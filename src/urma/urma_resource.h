@@ -164,6 +164,7 @@ public:
   urma_context_t *Ctx() const;
   urma_jfce_t *Jfce() const;
   urma_jfc_t *Jfc() const;
+  bool RearmJfc() const { return jfc_ != nullptr && jfc_->Rearm(); }
   const urma_token_t &Token() const { return token_; }
   uint64_t MaxWriteSize() const;
   uint32_t TransMode() const { return transMode_; }

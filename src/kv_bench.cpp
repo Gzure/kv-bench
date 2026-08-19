@@ -953,6 +953,7 @@ static int run_client(const argument_t *args)
     ctx->stop = false;
     ctx->mgr = new kv_bench::UrmaManager();
     int sockfd = -1;
+    pthread_t sampler_thread = 0;
 
     if (!ctx->mgr->Init(args->dev_name, args->cacheable, args->jetty_count, args->threads, args->event_mode,
                         args->trans_mode)) {
@@ -970,7 +971,6 @@ static int run_client(const argument_t *args)
         goto fail;
     }
 
-    pthread_t sampler_thread = 0;
     if (pthread_create(&sampler_thread, NULL, client_sampler_main, ctx) != 0) {
         fprintf(stderr, "Failed to create sampler thread\n");
     }
@@ -1052,7 +1052,7 @@ static void *server_conn_main(void *arg)
     params.valueSize = (uint32_t)ctx->args.value_size;
     params.transMode = ctx->args.trans_mode;
     params.dstChip = INVALID_CHIP;
-    int dst_chip = first_dst_chip(ctx->args);
+    int dst_chip = first_dst_chip(&ctx->args);
     if (dst_chip > 0) {
         params.dstChip = (uint32_t)dst_chip;
     }
