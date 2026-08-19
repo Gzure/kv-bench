@@ -945,6 +945,25 @@ static void free_bench_workers(context_t *ctx)
     }
 }
 
+/* 统一清理：停 manager + 释放 worker/缓冲 + 关闭控制 socket（sockfd<0 时跳过） */
+static void destroy_context(context_t *ctx, int sockfd)
+{
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+    if (ctx->mgr != nullptr) {
+        ctx->mgr->Stop();
+        delete ctx->mgr;
+        ctx->mgr = nullptr;
+    }
+    free_bench_workers(ctx);
+    if (ctx->va != NULL) {
+        free(ctx->va);
+        ctx->va = NULL;
+    }
+    free(ctx);
+}
+
 static int run_client(const argument_t *args)
 {
     context_t *ctx = (context_t *)calloc(1, sizeof(context_t));
@@ -958,17 +977,21 @@ static int run_client(const argument_t *args)
     if (!ctx->mgr->Init(args->dev_name, args->cacheable, args->jetty_count, args->threads, args->event_mode,
                         args->trans_mode)) {
         fprintf(stderr, "failed to init URMA manager\n");
-        goto fail;
+        destroy_context(ctx, sockfd);
+        return -1;
     }
     if (setup_buffer(ctx, false) != 0) {
-        goto fail;
+        destroy_context(ctx, sockfd);
+        return -1;
     }
     sockfd = client_connect_and_exchange(ctx, args);
     if (sockfd < 0) {
-        goto fail;
+        destroy_context(ctx, sockfd);
+        return -1;
     }
     if (create_workers(ctx, args->threads) != 0) {
-        goto fail;
+        destroy_context(ctx, sockfd);
+        return -1;
     }
 
     if (pthread_create(&sampler_thread, NULL, client_sampler_main, ctx) != 0) {
@@ -999,29 +1022,8 @@ static int run_client(const argument_t *args)
     close(sockfd);
     sockfd = -1;
 
-    ctx->mgr->Stop();
-    delete ctx->mgr;
-    free_bench_workers(ctx);
-    if (ctx->va != NULL) {
-        free(ctx->va);
-    }
-    free(ctx);
+    destroy_context(ctx, sockfd);
     return 0;
-
-fail:
-    if (sockfd >= 0) {
-        close(sockfd);
-    }
-    if (ctx->mgr != nullptr) {
-        ctx->mgr->Stop();
-        delete ctx->mgr;
-    }
-    free_bench_workers(ctx);
-    if (ctx->va != NULL) {
-        free(ctx->va);
-    }
-    free(ctx);
-    return -1;
 }
 
 /* ---------------- 服务器流程 ---------------- */
@@ -1242,23 +1244,27 @@ static int run_server(const argument_t *args)
     if (!ctx->mgr->Init(args->dev_name, args->cacheable, args->jetty_count, 1, args->event_mode,
                         args->trans_mode)) {
         fprintf(stderr, "failed to init URMA manager\n");
-        goto fail;
+        destroy_context(ctx, -1);
+        return -1;
     }
     if (setup_buffer(ctx, true) != 0) {
-        goto fail;
+        destroy_context(ctx, -1);
+        return -1;
     }
     /* 目的亲和: 服务器（write 目的）固定到 destination_cpus; 反亲和同样固定目的侧 */
     if (args->affinity_mode != AFF_NONE) {
         if (apply_cpu_list(args->destination_cpus) != 0) {
             fprintf(stderr, "failed to apply destination CPU affinity\n");
-            goto fail;
+            destroy_context(ctx, -1);
+            return -1;
         }
         printf("server process pinned to %s\n",
                args->destination_cpus != NULL ? args->destination_cpus : "(all)");
     }
 
     if (server_listen(ctx, args) != 0) {
-        goto fail;
+        destroy_context(ctx, -1);
+        return -1;
     }
 
     printf("Type enter to exit...\n");
@@ -1272,24 +1278,9 @@ static int run_server(const argument_t *args)
         }
     }
     close(ctx->listen_fd);
-    ctx->mgr->Stop();
-    delete ctx->mgr;
-    if (ctx->va != NULL) {
-        free(ctx->va);
-    }
-    free(ctx);
-    return 0;
 
-fail:
-    if (ctx->mgr != nullptr) {
-        ctx->mgr->Stop();
-        delete ctx->mgr;
-    }
-    if (ctx->va != NULL) {
-        free(ctx->va);
-    }
-    free(ctx);
-    return -1;
+    destroy_context(ctx, -1);
+    return 0;
 }
 
 /* ---------------- 参数解析 ---------------- */
