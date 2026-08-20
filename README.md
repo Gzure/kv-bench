@@ -105,7 +105,7 @@ CPU 亲和（线程绑定 + mbind）恒生效；**bonding chip 路由（WR 的 `
 
 ```text
 ==== summary role=client op=write threads=16 size=4194304 dual=mirror affinity=affinity jetty_count=16 duration=30.0s ====
-requests=9000000 iops=300000.00 wr_rate=600000.00 bandwidth_mbps=201326.59 bytes=75497472000 errors=0
+requests=9000000 iops=300000.00 wr_rate=600000.00 bandwidth=25165.82 MB/s (201326.59 Mb/s) bytes=75497472000 errors=0
 round latency(us): avg=53.33 min=16.24 p50=50.00 p90=61.00 p99=80.25 p999=176.70 p9999=304.80 pmax=2084.00
 ```
 

@@ -912,9 +912,11 @@ static void print_client_summary(context_t *ctx, double seconds)
            op_name(args->op), args->threads, args->value_size, dual_name(args->dual_mode),
            aff_name(args->affinity_mode), ctx->mgr->Resource().SendJettyCount(), seconds);
     double iops = seconds > 0 ? (double)ops / seconds : 0.0;
-    double bw_mbps = seconds > 0 ? (double)bytes * 8.0 / seconds / 1e6 : 0.0;
-    printf("requests=%" PRIu64 " iops=%.2f wr_rate=%.2f bandwidth_mbps=%.2f bytes=%" PRIu64 " errors=%" PRIu64 "\n",
-           ops, iops, iops * 2.0, bw_mbps, bytes, errors);
+    double bw_mb_s = seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
+    double bw_mbps = bw_mb_s * 8.0; /* 小 b: Mb/s */
+    printf("requests=%" PRIu64 " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
+           "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
+           ops, iops, iops * 2.0, bw_mb_s, bw_mbps, bytes, errors);
     print_latency_line_us("round", &merged);
     kv_hist_destroy(&merged);
 }
@@ -938,8 +940,9 @@ static void *client_sampler_main(void *arg)
         double dt = (double)(now - last_t) / 1e9;
         double elapsed = (double)(now - t0) / 1e9;
         if (dt > 0) {
-            printf("[t=%.1fs] ops=%" PRIu64 " iops=%.2f bandwidth_mbps=%.2f errors=%" PRIu64 "\n", elapsed,
-                   ops, (double)(ops - last_ops) / dt, (double)(bytes - last_bytes) * 8.0 / dt / 1e6, errors);
+            double bw_mb_s = (double)(bytes - last_bytes) / dt / 1e6; /* 大 B: MB/s */
+            printf("[t=%.1fs] ops=%" PRIu64 " iops=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) errors=%" PRIu64 "\n",
+                   elapsed, ops, (double)(ops - last_ops) / dt, bw_mb_s, bw_mb_s * 8.0, errors);
         }
         last_ops = ops;
         last_bytes = bytes;
