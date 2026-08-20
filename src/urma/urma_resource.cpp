@@ -8,13 +8,9 @@
 #include <cstdio>
 #include <cstring>
 
-/* bonding user_ctl（balance 模式）需要 SDK 的 bondp 头；存在则引入，
- * BONDP_USER_CTL_BONDING 由该头定义时启用（对齐参考 ChangeBondingBalanceMode） */
-#if defined(__has_include)
-#  if __has_include(<ub/umdk/urma/urma_bondp.h>)
-#    include <ub/umdk/urma/urma_bondp.h>
-#  endif
-#endif
+/* bonding user_ctl 定义（BONDP_USER_CTL_BONDING / bondp_set_bonding_mode_in_t 等）在
+ * urma_ubagg.h 中；引入后 #ifdef BONDP_USER_CTL_BONDING 生效（对齐参考 ChangeBondingBalanceMode） */
+#include "urma_ubagg.h"
 
 namespace kv_bench {
 
