@@ -301,6 +301,11 @@ void UrmaManager::Stop() {
     }
     resource_.Clear();
     initialized_ = false;
+    /* 所有 urma 资源（本地段等）必须在 urma_uninit 之前释放：
+     * localSeg_ 的析构会调 urma_unregister_seg，uninit 之后再调会段错误 */
+    localSeg_.reset();
+    buf_ = nullptr;
+    bufLen_ = 0;
     (void)urma_uninit();
   }
 }

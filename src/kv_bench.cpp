@@ -1000,6 +1000,9 @@ static void destroy_context(context_t *ctx, int sockfd)
     if (sockfd >= 0) {
         close(sockfd);
     }
+    /* 先释放对端连接（import 出的 target jetty/segment 需 urma_unimport_*），
+     * 必须在 mgr->Stop()（内部 urma_uninit）之前，否则撞已卸载的库 */
+    ctx->conn.reset();
     if (ctx->mgr != nullptr) {
         ctx->mgr->Stop();
         delete ctx->mgr;
