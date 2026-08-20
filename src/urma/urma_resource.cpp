@@ -352,9 +352,11 @@ bool UrmaResource::Init(urma_device_t *device, uint32_t eidIndex,
   token_.token = 0xACFE; /* 对齐 yuanrong 默认 token */
 
   /* bonding 设备：设置 bonding balance 模式（对齐参考 UrmaContext::ChangeBondingBalanceMode）。
-   * 必须在创建任何队列（jfce/jfc/jetty）之前调用，否则驱动可能因设备忙返回 EAGAIN(11) */
+   * 必须在创建任何队列（jfce/jfc/jetty）之前调用，否则驱动可能因设备忙返回 EAGAIN(11)。
+   * 默认编译关闭（-DKV_BENCH_BONDP_CTL=ON 开启）：部分平台/UMDK 版本的
+   * urma_user_ctl 不可用或 bondp 相关库崩溃，默认不开更安全。 */
   if (strncmp(device->name, "bonding", strlen("bonding")) == 0) {
-#ifdef BONDP_USER_CTL_BONDING
+#ifdef KV_BENCH_BONDP_CTL
     bondp_set_bonding_mode_in_t mode;
     (void)memset(&mode, 0, sizeof(mode));
     mode.bonding_mode = BONDP_BONDING_MODE_BALANCE;
@@ -370,8 +372,8 @@ bool UrmaResource::Init(urma_device_t *device, uint32_t eidIndex,
     printf("bonding device %s: set balance mode rc=%d\n", device->name, rc);
 #else
     fprintf(stderr,
-            "Warning: bonding device %s: BONDP_USER_CTL_BONDING not available, "
-            "skip bonding balance mode (drv-ext data path may fail)\n",
+            "Warning: bonding device %s: balance mode disabled at compile time "
+            "(-DKV_BENCH_BONDP_CTL=ON to enable)\n",
             device->name);
 #endif
   }
