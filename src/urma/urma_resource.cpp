@@ -351,15 +351,8 @@ bool UrmaResource::Init(urma_device_t *device, uint32_t eidIndex,
   }
   token_.token = 0xACFE; /* 对齐 yuanrong 默认 token */
 
-  if (!UrmaJfce::Create(context_->Raw(), jfce_)) {
-    return false;
-  }
-  if (!UrmaJfc::Create(context_->Raw(), devAttr_, jfc_)) {
-    return false;
-  }
-
-  /* bonding 设备：设置 bonding balance 模式（对齐参考
-   * UrmaContext::ChangeBondingBalanceMode，数据面路由依赖） */
+  /* bonding 设备：设置 bonding balance 模式（对齐参考 UrmaContext::ChangeBondingBalanceMode）。
+   * 必须在创建任何队列（jfce/jfc/jetty）之前调用，否则驱动可能因设备忙返回 EAGAIN(11) */
   if (strncmp(device->name, "bonding", strlen("bonding")) == 0) {
 #ifdef BONDP_USER_CTL_BONDING
     bondp_set_bonding_mode_in_t mode;
@@ -381,6 +374,13 @@ bool UrmaResource::Init(urma_device_t *device, uint32_t eidIndex,
             "skip bonding balance mode (drv-ext data path may fail)\n",
             device->name);
 #endif
+  }
+
+  if (!UrmaJfce::Create(context_->Raw(), jfce_)) {
+    return false;
+  }
+  if (!UrmaJfc::Create(context_->Raw(), devAttr_, jfc_)) {
+    return false;
   }
 
   uint32_t count = jettyCount > minJettys ? jettyCount : minJettys;
