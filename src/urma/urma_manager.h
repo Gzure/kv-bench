@@ -92,11 +92,15 @@ public:
   bool WaitEvent(uint32_t workerId, uint64_t seq, int timeoutMs);
   void AbortEvent(uint32_t workerId, uint64_t seq);
 
-  /* TCP 控制面握手：交换元信息 + import 对端 jetty/segment */
+  /* TCP 控制面握手：交换元信息 + import 对端 jetty/segment。
+   * preferRtp=true 时用普通 RTP import（SDK 示例），跳过 bondp/CTP
+   * （部分平台驱动对 bondp import 有问题时可绕行） */
   bool ExchangeAsClient(int sockfd, const HandshakeParams &params,
-                        std::shared_ptr<UrmaConnection> &conn);
+                        std::shared_ptr<UrmaConnection> &conn,
+                        bool preferRtp = false);
   bool ExchangeAsServer(int sockfd, const HandshakeParams &params,
-                        std::shared_ptr<UrmaConnection> &conn);
+                        std::shared_ptr<UrmaConnection> &conn,
+                        bool preferRtp = false);
 
   /* send lane：每轮（一次业务请求）从池取一条 jetty，用后归还（对齐 yuanrong
    * AcquireSendLane） */

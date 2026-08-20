@@ -482,7 +482,8 @@ void UrmaManager::ReleaseSendLane(const std::shared_ptr<UrmaJetty> &jetty) {
 /* ---------------- 握手 ---------------- */
 
 bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
-                           std::shared_ptr<UrmaConnection> &conn) {
+                           std::shared_ptr<UrmaConnection> &conn,
+                           bool preferRtp) {
   if (localSeg_ == nullptr || resource_.Ctx() == nullptr) {
     fprintf(stderr, "Exchange before RegisterBuffer/Init\n");
     return false;
@@ -542,20 +543,11 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
 
   /* import 对端 jetty（legacy handshake，对齐 yuanrong BuildRemoteJetty +
    * ImportTargetJetty）。
-   * 路径1（bonding/datasystem）: bondp_rjetty + tp_type=CTP + has_drv_ext=1；
-   * 路径2（SDK 示例）: 普通 urma_rjetty + tp_type=RTP。
-   * 注意：bondp.jetty 传 nullptr（对齐参考 ImportRemoteJetty/FinalizeOutboundConnection，
-   * 均传 nullptr；传本地 jetty 指针在部分固件上会导致 import 崩溃）。 */
-  bondp_rjetty_t bondp;
-  (void)memset(&bondp, 0, sizeof(bondp));
-  bondp.base.jetty_id = remoteWire.jetty_id;
-  bondp.base.trans_mode = ResolveTransMode(params.transMode);
-  bondp.base.type = URMA_JETTY;
-  bondp.base.tp_type = URMA_CTP;
-  bondp.base.flag.bs.has_drv_ext = 1;
-  bondp.jetty = nullptr;
-  if (!resource_.ImportTargetJetty(&bondp.base, newConn->targetJetty)) {
-    /* 回退：SDK 示例 legacy 路径（RTP） */
+   * 默认路径1（bonding/datasystem）: bondp_rjetty + tp_type=CTP + has_drv_ext=1；
+   * preferRtp 时直接走路径2（SDK 示例）: 普通 urma_rjetty + tp_type=RTP。
+   * bondp.jetty 传 nullptr（对齐参考 ImportRemoteJetty/FinalizeOutboundConnection）。 */
+  bool okImport = false;
+  if (preferRtp) {
     urma_rjetty_t rjetty;
     (void)memset(&rjetty, 0, sizeof(rjetty));
     rjetty.jetty_id = remoteWire.jetty_id;
@@ -564,17 +556,44 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
     rjetty.tp_type = URMA_RTP;
     rjetty.flag.bs.order_type = params.transMode == 3 ? 1 : 0;
     rjetty.flag.bs.share_tp = params.transMode == 3 ? 1 : 0;
-    if (!resource_.ImportTargetJetty(&rjetty, newConn->targetJetty)) {
-      fprintf(stderr,
-              "import remote jetty failed: both bondp/CTP and RTP paths, "
-              "id=%u eid=" EID_FMT " uasid=0x%x\n",
-              remoteWire.jetty_id.id, EID_ARGS(remoteWire.eid),
-              remoteWire.uasid);
-      return false;
+    okImport = resource_.ImportTargetJetty(&rjetty, newConn->targetJetty);
+    if (okImport) {
+      printf("import remote jetty ok (RTP path)\n");
     }
-    printf("import remote jetty ok (RTP legacy path)\n");
   } else {
-    printf("import remote jetty ok (bondp CTP path)\n");
+    bondp_rjetty_t bondp;
+    (void)memset(&bondp, 0, sizeof(bondp));
+    bondp.base.jetty_id = remoteWire.jetty_id;
+    bondp.base.trans_mode = ResolveTransMode(params.transMode);
+    bondp.base.type = URMA_JETTY;
+    bondp.base.tp_type = URMA_CTP;
+    bondp.base.flag.bs.has_drv_ext = 1;
+    bondp.jetty = nullptr;
+    if (!resource_.ImportTargetJetty(&bondp.base, newConn->targetJetty)) {
+      /* 回退：SDK 示例 legacy 路径（RTP） */
+      urma_rjetty_t rjetty;
+      (void)memset(&rjetty, 0, sizeof(rjetty));
+      rjetty.jetty_id = remoteWire.jetty_id;
+      rjetty.trans_mode = ResolveTransMode(params.transMode);
+      rjetty.type = URMA_JETTY;
+      rjetty.tp_type = URMA_RTP;
+      rjetty.flag.bs.order_type = params.transMode == 3 ? 1 : 0;
+      rjetty.flag.bs.share_tp = params.transMode == 3 ? 1 : 0;
+      okImport = resource_.ImportTargetJetty(&rjetty, newConn->targetJetty);
+      if (okImport) {
+        printf("import remote jetty ok (RTP legacy path)\n");
+      }
+    } else {
+      okImport = true;
+      printf("import remote jetty ok (bondp CTP path)\n");
+    }
+  }
+  if (!okImport) {
+    fprintf(stderr,
+            "import remote jetty failed: id=%u eid=" EID_FMT " uasid=0x%x\n",
+            remoteWire.jetty_id.id, EID_ARGS(remoteWire.eid),
+            remoteWire.uasid);
+    return false;
   }
   if (!resource_.ImportSegment(newConn->peer.seg, newConn->remoteSeg)) {
     return false;
@@ -599,13 +618,15 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
 }
 
 bool UrmaManager::ExchangeAsClient(int sockfd, const HandshakeParams &params,
-                                   std::shared_ptr<UrmaConnection> &conn) {
-  return Exchange(sockfd, params, conn);
+                                   std::shared_ptr<UrmaConnection> &conn,
+                                   bool preferRtp) {
+  return Exchange(sockfd, params, conn, preferRtp);
 }
 
 bool UrmaManager::ExchangeAsServer(int sockfd, const HandshakeParams &params,
-                                   std::shared_ptr<UrmaConnection> &conn) {
-  return Exchange(sockfd, params, conn);
+                                   std::shared_ptr<UrmaConnection> &conn,
+                                   bool preferRtp) {
+  return Exchange(sockfd, params, conn, preferRtp);
 }
 
 /* ---------------- 数据面 ---------------- */

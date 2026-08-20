@@ -87,6 +87,7 @@ typedef struct argument {
     bool get_fence;
     bool mbind; /* NUMA 绑定，默认关（Kunpeng/部分平台 mbind 不可用），--mbind 显式开启 */
     bool drv_ext; /* bonding chip 路由（has_drv_ext + src/dst chip），默认关 */
+    bool import_rtp; /* import 对端 jetty 用普通 RTP 路径（跳过 bondp/CTP），默认关 */
     int src_chip_a; /* drv-ext chip 覆盖：-1=自动（NumaIdToChipId），>=0=显式指定 */
     int src_chip_b;
     int dst_chip;
@@ -988,7 +989,7 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args)
     if (dst_chip > 0) {
         params.dstChip = (uint32_t)dst_chip;
     }
-    if (!ctx->mgr->ExchangeAsClient(sockfd, params, ctx->conn)) {
+    if (!ctx->mgr->ExchangeAsClient(sockfd, params, ctx->conn, args->import_rtp)) {
         fprintf(stderr, "Failed to exchange URMA info with server\n");
         close(sockfd);
         return -1;
@@ -1156,7 +1157,7 @@ static void *server_conn_main(void *arg)
     if (dst_chip > 0) {
         params.dstChip = (uint32_t)dst_chip;
     }
-    if (!ctx->mgr->ExchangeAsServer(conn->fd, params, conn->conn)) {
+    if (!ctx->mgr->ExchangeAsServer(conn->fd, params, conn->conn, ctx->args.import_rtp)) {
         fprintf(stderr, "[conn] Failed to exchange URMA info\n");
         goto out;
     }
@@ -1408,6 +1409,7 @@ static struct option g_long_options[] = {
     {"get-fence", no_argument, NULL, 1014},
     {"mbind", no_argument, NULL, 1015},
     {"drv-ext", no_argument, NULL, 1019},
+    {"import-rtp", no_argument, NULL, 1023},
     {"src-chip-a", required_argument, NULL, 1020},
     {"src-chip-b", required_argument, NULL, 1021},
     {"dst-chip", required_argument, NULL, 1022},
@@ -1444,6 +1446,7 @@ static void usage(void)
     printf("      --get-fence            get 回写拆成 data WR + fence flag WR\n");
     printf("      --mbind                enable NUMA mbind of the buffer (default off; unsupported on some platforms)\n");
     printf("      --drv-ext              enable bonding chip routing (has_drv_ext + src/dst chip, default off)\n");
+    printf("      --import-rtp           import remote jetty via plain RTP (skip bondp/CTP, workaround for driver crash)\n");
     printf("      --src-chip-a <n>       override WR-A src chip id when --drv-ext (default auto)\n");
     printf("      --src-chip-b <n>       override WR-B src chip id when --drv-ext (default auto)\n");
     printf("      --dst-chip <n>         override dst chip id when --drv-ext (default auto)\n");
@@ -1647,6 +1650,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
                 break;
             case 1019:
                 args->drv_ext = true;
+                break;
+            case 1023:
+                args->import_rtp = true;
                 break;
             case 1020:
                 args->src_chip_a = (int)strtol(optarg, NULL, 0);
