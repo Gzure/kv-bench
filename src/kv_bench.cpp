@@ -1705,7 +1705,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
 }
 
 int main(int argc, char *argv[]) {
-  argument_t args;
+  argument_t args{};
   int ret;
 
   ret = parse_arguments(argc, argv, &args);
