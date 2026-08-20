@@ -148,8 +148,7 @@ done
 | 参数 | 说明 |
 | --- | --- |
 | `--trans-mode` | 0=RM(默认) 1=RC 2=UM 3=RS |
-| `--multi-path` | bonding 设备建议保持默认（RM+multi_path 或 RC）；传输类型由 `--import-rtp` 决定（默认 CTP，`--import-rtp` 走 RTP） |
+| `--import-rtp` | import 对端 jetty 走普通 RTP 路径（默认 bondp/CTP；版本不匹配导致 bondp 崩溃时的绕行） |
 | `--event-mode` | 使用 wait_jfc/ack/rearm 事件模式而非忙轮询 |
 | `--cacheable` | 注册/导入 cacheable 段（默认 non-cacheable） |
 | `--timeout-ms` | 完成等待超时（默认 5000） |
-| `-c, --cs-coexist` | 单进程双角色（仅 loopback 调试） |
