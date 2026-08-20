@@ -516,10 +516,28 @@ static void pick_round_chips(const argument_t *args, bool is_client,
     for (int i = 0; i < np; i++)
       pool[i] = n_mine > 0 ? mine[i] : all_cpus[i];
     int c0 = pool[rng_next(&w->rng) % np];
-    int c1 = pool[rng_next(&w->rng) % np];
     int ch0 = cpu_to_chip(c0);
-    int ch1 = cpu_to_chip(c1);
     *src_a = ch0 > 0 ? ch0 : ((int)(w->id % 2) + 1);
+    /* 源 B 优先从对侧 chip 的 CPU 里随机，保证双源分属两 chip（bonding 双源
+     * 不退化）；对侧无可用 CPU（单 chip 拓扑）时回退全池随机 */
+    int c1 = -1;
+    int other = (ch0 > 0) ? ((ch0 == 1) ? 2 : 1) : -1;
+    if (other > 0) {
+      int cands[MAX_CPUS];
+      int nc = 0;
+      for (int i = 0; i < np && nc < MAX_CPUS; i++) {
+        if (cpu_to_chip(pool[i]) == other) {
+          cands[nc++] = pool[i];
+        }
+      }
+      if (nc > 0) {
+        c1 = cands[rng_next(&w->rng) % nc];
+      }
+    }
+    if (c1 < 0) {
+      c1 = pool[rng_next(&w->rng) % np];
+    }
+    int ch1 = cpu_to_chip(c1);
     *src_b = ch1 > 0 ? ch1 : ((*src_a == 1) ? 2 : 1);
     *dst = dst_chip;
   } else {
