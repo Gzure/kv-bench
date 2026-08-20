@@ -176,6 +176,12 @@ public:
   /* jetty 创建与池（SendJettyPool 线程安全内建；每轮 PopIdle 取"新的"空闲
    * jetty） */
   bool CreateSendJetty(std::shared_ptr<UrmaJetty> &out);
+  /* 进程级共享 RECV jetty（独立 JFR，握手时发布供对端 import，对齐 yuanrong
+   * GetOrCreateSharedRecvJetty） */
+  bool GetOrCreateSharedRecvJetty(std::shared_ptr<UrmaJetty> &out);
+  std::shared_ptr<UrmaJetty> RecvJetty() const {
+    return sharedRecvJetty_;
+  }
   uint32_t SendJettyCount() const;
   std::shared_ptr<UrmaJetty> JettyAt(uint32_t index) const;
   SendJettyPool::Stats SendJettyPoolStats() const;
@@ -201,6 +207,7 @@ private:
   std::unique_ptr<UrmaJfc> jfc_;
   std::shared_ptr<UrmaJfr> sharedJettyJfr_;
   SendJettyPool sendJettyPool_;
+  std::shared_ptr<UrmaJetty> sharedRecvJetty_; /* 握手发布的 RECV jetty */
   urma_token_t token_{};
   urma_device_attr_t devAttr_{};
   uint64_t maxWriteSize_{0};

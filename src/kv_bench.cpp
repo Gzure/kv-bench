@@ -327,12 +327,23 @@ static int enumerate_all_cpus(int *out, int max_out)
 }
 
 /* mbind: 把 [addr, addr+len) 绑定到 node（用 syscall 避免 libnuma 依赖） */
+/* mbind: 把 [addr, addr+len) 绑定到 node（用 syscall 避免 libnuma 依赖）。
+ * addr 需页对齐；掩码用满字长数组，maxnode 取系统实际节点数（≤ MAX_NUMNODES）。 */
 static int mbind_to_node(void *addr, size_t len, int node)
 {
-    if (node < 0) return -1;
-    unsigned long mask = 1UL << node;
-    long rc = syscall(SYS_mbind, addr, len, MPOL_BIND, &mask, node + 1, 0);
-    return rc == 0 ? 0 : -1;
+    int num_nodes = get_num_numa_nodes();
+    if (node < 0 || num_nodes <= 0) return -1;
+    uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(PAGE_SIZE - 1);
+    size_t ext = ((uintptr_t)addr - start) + len;
+    unsigned long mask[64] = {0}; /* 512B = 4096 bit，足够 MAX_NUMNODES */
+    mask[node / (8 * sizeof(unsigned long))] = 1UL << (node % (8 * sizeof(unsigned long)));
+    long rc = syscall(SYS_mbind, (void *)start, ext, MPOL_BIND, mask, num_nodes, 0);
+    if (rc != 0) {
+        fprintf(stderr, "Warning: mbind(addr=0x%lx len=%zu node=%d) failed, errno=%d (%s)\n",
+                (unsigned long)start, ext, node, errno, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 /* ---------------- 缓冲布局 ---------------- */
@@ -388,10 +399,11 @@ static int setup_buffer(context_t *ctx, bool is_server)
         if (n > 0) {
             int node = read_cpu_numa(dst_cpus[0]);
             if (node >= 0) {
-                if (mbind_to_node((uint8_t *)ctx->client_data, ctx->data_len, node) != 0) {
-                    fprintf(stderr, "Warning: mbind to node %d failed (errno %d)\n", node, errno);
+                /* 整缓冲绑定（va 由 memalign 页对齐），保证数据区落在目的 NUMA */
+                if (mbind_to_node(ctx->va, ctx->buf_len, node) != 0) {
+                    fprintf(stderr, "Warning: mbind to node %d failed, continue without NUMA binding\n", node);
                 } else {
-                    printf("mbind data area (%" PRIu64 "B) to node %d\n", ctx->data_len, node);
+                    printf("mbind buffer (%" PRIu64 "B) to node %d\n", ctx->buf_len, node);
                 }
             }
         }
@@ -1386,8 +1398,14 @@ static int validate_input_params(argument_t *args, bool tp_type_input_flag, bool
         if (tp_type_input_flag) {
             fprintf(stderr, "Warning: TP type should not be set for bonding device.\n");
         }
-        if (!((args->trans_mode == 0 && args->multi_path == true) || (args->trans_mode == 1))) {
-            fprintf(stderr, "Error: This combination of trans-mode and multi-path is invalid on bonding devices.\n");
+        /* bonding + RM 要求 multi-path：自动开启，无需手动加 -u */
+        if (args->trans_mode == 0 && !args->multi_path) {
+            fprintf(stderr, "Info: bonding device with RM trans-mode requires multi-path, enabling it automatically.\n");
+            args->multi_path = true;
+        }
+        if (args->trans_mode != 0 && args->trans_mode != 1) {
+            fprintf(stderr, "Error: bonding device only supports RM+multi-path or RC (-m 1), got trans-mode %u.\n",
+                    args->trans_mode);
             return -1;
         }
     } else {

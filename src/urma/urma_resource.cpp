@@ -361,14 +361,21 @@ bool UrmaResource::Init(urma_device_t *device, uint32_t eidIndex,
   if (!PreFillSendJettyPool(count)) {
     return false;
   }
-  printf("urma resource init ok: jettys=%u max_write_size=%\n",
-         SendJettyCount(), maxWriteSize_);
+  {
+    std::shared_ptr<UrmaJetty> recv;
+    if (!GetOrCreateSharedRecvJetty(recv)) {
+      return false;
+    }
+  }
+  printf("urma resource init ok: jettys=%u max_write_size=%llu\n",
+         SendJettyCount(), (unsigned long long)maxWriteSize_);
   return true;
 }
 
 void UrmaResource::Clear() {
   localSeg_.reset();
   sendJettyPool_.Clear();
+  sharedRecvJetty_.reset();
   sharedJettyJfr_.reset();
   jfc_.reset();
   jfce_.reset();
@@ -404,6 +411,20 @@ bool UrmaResource::RegisterSegment(uint64_t va, uint64_t len,
 
 bool UrmaResource::CreateSendJetty(std::shared_ptr<UrmaJetty> &out) {
   return UrmaJetty::Create(*this, true, out);
+}
+
+bool UrmaResource::GetOrCreateSharedRecvJetty(
+    std::shared_ptr<UrmaJetty> &out) {
+  if (sharedRecvJetty_ == nullptr) {
+    /* RECV jetty 持独立 JFR（对齐 yuanrong UrmaJetty::Create recv 路径） */
+    if (!UrmaJetty::Create(*this, false, sharedRecvJetty_)) {
+      return false;
+    }
+    printf("created shared recv jetty id %u\n",
+           sharedRecvJetty_->JettyId());
+  }
+  out = sharedRecvJetty_;
+  return true;
 }
 
 uint32_t UrmaResource::SendJettyCount() const {
@@ -445,8 +466,7 @@ uint32_t UrmaResource::Uasid() const {
 }
 
 uint32_t UrmaResource::PublishedJettyId() const {
-  std::shared_ptr<UrmaJetty> jetty0 = sendJettyPool_.At(0);
-  return jetty0 != nullptr ? jetty0->JettyId() : 0;
+  return sharedRecvJetty_ != nullptr ? sharedRecvJetty_->JettyId() : 0;
 }
 
 bool UrmaResource::PreFillSendJettyPool(uint32_t count) {

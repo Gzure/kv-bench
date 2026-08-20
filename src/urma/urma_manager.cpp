@@ -487,10 +487,11 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   localWire.seg_flag = local->seg.attr.value;
   localWire.seg_token_id = local->seg.token_id;
   {
-    std::shared_ptr<UrmaJetty> jetty0 = resource_.JettyAt(0);
-    if (jetty0 != nullptr) {
-      localWire.jetty_id =
-          jetty0->Raw()->jetty_id; /* 发布 jetty[0] 供对端 import */
+    /* 发布进程级 RECV jetty（独立 JFR）供对端 import（对齐 yuanrong
+     * GetOrCreateSharedRecvJetty + 握手发布） */
+    std::shared_ptr<UrmaJetty> recvJetty = resource_.RecvJetty();
+    if (recvJetty != nullptr) {
+      localWire.jetty_id = recvJetty->Raw()->jetty_id;
     }
   }
   localWire.threads = params.threads;
@@ -529,17 +530,42 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   newConn->peer.seg.token_id = remoteWire.seg_token_id;
 
   /* import 对端 jetty（legacy handshake，对齐 yuanrong BuildRemoteJetty +
-   * ImportTargetJetty） */
-  urma_rjetty_t rjetty;
-  (void)memset(&rjetty, 0, sizeof(rjetty));
-  rjetty.jetty_id = remoteWire.jetty_id;
-  rjetty.trans_mode = ResolveTransMode(params.transMode);
-  rjetty.type = URMA_JETTY;
-  rjetty.tp_type = URMA_RTP;
-  rjetty.flag.bs.order_type = params.transMode == 3 ? 1 : 0;
-  rjetty.flag.bs.share_tp = params.transMode == 3 ? 1 : 0;
-  if (!resource_.ImportTargetJetty(&rjetty, newConn->targetJetty)) {
-    return false;
+   * ImportTargetJetty）。
+   * 路径1（bonding/datasystem）: bondp_rjetty + tp_type=CTP + has_drv_ext=1；
+   * 路径2（SDK 示例）: 普通 urma_rjetty + tp_type=RTP。 */
+  std::shared_ptr<UrmaJetty> localRecvJetty = resource_.RecvJetty();
+  urma_jetty_t *localJettyRaw =
+      localRecvJetty != nullptr ? localRecvJetty->Raw() : nullptr;
+
+  bondp_rjetty_t bondp;
+  (void)memset(&bondp, 0, sizeof(bondp));
+  bondp.base.jetty_id = remoteWire.jetty_id;
+  bondp.base.trans_mode = ResolveTransMode(params.transMode);
+  bondp.base.type = URMA_JETTY;
+  bondp.base.tp_type = URMA_CTP;
+  bondp.base.flag.bs.has_drv_ext = 1;
+  bondp.jetty = localJettyRaw;
+  if (!resource_.ImportTargetJetty(&bondp.base, newConn->targetJetty)) {
+    /* 回退：SDK 示例 legacy 路径（RTP） */
+    urma_rjetty_t rjetty;
+    (void)memset(&rjetty, 0, sizeof(rjetty));
+    rjetty.jetty_id = remoteWire.jetty_id;
+    rjetty.trans_mode = ResolveTransMode(params.transMode);
+    rjetty.type = URMA_JETTY;
+    rjetty.tp_type = URMA_RTP;
+    rjetty.flag.bs.order_type = params.transMode == 3 ? 1 : 0;
+    rjetty.flag.bs.share_tp = params.transMode == 3 ? 1 : 0;
+    if (!resource_.ImportTargetJetty(&rjetty, newConn->targetJetty)) {
+      fprintf(stderr,
+              "import remote jetty failed: both bondp/CTP and RTP paths, "
+              "id=%u eid=" EID_FMT " uasid=0x%x\n",
+              remoteWire.jetty_id.id, EID_ARGS(remoteWire.eid),
+              remoteWire.uasid);
+      return false;
+    }
+    printf("import remote jetty ok (RTP legacy path)\n");
+  } else {
+    printf("import remote jetty ok (bondp CTP path)\n");
   }
   if (!resource_.ImportSegment(newConn->peer.seg, newConn->remoteSeg)) {
     return false;
