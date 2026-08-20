@@ -615,6 +615,23 @@ bool UrmaManager::PostWrite(const std::shared_ptr<UrmaJetty> &jetty,
       conn.remoteSeg == nullptr) {
     return false;
   }
+  {
+    /* 前 2 条 WR 打印 sge/tseg 详情，便于定位 status=LOC_ACCESS_ERR 等失败 */
+    static std::atomic<int> diagCnt{0};
+    if (diagCnt.fetch_add(1) < 2) {
+      urma_seg_t *ls = &localSeg_->Raw()->seg;
+      urma_seg_t *rs = &conn.remoteSeg->Raw()->seg;
+      fprintf(stderr,
+              "[wr] diag: local=0x%lx remote=0x%lx len=%u src=%u dst=%u "
+              "local_tseg_va=0x%lx local_len=%llu remote_tseg_va=0x%lx "
+              "remote_len=%llu jetty=%u target_jetty=0x%lx\n",
+              (unsigned long)localAddr, (unsigned long)remoteAddr, len, srcChip,
+              dstChip, (unsigned long)ls->ubva.va,
+              (unsigned long long)ls->len, (unsigned long)rs->ubva.va,
+              (unsigned long long)rs->len, jetty->Raw()->jetty_id.id,
+              (unsigned long)conn.targetJetty->Raw());
+    }
+  }
   uint32_t drv = (srcChip != kInvalidChip && dstChip != kInvalidChip) ? 1 : 0;
   urma_jfs_wr_t *bad = nullptr;
   urma_status_t rc =

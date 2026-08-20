@@ -91,6 +91,9 @@ kv_bench 打流线程
 - `anti`/`anti-affinity`：源随机（每轮随机 chip），目的固定。
 - `none`：两端都不绑定，源/目的 chip 每轮随机。
 
+CPU 亲和（线程绑定 + mbind）恒生效；**bonding chip 路由（WR 的 `has_drv_ext` +
+`src/dst_chip_id`）默认关闭**（对齐参考默认路径，部分平台 post 时会报
+`URMA_CR_LOC_ACCESS_ERR`），显式 `--drv-ext` 开启。
 `--seed` 控制随机；`--no-mbind` 关闭 NUMA 绑定；`--fixed-offset` 恒压同一地址（热缓存测试）。
 
 ## 统计输出

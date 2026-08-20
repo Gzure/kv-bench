@@ -8,6 +8,14 @@
 #include <cstdio>
 #include <cstring>
 
+/* bonding user_ctl（balance 模式）需要 SDK 的 bondp 头；存在则引入，
+ * BONDP_USER_CTL_BONDING 由该头定义时启用（对齐参考 ChangeBondingBalanceMode） */
+#if defined(__has_include)
+#  if __has_include(<ub/umdk/urma/urma_bondp.h>)
+#    include <ub/umdk/urma/urma_bondp.h>
+#  endif
+#endif
+
 namespace kv_bench {
 
 namespace {
@@ -352,6 +360,31 @@ bool UrmaResource::Init(urma_device_t *device, uint32_t eidIndex,
   }
   if (!UrmaJfc::Create(context_->Raw(), devAttr_, jfc_)) {
     return false;
+  }
+
+  /* bonding 设备：设置 bonding balance 模式（对齐参考
+   * UrmaContext::ChangeBondingBalanceMode，数据面路由依赖） */
+  if (strncmp(device->name, "bonding", strlen("bonding")) == 0) {
+#ifdef BONDP_USER_CTL_BONDING
+    bondp_set_bonding_mode_in_t mode;
+    (void)memset(&mode, 0, sizeof(mode));
+    mode.bonding_mode = BONDP_BONDING_MODE_BALANCE;
+    mode.bonding_level = BONDP_BONDING_LEVEL_PORT;
+    urma_user_ctl_in_t in;
+    (void)memset(&in, 0, sizeof(in));
+    in.addr = reinterpret_cast<uint64_t>(&mode);
+    in.len = sizeof(mode);
+    in.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
+    urma_user_ctl_out_t out;
+    (void)memset(&out, 0, sizeof(out));
+    const urma_status_t rc = urma_user_ctl(context_->Raw(), &in, &out);
+    printf("bonding device %s: set balance mode rc=%d\n", device->name, rc);
+#else
+    fprintf(stderr,
+            "Warning: bonding device %s: BONDP_USER_CTL_BONDING not available, "
+            "skip bonding balance mode (drv-ext data path may fail)\n",
+            device->name);
+#endif
   }
 
   uint32_t count = jettyCount > minJettys ? jettyCount : minJettys;

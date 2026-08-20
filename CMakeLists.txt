@@ -8,6 +8,10 @@ if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# SDK 有 urma_bondp.h 且支持 bonding balance-mode user_ctl 时开启
+# （代码已用 __has_include 自动探测；此开关用于 SDK 头缺失定义时手动强制）
+option(KV_BENCH_BONDP_CTL "Force-enable bonding balance-mode user_ctl (BONDP_USER_CTL_BONDING)" OFF)
+
 # ---- URMA SDK 头文件（urma_api.h / urma_ubagg.h），URMA_ROOT 或系统路径 ----
 find_path(URMA_INCLUDE_PATH
 	NAMES
@@ -82,4 +86,8 @@ target_include_directories(kv-bench
 		"${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 target_link_libraries(kv-bench PRIVATE "${URMA_LIBRARY}" pthread)
-target_compile_definitions(kv-bench PRIVATE _GNU_SOURCE)
+target_compile_definitions(kv-bench
+	PRIVATE
+		_GNU_SOURCE
+		$<$<BOOL:${KV_BENCH_BONDP_CTL}>:BONDP_USER_CTL_BONDING>
+)

@@ -55,6 +55,7 @@
 #define DEFAULT_TIMEOUT_MS 5000
 #define MAX_CPUS 1024
 #define INVALID_CHIP 0xFFu
+#define ROUND_UP(x, a) (((x) + (uint64_t)(a) - 1) & ~((uint64_t)(a) - 1))
 
 /* 操作类型 / 双发模式 / 亲和模式 */
 enum { OP_WRITE = 0, OP_GET = 1, OP_MIXED = 2 };
@@ -353,10 +354,10 @@ static int layout_client_buffer(context_t *ctx)
 {
     const argument_t *args = &ctx->args;
     uint64_t size = args->value_size;
-    ctx->req_bytes = (uint64_t)args->threads * GET_REQ_SIZE;
+    ctx->req_bytes = ROUND_UP((uint64_t)args->threads * GET_REQ_SIZE, PAGE_SIZE);
     ctx->data_len = (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * size;
     ctx->flag_bytes = (uint64_t)args->threads * FLAG_PER_THREAD;
-    ctx->buf_len = ctx->req_bytes + ctx->data_len + ctx->flag_bytes;
+    ctx->buf_len = ROUND_UP(ctx->req_bytes + ctx->data_len + ctx->flag_bytes, PAGE_SIZE);
     ctx->client_data = (uint8_t *)ctx->va + ctx->req_bytes;
     ctx->client_flags = ctx->client_data + ctx->data_len;
     return 0;
@@ -369,7 +370,7 @@ static int layout_server_buffer(context_t *ctx)
     ctx->req_bytes = 0;
     ctx->data_len = (uint64_t)SERVER_DATA_WINDOW * size;
     ctx->flag_bytes = 0;
-    ctx->buf_len = RING_BYTES + ctx->data_len + 16; /* +16 回写标志源槽 */
+    ctx->buf_len = ROUND_UP(RING_BYTES + ctx->data_len + 16, PAGE_SIZE); /* +16 回写标志源槽 */
     ctx->client_data = (uint8_t *)ctx->va + RING_BYTES;
     ctx->client_flags = NULL;
     return 0;
