@@ -113,10 +113,7 @@ CPU 亲和（线程绑定 + mbind）恒生效；**bonding chip 路由（WR 的 `
 `URMA_CR_LOC_ACCESS_ERR`），显式 `--drv-ext` 开启。
 `--seed` 控制随机；`--mbind` 显式开启 NUMA 绑定（默认关，部分平台/Kunpeng 不支持
 mbind 会报 EINVAL，非必要）；`--fixed-offset` 恒压同一地址（热缓存测试）。
-
-`--drv-ext` 开启 bonding chip 路由；机器真实 chip id 可能与自动值（参考
-`NumaIdToChipId` 的 1/2）不同，可用 `--src-chip-a/--src-chip-b/--dst-chip` 显式覆盖
-（例如 4 节点 Kunpeng 试 `--src-chip-a 0 --src-chip-b 1 --dst-chip 0`）。
+`--drv-ext` 开启 bonding chip 路由（自动值参考 `NumaIdToChipId`）。
 
 ## 统计输出
 

@@ -87,9 +87,6 @@ typedef struct argument {
     bool mbind; /* NUMA 绑定，默认关（Kunpeng/部分平台 mbind 不可用），--mbind 显式开启 */
     bool drv_ext; /* bonding chip 路由（has_drv_ext + src/dst chip），默认关 */
     bool import_rtp; /* import 对端 jetty 用普通 RTP 路径（跳过 bondp/CTP），默认关 */
-    int src_chip_a; /* drv-ext chip 覆盖：-1=自动（NumaIdToChipId），>=0=显式指定 */
-    int src_chip_b;
-    int dst_chip;
     uint32_t seed;
     bool fixed_offset;
     int timeout_ms;
@@ -684,14 +681,9 @@ static void *client_worker_main(void *arg)
             dst_chip = (int)ctx->conn->peer.dstChip;
         }
         /* 默认不走 bonding chip 路由（has_drv_ext=0 + INVALID chip，对齐参考默认路径）；
-         * --drv-ext 显式开启后使用 src/dst chip 路由 */
+         * --drv-ext 显式开启后使用 src/dst chip 路由（自动值，参考 NumaIdToChipId） */
         if (!args->drv_ext) {
             src_a = src_b = dst_chip = INVALID_CHIP;
-        } else {
-            /* --src-chip-a/b/--dst-chip 显式覆盖（机器真实 chip id 可能与自动值不同） */
-            if (args->src_chip_a >= 0) src_a = args->src_chip_a;
-            if (args->src_chip_b >= 0) src_b = args->src_chip_b;
-            if (args->dst_chip >= 0) dst_chip = args->dst_chip;
         }
 
         uint64_t t0 = now_ns();
@@ -840,10 +832,6 @@ static void *server_get_worker_main(void *arg)
             }
             if (!args->drv_ext) {
                 src_a = src_b = dst_chip = INVALID_CHIP;
-            } else {
-                if (args->src_chip_a >= 0) src_a = args->src_chip_a;
-                if (args->src_chip_b >= 0) src_b = args->src_chip_b;
-                if (args->dst_chip >= 0) dst_chip = args->dst_chip;
             }
             if (server_write_back(ctx, conn, w, &req, src_a, src_b, dst_chip) == 0) {
                 w->seen[slot] = seq;
@@ -1436,9 +1424,6 @@ static struct option g_long_options[] = {
     {"mbind", no_argument, NULL, 1015},
     {"drv-ext", no_argument, NULL, 1019},
     {"import-rtp", no_argument, NULL, 1023},
-    {"src-chip-a", required_argument, NULL, 1020},
-    {"src-chip-b", required_argument, NULL, 1021},
-    {"dst-chip", required_argument, NULL, 1022},
     {"seed", required_argument, NULL, 1016},
     {"fixed-offset", no_argument, NULL, 1017},
     {"timeout-ms", required_argument, NULL, 1018},
@@ -1471,9 +1456,6 @@ static void usage(void)
     printf("      --mbind                enable NUMA mbind of the buffer (default off; unsupported on some platforms)\n");
     printf("      --drv-ext              enable bonding chip routing (has_drv_ext + src/dst chip, default off)\n");
     printf("      --import-rtp           import remote jetty via plain RTP (skip bondp/CTP, workaround for driver crash)\n");
-    printf("      --src-chip-a <n>       override WR-A src chip id when --drv-ext (default auto)\n");
-    printf("      --src-chip-b <n>       override WR-B src chip id when --drv-ext (default auto)\n");
-    printf("      --dst-chip <n>         override dst chip id when --drv-ext (default auto)\n");
     printf("      --seed <n>             random seed for anti/none affinity (default 42)\n");
     printf("      --fixed-offset         always use offset 0 (hot-cache test) instead of cycling\n");
     printf("      --timeout-ms <ms>      completion timeout (default 5000)\n");
@@ -1544,7 +1526,6 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
     args->server_workers = 0;
     args->seed = 42;
     args->timeout_ms = DEFAULT_TIMEOUT_MS;
-    args->src_chip_a = args->src_chip_b = args->dst_chip = -1; /* chip 覆盖默认自动 */
 
     while (1) {
         int c = getopt_long(argc, argv, "m:d:i:p:e", g_long_options, NULL);
@@ -1646,15 +1627,6 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
                 break;
             case 1023:
                 args->import_rtp = true;
-                break;
-            case 1020:
-                args->src_chip_a = (int)strtol(optarg, NULL, 0);
-                break;
-            case 1021:
-                args->src_chip_b = (int)strtol(optarg, NULL, 0);
-                break;
-            case 1022:
-                args->dst_chip = (int)strtol(optarg, NULL, 0);
                 break;
             case 1016:
                 args->seed = (uint32_t)strtoul(optarg, NULL, 0);
