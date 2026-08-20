@@ -26,10 +26,13 @@ cmake --build build -j
 **注意：所有节点（客户端/服务器）的 UMDK 版本必须一致**。`bondp_rjetty_t`
 结构体在不同 UMDK 版本间布局有差异（新版含 `urma_bond_jetty_ext_t`），
 头文件与 `liburma_ubagg.so` 版本不匹配时，`bondp_import_jetty` 会按错误布局
-解析结构体导致段错误（gdb 栈：`bondp_import_jetty`）。绕行：双端加
-`--import-rtp` 走普通 RTP import（不经过 bondp 路径）；根治：统一各节点
-`rpm -qa | grep urma` 的版本，并确保编译用的头（`URMA_INCLUDE_PATH`）与
-机器上的库同源。
+解析结构体导致段错误（gdb 栈：`bondp_import_jetty`）。
+
+**import 默认 CTP 模式**（对齐 datasystem：bondp rjetty + `tp_type=CTP` +
+`has_drv_ext=1`，失败自动回退 RTP）。仅当 UMDK 版本不一致导致 CTP 路径
+崩溃时，双端加 `--import-rtp` 显式走普通 RTP import 绕行；根治仍是统一各
+节点 `rpm -qa | grep urma` 的版本，并确保编译用的头（`URMA_INCLUDE_PATH`）
+与机器上的库同源。
 
 ## 分层（对齐 yuanrong-datasystem）
 
