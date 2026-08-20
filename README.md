@@ -23,22 +23,25 @@ cmake --build build -j
 
 `UMDK_ROOT` 只提供 URMA 头文件和库；YuanRong 源码仓不参与构建。
 
-**注意：所有节点（客户端/服务器）的 UMDK 版本必须一致**。`bondp_rjetty_t`
-结构体在不同 UMDK 版本间布局有差异（新版含 `urma_bond_jetty_ext_t`），
-头文件与 `liburma_ubagg.so` 版本不匹配时，`bondp_import_jetty` 会按错误布局
-解析结构体导致段错误（gdb 栈：`bondp_import_jetty`）。
+**注意：编译用的 UMDK 头必须与运行机器上的 `liburma*` 库同源（同版本）**。
+`bondp_rjetty_t` 结构体在不同 UMDK 版本间布局有差异（新版含
+`urma_bond_jetty_ext_t`），头文件与 `liburma_ubagg.so` 版本不匹配时，
+`bondp_import_jetty` 会按错误布局解析结构体导致段错误（gdb 栈：
+`bondp_import_jetty` ← `urma_import_jetty`）。
+
+**实测踩坑**：在 26.06 机器上编译、把二进制直接传到 25.12.0-B105 机器上运行，
+CTP import 段错误，且表现为"进程内存布局敏感"——仅给 `argument_t` 加 3 个无用
+int 字段（或任何改布局的提交）就崩，改回去又可能不崩，极难排查。**真根因是
+头库版本不匹配**（26.06 头编译的 `bondp_rjetty_t` 被 25.12 库按旧布局解析）。
+修复：在目标机器上编译（或 `-DUMDK_ROOT` 指向与运行库同版本的头），或统一
+各节点 UMDK 版本。
 
 **import 默认 CTP 模式**（对齐 datasystem：bondp rjetty + `tp_type=CTP` +
-`has_drv_ext=1`，失败自动回退 RTP）。以下场景需双端加 `--import-rtp` 显式走
-普通 RTP import 绕行：
-- UMDK 版本不一致导致 CTP 路径崩溃；
-- **UMDK 25.12.0-B105 固件**：`bondp_import_jetty` 对进程内存布局敏感
-  （实测：仅给 `argument_t` 增加 3 个无用 int 字段改变进程布局即触发段错误，
-  与业务逻辑无关；gdb 栈 `bondp_import_jetty` ← `urma_import_jetty`），
-  该版本建议直接使用 `--import-rtp`。
-
-根治仍是统一各节点 `rpm -qa | grep urma` 的版本，并确保编译用的头
-（`URMA_INCLUDE_PATH`）与机器上的库同源。
+`has_drv_ext=1`，失败自动回退 RTP）。以下场景可双端加 `--import-rtp` 显式走
+普通 RTP import 绕行（RTP 路径用普通 `urma_rjetty_t`，跨版本稳定，不经过
+`bondp_import_jetty`）：
+- 头库版本不匹配、暂时无法重新编译时；
+- UMDK 版本不一致导致 CTP 路径崩溃时。
 
 ## 分层（对齐 yuanrong-datasystem）
 
