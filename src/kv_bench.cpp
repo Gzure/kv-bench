@@ -93,6 +93,7 @@ typedef struct argument {
   uint32_t seed;
   bool fixed_offset;
   int timeout_ms;
+  bool query_chips; /* 只查询 chip 路由选择（不初始化 URMA），打印后退出 */
 } argument_t;
 
 /* 客户端 -> 服务器 请求（seq 放最后，读方 acquire 保证前置字段可见）; 32B
@@ -1450,6 +1451,7 @@ static struct option g_long_options[] = {
     {"seed", required_argument, NULL, 1016},
     {"fixed-offset", no_argument, NULL, 1017},
     {"timeout-ms", required_argument, NULL, 1018},
+    {"query-chips", no_argument, NULL, 1024},
     {NULL, 0, NULL, 0}};
 
 static void usage(void) {
@@ -1498,6 +1500,8 @@ static void usage(void) {
   printf("      --fixed-offset         always use offset 0 (hot-cache test) "
          "instead of cycling\n");
   printf("      --timeout-ms <ms>      completion timeout (default 5000)\n");
+  printf("      --query-chips          print CPU->NUMA->chip and pick_round_chips "
+         "selection, then exit\n");
 }
 
 static int validate_input_params(argument_t *args) {
@@ -1686,6 +1690,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
     case 1018:
       args->timeout_ms = (int)strtol(optarg, NULL, 0);
       break;
+    case 1024:
+      args->query_chips = true;
+      break;
     default:
       usage();
       return -1;
@@ -1704,12 +1711,77 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   return validate_input_params(args);
 }
 
+/* --query-chips: 只查询 chip 路由选择（不初始化 URMA）。打印
+ * CPU->NUMA->chip 拓扑、source/destination 列表的 chip，以及三种亲和模式下
+ * pick_round_chips 会选出的 src_a/src_b/dst，便于核对配置。 */
+static int run_chip_query(const argument_t *args) {
+  printf("== CPU -> NUMA -> chip (system topology) ==\n");
+  {
+    int cpus[MAX_CPUS];
+    int n = enumerate_all_cpus(cpus, MAX_CPUS);
+    for (int i = 0; i < n; i++) {
+      printf("  cpu %4d -> numa %2d -> chip %d\n", cpus[i],
+             read_cpu_numa(cpus[i]), cpu_to_chip(cpus[i]));
+    }
+  }
+  printf("== source-cpus (client side) ==\n");
+  {
+    int cpus[MAX_CPUS];
+    int n = parse_cpu_list(args->source_cpus, cpus, MAX_CPUS);
+    if (n == 0) {
+      n = enumerate_all_cpus(cpus, MAX_CPUS);
+      printf("  (--source-cpus not set; using all cpus)\n");
+    }
+    for (int i = 0; i < n; i++) {
+      printf("  cpu %4d -> numa %2d -> chip %d\n", cpus[i],
+             read_cpu_numa(cpus[i]), cpu_to_chip(cpus[i]));
+    }
+  }
+  printf("== destination-cpus (server side) ==\n");
+  {
+    int cpus[MAX_CPUS];
+    int n = parse_cpu_list(args->destination_cpus, cpus, MAX_CPUS);
+    if (n == 0) {
+      n = enumerate_all_cpus(cpus, MAX_CPUS);
+      printf("  (--destination-cpus not set; using all cpus)\n");
+    }
+    for (int i = 0; i < n; i++) {
+      printf("  cpu %4d -> numa %2d -> chip %d\n", cpus[i],
+             read_cpu_numa(cpus[i]), cpu_to_chip(cpus[i]));
+    }
+  }
+  printf("== first_dst_chip = %d ==\n", first_dst_chip(args));
+
+  static const char *mode_names[] = {"affinity", "anti", "none"};
+  uint32_t workers = args->threads > 0 ? args->threads : 1;
+  for (int m = AFF_AFFINITY; m <= AFF_NONE; m++) {
+    argument_t tmp = *args; /* pick_round_chips 按 args->affinity_mode 分支 */
+    tmp.affinity_mode = m;
+    printf("== pick_round_chips (mode=%s, threads=%u, seed=%u) ==\n",
+           mode_names[m], workers, tmp.seed);
+    for (uint32_t i = 0; i < workers; i++) {
+      worker_t w;
+      (void)memset(&w, 0, sizeof(w));
+      w.id = i;
+      w.rng = tmp.seed + i * 2654435761u;
+      int sa, sb, dst;
+      pick_round_chips(&tmp, true, &w, &sa, &sb, &dst);
+      printf("  worker %u: src_a=%d src_b=%d dst=%d\n", i, sa, sb, dst);
+    }
+  }
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   argument_t args{};
   int ret;
 
   ret = parse_arguments(argc, argv, &args);
   if (ret != 0) {
+    goto main_exit;
+  }
+  if (args.query_chips) {
+    ret = run_chip_query(&args);
     goto main_exit;
   }
   if (args.server_ip != NULL) {
