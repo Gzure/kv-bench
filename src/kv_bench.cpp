@@ -128,6 +128,7 @@ typedef struct conn {
     worker_t *workers;
     uint32_t worker_count;
     pthread_t tid;
+    volatile bool fatal; /* 首错即中断（服务器 get 回写） */
 } conn_t;
 
 struct context {
@@ -146,6 +147,7 @@ struct context {
     worker_t *workers;
     uint32_t worker_count;
     volatile bool stop;
+    volatile bool fatal; /* 首错即中断（客户端打流） */
 
     /* 服务器 */
     int listen_fd;
@@ -639,7 +641,7 @@ static void *client_worker_main(void *arg)
     uint64_t window = (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
     w->off = (uint64_t)w->id * DATA_WINDOW_PER_THREAD * args->value_size;
 
-    while (!w->stop && now_ns() < deadline) {
+    while (!w->stop && !ctx->fatal && now_ns() < deadline) {
         uint64_t now = now_ns();
         if (interval_ns > 0) {
             if (now < w->next_post_ns) {
@@ -685,6 +687,12 @@ static void *client_worker_main(void *arg)
             __atomic_add_fetch(&w->bytes, round_bytes, __ATOMIC_RELAXED);
         } else {
             __atomic_add_fetch(&w->errors, 1, __ATOMIC_RELAXED);
+            /* 首错即中断：置 fatal，其它线程一并退出 */
+            if (!ctx->fatal) {
+                ctx->fatal = true;
+                fprintf(stderr, "[fatal] first round failed (worker %u), aborting...\n", w->id);
+            }
+            break;
         }
 
         if (!args->fixed_offset) {
@@ -788,7 +796,7 @@ static void *server_get_worker_main(void *arg)
 
     get_req_t *ring = (get_req_t *)ctx->va;
     uint32_t g = conn->worker_count;
-    while (!w->stop && !ctx->stop) {
+    while (!w->stop && !ctx->stop && !conn->fatal) {
         bool worked = false;
         for (uint32_t slot = w->local_index % g; slot < RING_SLOTS; slot += g) {
             uint64_t seq = __atomic_load_n(&ring[slot].seq, __ATOMIC_ACQUIRE);
@@ -814,6 +822,11 @@ static void *server_get_worker_main(void *arg)
             } else {
                 __atomic_add_fetch(&w->errors, 1, __ATOMIC_RELAXED);
                 w->seen[slot] = seq; /* 放弃该请求，避免死循环 */
+                /* 首错即中断 */
+                if (!conn->fatal) {
+                    conn->fatal = true;
+                    fprintf(stderr, "[fatal] write-back failed, aborting server workers\n");
+                }
             }
             worked = true;
         }
@@ -1048,6 +1061,17 @@ static int run_client(const argument_t *args)
     ctx->stop = true;
     if (sampler_thread != 0) {
         pthread_join(sampler_thread, NULL);
+    }
+
+    if (ctx->fatal) {
+        fprintf(stderr, "\n==== abort: first round error, run stopped early ====\n");
+        /* 通知服务器结束（EOF 语义） */
+        char sync_msg = 'E';
+        (void)write(sockfd, &sync_msg, 1);
+        close(sockfd);
+        sockfd = -1;
+        destroy_context(ctx, sockfd);
+        return -1;
     }
 
     print_client_summary(ctx, (double)(t1 - t0) / 1e9);
