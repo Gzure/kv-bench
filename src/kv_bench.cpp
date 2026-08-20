@@ -69,7 +69,6 @@ typedef struct argument {
     unsigned int server_port;
     unsigned int trans_mode; /* 0=RM 1=RC 2=UM 3=RS */
     bool multi_path;
-    unsigned int tp_type;
     bool event_mode;
     uint64_t value_size;
     uint64_t qps;
@@ -1419,7 +1418,6 @@ static struct option g_long_options[] = {
     {"dev-name", required_argument, NULL, 'd'},
     {"server-ip", required_argument, NULL, 'i'},
     {"server-port", required_argument, NULL, 'p'},
-    {"tp-type", required_argument, NULL, 't'},
     {"multi-path", required_argument, NULL, 'u'},
     {"event-mode", no_argument, NULL, 'e'},
     {"value-size", required_argument, NULL, 1000},
@@ -1456,7 +1454,6 @@ static void usage(void)
     printf("  -d, --dev-name <dev>       device name, e.g. bonding0 (default bonding0)\n");
     printf("  -i, --server-ip <ip>       server ip address given only by client\n");
     printf("  -p, --server-port <port>   listen on/connect to port <port> (default %d)\n", DEFAULT_PORT);
-    printf("  -t, --tp-type <type>       0 for URMA_RTP, 1 for URMA_CTP, 2 for URMA_UTP\n");
     printf("  -u, --multi-path           use multipath instead of single path (default false)\n");
     printf("  -e, --event-mode           use wait_jfc/ack/rearm event mode (default false)\n");
     printf("      --value-size <bytes>   per-WR payload, e.g. 4M/8M (default 4M)\n");
@@ -1485,7 +1482,7 @@ static void usage(void)
     printf("      --timeout-ms <ms>      completion timeout (default 5000)\n");
 }
 
-static int validate_input_params(argument_t *args, bool tp_type_input_flag, bool multi_path_input_flag)
+static int validate_input_params(argument_t *args, bool multi_path_input_flag)
 {
     if (args->dev_name == NULL || args->value_size == 0 || args->value_size > UINT32_MAX ||
         args->duration_sec == 0 || args->jetty_count == 0 || args->jetty_count > MAX_JETTY_COUNT) {
@@ -1516,15 +1513,8 @@ static int validate_input_params(argument_t *args, bool tp_type_input_flag, bool
         fprintf(stderr, "Invalid trans mode %d\n", args->trans_mode);
         return -1;
     }
-    if (args->tp_type > 2) {
-        fprintf(stderr, "Invalid tp type %d\n", args->tp_type);
-        return -1;
-    }
 
     if (strncmp(args->dev_name, "bonding", strlen("bonding")) == 0) {
-        if (tp_type_input_flag) {
-            fprintf(stderr, "Warning: TP type should not be set for bonding device.\n");
-        }
         /* bonding + RM 要求 multi-path：自动开启，无需手动加 -u */
         if (args->trans_mode == 0 && !args->multi_path) {
             fprintf(stderr, "Info: bonding device with RM trans-mode requires multi-path, enabling it automatically.\n");
@@ -1538,10 +1528,6 @@ static int validate_input_params(argument_t *args, bool tp_type_input_flag, bool
     } else {
         if (multi_path_input_flag) {
             fprintf(stderr, "Error: Multi path should not be set for non-bonding device.\n");
-            return -1;
-        }
-        if (!(((args->trans_mode != 2) && (args->tp_type != 2)) || (args->trans_mode == 2 && args->tp_type == 2))) {
-            fprintf(stderr, "Error: This combination of tp-type and trans-mode is invalid on non-bonding device.\n");
             return -1;
         }
     }
@@ -1573,10 +1559,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
     args->src_chip_a = args->src_chip_b = args->dst_chip = -1; /* chip 覆盖默认自动 */
 
     bool multi_path_input_flag = false;
-    bool tp_type_input_flag = false;
 
     while (1) {
-        int c = getopt_long(argc, argv, "m:d:i:p:t:ue", g_long_options, NULL);
+        int c = getopt_long(argc, argv, "m:d:i:p:ue", g_long_options, NULL);
         if (c == -1) {
             break;
         }
@@ -1598,10 +1583,6 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
                 break;
             case 'p':
                 args->server_port = (unsigned int)strtoul(optarg, NULL, 0);
-                break;
-            case 't':
-                args->tp_type = (unsigned int)strtoul(optarg, NULL, 0);
-                tp_type_input_flag = true;
                 break;
             case 'u':
                 args->multi_path = true;
@@ -1716,7 +1697,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
         args->dev_name = strdup("bonding0");
         if (args->dev_name == NULL) return -1;
     }
-    return validate_input_params(args, tp_type_input_flag, multi_path_input_flag);
+    return validate_input_params(args, multi_path_input_flag);
 }
 
 int main(int argc, char *argv[])
