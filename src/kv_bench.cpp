@@ -332,7 +332,22 @@ static int enumerate_all_cpus(int *out, int max_out)
 
 /* mbind: 把 [addr, addr+len) 绑定到 node（用 syscall 避免 libnuma 依赖） */
 /* mbind: 把 [addr, addr+len) 绑定到 node（用 syscall 避免 libnuma 依赖）。
- * addr 需页对齐；掩码用满字长数组，maxnode 取系统实际节点数（≤ MAX_NUMNODES）。 */
+ * 不同内核的 get_nodes() 对 maxnode 的拷贝/钳制行为不同（maxnode<8 时部分内核
+ * 拷 0 字节 → 节点集为空 → EINVAL），故逐个尝试多种 maxnode。 */
+static void print_mems_allowed(void)
+{
+    FILE *f = fopen("/proc/self/status", "r");
+    if (f == NULL) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, "Mems_allowed:", 13) == 0) {
+            fprintf(stderr, "  /proc/self/status: %s", line);
+            break;
+        }
+    }
+    fclose(f);
+}
+
 static int mbind_to_node(void *addr, size_t len, int node)
 {
     int num_nodes = get_num_numa_nodes();
@@ -341,13 +356,23 @@ static int mbind_to_node(void *addr, size_t len, int node)
     size_t ext = ((uintptr_t)addr - start) + len;
     unsigned long mask[64] = {0}; /* 512B = 4096 bit，足够 MAX_NUMNODES */
     mask[node / (8 * sizeof(unsigned long))] = 1UL << (node % (8 * sizeof(unsigned long)));
-    long rc = syscall(SYS_mbind, (void *)start, ext, MPOL_BIND, mask, num_nodes, 0);
-    if (rc != 0) {
-        fprintf(stderr, "Warning: mbind(addr=0x%lx len=%zu node=%d) failed, errno=%d (%s)\n",
-                (unsigned long)start, ext, node, errno, strerror(errno));
-        return -1;
+
+    /* 候选 maxnode：系统节点数 / 字对齐 / 固定较大值 */
+    long candidates[3];
+    candidates[0] = num_nodes;
+    candidates[1] = ((long)node / 64 + 1) * 64;
+    candidates[2] = 128;
+    for (int i = 0; i < 3; i++) {
+        if (syscall(SYS_mbind, (void *)start, ext, MPOL_BIND, mask, candidates[i], 0) == 0) {
+            return 0;
+        }
     }
-    return 0;
+    fprintf(stderr,
+            "Warning: mbind(addr=0x%lx len=%zu node=%d) failed, errno=%d (%s); "
+            "NUMA binding skipped\n",
+            (unsigned long)start, ext, node, errno, strerror(errno));
+    print_mems_allowed();
+    return -1;
 }
 
 /* ---------------- 缓冲布局 ---------------- */
