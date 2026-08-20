@@ -29,10 +29,16 @@ cmake --build build -j
 解析结构体导致段错误（gdb 栈：`bondp_import_jetty`）。
 
 **import 默认 CTP 模式**（对齐 datasystem：bondp rjetty + `tp_type=CTP` +
-`has_drv_ext=1`，失败自动回退 RTP）。仅当 UMDK 版本不一致导致 CTP 路径
-崩溃时，双端加 `--import-rtp` 显式走普通 RTP import 绕行；根治仍是统一各
-节点 `rpm -qa | grep urma` 的版本，并确保编译用的头（`URMA_INCLUDE_PATH`）
-与机器上的库同源。
+`has_drv_ext=1`，失败自动回退 RTP）。以下场景需双端加 `--import-rtp` 显式走
+普通 RTP import 绕行：
+- UMDK 版本不一致导致 CTP 路径崩溃；
+- **UMDK 25.12.0-B105 固件**：`bondp_import_jetty` 对进程内存布局敏感
+  （实测：仅给 `argument_t` 增加 3 个无用 int 字段改变进程布局即触发段错误，
+  与业务逻辑无关；gdb 栈 `bondp_import_jetty` ← `urma_import_jetty`），
+  该版本建议直接使用 `--import-rtp`。
+
+根治仍是统一各节点 `rpm -qa | grep urma` 的版本，并确保编译用的头
+（`URMA_INCLUDE_PATH`）与机器上的库同源。
 
 ## 分层（对齐 yuanrong-datasystem）
 
