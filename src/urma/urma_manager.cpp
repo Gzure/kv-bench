@@ -543,11 +543,9 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   /* import 对端 jetty（legacy handshake，对齐 yuanrong BuildRemoteJetty +
    * ImportTargetJetty）。
    * 路径1（bonding/datasystem）: bondp_rjetty + tp_type=CTP + has_drv_ext=1；
-   * 路径2（SDK 示例）: 普通 urma_rjetty + tp_type=RTP。 */
-  std::shared_ptr<UrmaJetty> localRecvJetty = resource_.RecvJetty();
-  urma_jetty_t *localJettyRaw =
-      localRecvJetty != nullptr ? localRecvJetty->Raw() : nullptr;
-
+   * 路径2（SDK 示例）: 普通 urma_rjetty + tp_type=RTP。
+   * 注意：bondp.jetty 传 nullptr（对齐参考 ImportRemoteJetty/FinalizeOutboundConnection，
+   * 均传 nullptr；传本地 jetty 指针在部分固件上会导致 import 崩溃）。 */
   bondp_rjetty_t bondp;
   (void)memset(&bondp, 0, sizeof(bondp));
   bondp.base.jetty_id = remoteWire.jetty_id;
@@ -555,7 +553,7 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   bondp.base.type = URMA_JETTY;
   bondp.base.tp_type = URMA_CTP;
   bondp.base.flag.bs.has_drv_ext = 1;
-  bondp.jetty = localJettyRaw;
+  bondp.jetty = nullptr;
   if (!resource_.ImportTargetJetty(&bondp.base, newConn->targetJetty)) {
     /* 回退：SDK 示例 legacy 路径（RTP） */
     urma_rjetty_t rjetty;
