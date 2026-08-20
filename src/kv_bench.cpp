@@ -334,48 +334,43 @@ static int enumerate_all_cpus(int *out, int max_out)
 }
 
 /* mbind: 把 [addr, addr+len) 绑定到 node（用 syscall 避免 libnuma 依赖） */
-/* mbind: 把 [addr, addr+len) 绑定到 node（用 syscall 避免 libnuma 依赖）。
- * 不同内核的 get_nodes() 对 maxnode 的拷贝/钳制行为不同（maxnode<8 时部分内核
- * 拷 0 字节 → 节点集为空 → EINVAL），故逐个尝试多种 maxnode。 */
-static void print_mems_allowed(void)
-{
-    FILE *f = fopen("/proc/self/status", "r");
-    if (f == NULL) return;
-    char line[256];
-    while (fgets(line, sizeof(line), f) != NULL) {
-        if (strncmp(line, "Mems_allowed:", 13) == 0) {
-            fprintf(stderr, "  /proc/self/status: %s", line);
-            break;
-        }
-    }
-    fclose(f);
-}
-
+/* mbind: 把 [addr, addr+len) 绑定到 node。对齐参考 DistributeMemoryAcrossNumaNodeList
+ * (yuanrong numa_util.cpp)：
+ *   - MPOL_PREFERRED（首选节点，非强制，cpuset 受限也不会 EINVAL）
+ *   - maxnode=32（固定大值，避开小 maxnode 时内核拷贝 0 字节的怪癖）
+ *   - 1GB 分块 + 逐页 touch 触发实际分配 */
 static int mbind_to_node(void *addr, size_t len, int node)
 {
-    int num_nodes = get_num_numa_nodes();
-    if (node < 0 || num_nodes <= 0) return -1;
-    uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(PAGE_SIZE - 1);
-    size_t ext = ((uintptr_t)addr - start) + len;
-    unsigned long mask[64] = {0}; /* 512B = 4096 bit，足够 MAX_NUMNODES */
-    mask[node / (8 * sizeof(unsigned long))] = 1UL << (node % (8 * sizeof(unsigned long)));
-
-    /* 候选 maxnode：系统节点数 / 字对齐 / 固定较大值 */
-    long candidates[3];
-    candidates[0] = num_nodes;
-    candidates[1] = ((long)node / 64 + 1) * 64;
-    candidates[2] = 128;
-    for (int i = 0; i < 3; i++) {
-        if (syscall(SYS_mbind, (void *)start, ext, MPOL_BIND, mask, candidates[i], 0) == 0) {
-            return 0;
+    if (node < 0) return -1;
+    long pageSizeRaw = getpagesize();
+    if (pageSizeRaw <= 0) return -1;
+    uint64_t pageSize = (uint64_t)pageSizeRaw;
+    uintptr_t begin = (uintptr_t)addr;
+    uintptr_t end = begin + len;
+    uintptr_t alignedBegin = (begin / pageSize) * pageSize;
+    uintptr_t alignedEnd = ((end + pageSize - 1) / pageSize) * pageSize;
+    uint64_t alignedLen = alignedEnd - alignedBegin;
+    constexpr uint64_t kChunkBytes = 1ULL << 30; /* 1GB */
+    constexpr unsigned long kMaxNumaNodeCount = 32;
+    unsigned long mask = 1UL << (unsigned long)node;
+    uint8_t *p = (uint8_t *)alignedBegin;
+    for (uint64_t off = 0; off < alignedLen;) {
+        uint64_t chunk = alignedLen - off;
+        if (chunk > kChunkBytes) chunk = kChunkBytes;
+        long rc = syscall(SYS_mbind, p + off, chunk, MPOL_PREFERRED, &mask, kMaxNumaNodeCount, 0);
+        if (rc != 0) {
+            fprintf(stderr, "Warning: mbind(node=%d) failed, errno=%d (%s); NUMA binding skipped\n",
+                    node, errno, strerror(errno));
+            return -1;
         }
+        /* 逐页 touch，让页面落在首选节点 */
+        for (uint64_t pg = 0; pg < chunk; pg += pageSize) {
+            volatile uint8_t *t = p + off + pg;
+            *t = *t;
+        }
+        off += chunk;
     }
-    fprintf(stderr,
-            "Warning: mbind(addr=0x%lx len=%zu node=%d) failed, errno=%d (%s); "
-            "NUMA binding skipped\n",
-            (unsigned long)start, ext, node, errno, strerror(errno));
-    print_mems_allowed();
-    return -1;
+    return 0;
 }
 
 /* ---------------- 缓冲布局 ---------------- */
