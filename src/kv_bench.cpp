@@ -30,6 +30,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <time.h>
 #include <sched.h>
 #include <dirent.h>
@@ -961,6 +962,33 @@ static void *client_sampler_main(void *arg)
 
 /* ---------------- 客户端流程 ---------------- */
 
+/* 带超时的 TCP 连接：防火墙丢包/不可达时不再无限挂起（默认内核 SYN 重试约 2 分钟） */
+static int connect_with_timeout(int sockfd, const struct sockaddr *addr, socklen_t len, int timeout_ms)
+{
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    (void)fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(sockfd, addr, len);
+    if (rc != 0 && errno != EINPROGRESS) {
+        (void)fcntl(sockfd, F_SETFL, flags);
+        return -1;
+    }
+    if (rc == 0) {
+        (void)fcntl(sockfd, F_SETFL, flags);
+        return 0;
+    }
+    struct pollfd pfd = {sockfd, POLLOUT, 0};
+    int pr = poll(&pfd, 1, timeout_ms);
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    if (pr > 0) {
+        (void)getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+    } else {
+        soerr = ETIMEDOUT;
+    }
+    (void)fcntl(sockfd, F_SETFL, flags);
+    return soerr == 0 ? 0 : -1;
+}
+
 static int client_connect_and_exchange(context_t *ctx, const argument_t *args)
 {
     struct sockaddr_in addr;
@@ -972,8 +1000,10 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args)
     addr.sin_family = AF_INET;
     addr.sin_port = htons(args->server_port);
     addr.sin_addr.s_addr = inet_addr(args->server_ip);
-    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(struct sockaddr))) {
-        fprintf(stderr, "Failed to connect, err: [%d]%s\n", errno, strerror(errno));
+    if (connect_with_timeout(sockfd, (struct sockaddr *)&addr, sizeof(addr), 5000) != 0) {
+        fprintf(stderr, "Failed to connect %s:%u (timeout 5s, errno=%d %s); "
+                        "check server is running and reachable\n",
+                args->server_ip, args->server_port, errno, strerror(errno));
         close(sockfd);
         return -1;
     }
