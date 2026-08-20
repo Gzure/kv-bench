@@ -135,7 +135,8 @@ private:
   void PollThreadMain();
   void CompleteEvent(uint32_t workerId, uint64_t userCtx, bool ok);
   bool Exchange(int sockfd, const HandshakeParams &params,
-                std::shared_ptr<UrmaConnection> &conn);
+                std::shared_ptr<UrmaConnection> &conn,
+                bool preferRtp = false);
   static int GetEidIndex(urma_device_t *dev);
 
   UrmaResource resource_;
