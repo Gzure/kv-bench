@@ -350,6 +350,8 @@ static int mbind_to_node(void *addr, size_t len, int node)
 
 /* ---------------- 缓冲布局 ---------------- */
 
+/* 注意：这里只计算各区域【尺寸】；client_data/client_flags 等【指针】必须在
+ * ctx->va = memalign() 之后计算（setup_buffer 内），否则会用 NULL 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx)
 {
     const argument_t *args = &ctx->args;
@@ -358,8 +360,6 @@ static int layout_client_buffer(context_t *ctx)
     ctx->data_len = (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * size;
     ctx->flag_bytes = (uint64_t)args->threads * FLAG_PER_THREAD;
     ctx->buf_len = ROUND_UP(ctx->req_bytes + ctx->data_len + ctx->flag_bytes, PAGE_SIZE);
-    ctx->client_data = (uint8_t *)ctx->va + ctx->req_bytes;
-    ctx->client_flags = ctx->client_data + ctx->data_len;
     return 0;
 }
 
@@ -371,8 +371,6 @@ static int layout_server_buffer(context_t *ctx)
     ctx->data_len = (uint64_t)SERVER_DATA_WINDOW * size;
     ctx->flag_bytes = 0;
     ctx->buf_len = ROUND_UP(RING_BYTES + ctx->data_len + 16, PAGE_SIZE); /* +16 回写标志源槽 */
-    ctx->client_data = (uint8_t *)ctx->va + RING_BYTES;
-    ctx->client_flags = NULL;
     return 0;
 }
 
@@ -391,6 +389,14 @@ static int setup_buffer(context_t *ctx, bool is_server)
         return -1;
     }
     (void)memset(ctx->va, 0, ctx->buf_len);
+    /* va 就绪后再计算区域指针 */
+    if (is_server) {
+        ctx->client_data = (uint8_t *)ctx->va + RING_BYTES;
+        ctx->client_flags = NULL;
+    } else {
+        ctx->client_data = (uint8_t *)ctx->va + ctx->req_bytes;
+        ctx->client_flags = ctx->client_data + ctx->data_len;
+    }
     if (!ctx->mgr->RegisterBuffer(ctx->va, ctx->buf_len)) {
         fprintf(stderr, "Failed to register buffer\n");
         return -1;
