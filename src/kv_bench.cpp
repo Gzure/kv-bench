@@ -85,8 +85,11 @@ typedef struct argument {
     uint32_t report_interval;
     uint32_t server_workers; /* 0=auto(=client threads) */
     bool get_fence;
-    bool no_mbind;
+    bool mbind; /* NUMA 绑定，默认关（Kunpeng/部分平台 mbind 不可用），--mbind 显式开启 */
     bool drv_ext; /* bonding chip 路由（has_drv_ext + src/dst chip），默认关 */
+    int src_chip_a; /* drv-ext chip 覆盖：-1=自动（NumaIdToChipId），>=0=显式指定 */
+    int src_chip_b;
+    int dst_chip;
     uint32_t seed;
     bool fixed_offset;
     int timeout_ms;
@@ -428,7 +431,7 @@ static int setup_buffer(context_t *ctx, bool is_server)
         fprintf(stderr, "Failed to register buffer\n");
         return -1;
     }
-    if (!args->no_mbind && args->affinity_mode == AFF_AFFINITY) {
+    if (args->mbind && args->affinity_mode == AFF_AFFINITY) {
         int dst_cpus[MAX_CPUS];
         int n = parse_cpu_list(args->destination_cpus, dst_cpus, MAX_CPUS);
         if (n > 0) {
@@ -689,6 +692,11 @@ static void *client_worker_main(void *arg)
          * --drv-ext 显式开启后使用 src/dst chip 路由 */
         if (!args->drv_ext) {
             src_a = src_b = dst_chip = INVALID_CHIP;
+        } else {
+            /* --src-chip-a/b/--dst-chip 显式覆盖（机器真实 chip id 可能与自动值不同） */
+            if (args->src_chip_a >= 0) src_a = args->src_chip_a;
+            if (args->src_chip_b >= 0) src_b = args->src_chip_b;
+            if (args->dst_chip >= 0) dst_chip = args->dst_chip;
         }
 
         uint64_t t0 = now_ns();
@@ -837,6 +845,10 @@ static void *server_get_worker_main(void *arg)
             }
             if (!args->drv_ext) {
                 src_a = src_b = dst_chip = INVALID_CHIP;
+            } else {
+                if (args->src_chip_a >= 0) src_a = args->src_chip_a;
+                if (args->src_chip_b >= 0) src_b = args->src_chip_b;
+                if (args->dst_chip >= 0) dst_chip = args->dst_chip;
             }
             if (server_write_back(ctx, conn, w, &req, src_a, src_b, dst_chip) == 0) {
                 w->seen[slot] = seq;
@@ -1399,8 +1411,11 @@ static struct option g_long_options[] = {
     {"report-interval", required_argument, NULL, 1012},
     {"server-workers", required_argument, NULL, 1013},
     {"get-fence", no_argument, NULL, 1014},
-    {"no-mbind", no_argument, NULL, 1015},
+    {"mbind", no_argument, NULL, 1015},
     {"drv-ext", no_argument, NULL, 1019},
+    {"src-chip-a", required_argument, NULL, 1020},
+    {"src-chip-b", required_argument, NULL, 1021},
+    {"dst-chip", required_argument, NULL, 1022},
     {"seed", required_argument, NULL, 1016},
     {"fixed-offset", no_argument, NULL, 1017},
     {"timeout-ms", required_argument, NULL, 1018},
@@ -1432,8 +1447,11 @@ static void usage(void)
     printf("      --report-interval <s>  periodic report interval (default 1)\n");
     printf("      --server-workers <n>   server get write-back workers per conn (0=auto=client threads)\n");
     printf("      --get-fence            get 回写拆成 data WR + fence flag WR\n");
-    printf("      --no-mbind             disable NUMA mbind of the destination data area\n");
+    printf("      --mbind                enable NUMA mbind of the buffer (default off; unsupported on some platforms)\n");
     printf("      --drv-ext              enable bonding chip routing (has_drv_ext + src/dst chip, default off)\n");
+    printf("      --src-chip-a <n>       override WR-A src chip id when --drv-ext (default auto)\n");
+    printf("      --src-chip-b <n>       override WR-B src chip id when --drv-ext (default auto)\n");
+    printf("      --dst-chip <n>         override dst chip id when --drv-ext (default auto)\n");
     printf("      --seed <n>             random seed for anti/none affinity (default 42)\n");
     printf("      --fixed-offset         always use offset 0 (hot-cache test) instead of cycling\n");
     printf("      --timeout-ms <ms>      completion timeout (default 5000)\n");
@@ -1524,6 +1542,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
     args->server_workers = 0;
     args->seed = 42;
     args->timeout_ms = DEFAULT_TIMEOUT_MS;
+    args->src_chip_a = args->src_chip_b = args->dst_chip = -1; /* chip 覆盖默认自动 */
 
     bool multi_path_input_flag = false;
     bool tp_type_input_flag = false;
@@ -1629,10 +1648,19 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
                 args->get_fence = true;
                 break;
             case 1015:
-                args->no_mbind = true;
+                args->mbind = true;
                 break;
             case 1019:
                 args->drv_ext = true;
+                break;
+            case 1020:
+                args->src_chip_a = (int)strtol(optarg, NULL, 0);
+                break;
+            case 1021:
+                args->src_chip_b = (int)strtol(optarg, NULL, 0);
+                break;
+            case 1022:
+                args->dst_chip = (int)strtol(optarg, NULL, 0);
                 break;
             case 1016:
                 args->seed = (uint32_t)strtoul(optarg, NULL, 0);
