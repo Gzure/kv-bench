@@ -85,6 +85,7 @@ typedef struct argument {
     uint32_t server_workers; /* 0=auto(=client threads) */
     bool get_fence;
     bool no_mbind;
+    bool drv_ext; /* bonding chip 路由（has_drv_ext + src/dst chip），默认关 */
     uint32_t seed;
     bool fixed_offset;
     int timeout_ms;
@@ -647,8 +648,13 @@ static void *client_worker_main(void *arg)
         int src_a, src_b, dst_chip;
         pick_round_chips(args, true, w, &src_a, &src_b, &dst_chip);
         /* 目的 chip 优先用服务器握手通告值（与服务器 --destination-cpus 一致） */
-        if (ctx->conn != nullptr && ctx->conn->peer.dstChip != INVALID_CHIP) {
+        if (args->drv_ext && ctx->conn != nullptr && ctx->conn->peer.dstChip != INVALID_CHIP) {
             dst_chip = (int)ctx->conn->peer.dstChip;
+        }
+        /* 默认不走 bonding chip 路由（has_drv_ext=0 + INVALID chip，对齐参考默认路径）；
+         * --drv-ext 显式开启后使用 src/dst chip 路由 */
+        if (!args->drv_ext) {
+            src_a = src_b = dst_chip = INVALID_CHIP;
         }
 
         uint64_t t0 = now_ns();
@@ -786,8 +792,11 @@ static void *server_get_worker_main(void *arg)
             int src_a, src_b, dst_chip;
             pick_round_chips(args, false, w, &src_a, &src_b, &dst_chip);
             /* get 回写目的 = 客户端缓冲 -> 客户端目的 chip（亲和/反亲和使用） */
-            if (conn->conn != nullptr && conn->conn->peer.dstChip != INVALID_CHIP) {
+            if (args->drv_ext && conn->conn != nullptr && conn->conn->peer.dstChip != INVALID_CHIP) {
                 dst_chip = (int)conn->conn->peer.dstChip;
+            }
+            if (!args->drv_ext) {
+                src_a = src_b = dst_chip = INVALID_CHIP;
             }
             if (server_write_back(ctx, conn, w, &req, src_a, src_b, dst_chip) == 0) {
                 w->seen[slot] = seq;
@@ -1329,6 +1338,7 @@ static struct option g_long_options[] = {
     {"server-workers", required_argument, NULL, 1013},
     {"get-fence", no_argument, NULL, 1014},
     {"no-mbind", no_argument, NULL, 1015},
+    {"drv-ext", no_argument, NULL, 1019},
     {"seed", required_argument, NULL, 1016},
     {"fixed-offset", no_argument, NULL, 1017},
     {"timeout-ms", required_argument, NULL, 1018},
@@ -1361,6 +1371,7 @@ static void usage(void)
     printf("      --server-workers <n>   server get write-back workers per conn (0=auto=client threads)\n");
     printf("      --get-fence            get 回写拆成 data WR + fence flag WR\n");
     printf("      --no-mbind             disable NUMA mbind of the destination data area\n");
+    printf("      --drv-ext              enable bonding chip routing (has_drv_ext + src/dst chip, default off)\n");
     printf("      --seed <n>             random seed for anti/none affinity (default 42)\n");
     printf("      --fixed-offset         always use offset 0 (hot-cache test) instead of cycling\n");
     printf("      --timeout-ms <ms>      completion timeout (default 5000)\n");
@@ -1557,6 +1568,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args)
                 break;
             case 1015:
                 args->no_mbind = true;
+                break;
+            case 1019:
+                args->drv_ext = true;
                 break;
             case 1016:
                 args->seed = (uint32_t)strtoul(optarg, NULL, 0);
