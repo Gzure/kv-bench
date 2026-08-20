@@ -530,6 +530,14 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b, in
     }
     bool ok_a = mgr->WaitEvent(w->id, seq_a, args->timeout_ms);
     bool ok_b = mgr->WaitEvent(w->id, seq_b, args->timeout_ms);
+    if (!ok_a) {
+        fprintf(stderr, "[wr] wait A failed (seq=%lu, src_chip=%d, dst_chip=%d)\n",
+                (unsigned long)seq_a, src_a, dst_chip);
+    }
+    if (!ok_b) {
+        fprintf(stderr, "[wr] wait B failed (seq=%lu, src_chip=%d, dst_chip=%d)\n",
+                (unsigned long)seq_b, src_b, dst_chip);
+    }
     mgr->ReleaseSendLane(jetty);
     return (ok_a && ok_b) ? 0 : -1;
 }

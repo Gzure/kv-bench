@@ -285,7 +285,9 @@ bool UrmaManager::Init(const std::string &devName, bool cacheable,
   }
   stop_ = false;
   initialized_ = true;
-  return true;
+  /* 轮询线程 Init 即启动（对齐参考 UrmaManager::Init 起 UrmaPollJfc）：
+   * 服务器 write 模式无打流线程，也必须推进本地 JFC 让路径建立/应答 */
+  return EnsurePollThread();
 }
 
 void UrmaManager::Stop() {
@@ -447,6 +449,10 @@ void UrmaManager::PollThreadMain() {
       for (int i = 0; i < cnt; i++) {
         uint64_t userCtx = crs[i].user_ctx;
         uint32_t wid = (uint32_t)(userCtx >> kRidShift);
+        if (crs[i].status != URMA_CR_SUCCESS) {
+          fprintf(stderr, "[poll] CQE failed: status=%d user_ctx=%lu\n",
+                  crs[i].status, (unsigned long)userCtx);
+        }
         CompleteEvent(wid, userCtx, crs[i].status == URMA_CR_SUCCESS);
       }
     } else if (cnt == 0) {
