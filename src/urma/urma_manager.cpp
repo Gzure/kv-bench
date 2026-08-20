@@ -5,7 +5,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <poll.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -71,16 +70,6 @@ int SockSyncData(int sockfd, int size, char *localData, char *remoteData) {
   }
   int total = 0;
   while (total < size) {
-    /* 读等待带 5s 超时：服务器无响应时快速失败而非无限挂起 */
-    struct pollfd pfd = {sockfd, POLLIN, 0};
-    int pr = poll(&pfd, 1, 5000);
-    if (pr <= 0) {
-      fprintf(stderr,
-              "Failed reading data during exchange: timeout waiting for peer "
-              "(errno=%d %s)\n",
-              errno, strerror(errno));
-      return -1;
-    }
     int n = (int)read(sockfd, remoteData + total, (size_t)(size - total));
     if (n > 0) {
       total += n;
