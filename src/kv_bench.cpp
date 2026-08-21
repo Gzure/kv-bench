@@ -509,7 +509,7 @@ static void pick_round_chips(const argument_t *args, bool is_client,
     }
     *src_a = my_chip;
     *src_b = (my_chip == 1) ? 2 : 1;
-    *dst = dst_chip;
+    *dst = my_chip; /* 亲和: dst 跟随 src_a，src=1->dst=1, src=2->dst=2 */
   } else if (args->affinity_mode == AFF_ANTI) {
     int pool[MAX_CPUS];
     int np = n_mine > 0 ? n_mine : n_all;
