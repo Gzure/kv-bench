@@ -1,19 +1,17 @@
 #define _GNU_SOURCE
 
 /*
- * kv-bench 业务层：选项 / 亲和(chip) / 打流引擎 / get 请求环与回写 / 统计。
+ * kv-bench 业务层：选项 / 亲和(chip) / 打流引擎 / 统计。
  *
  * 分层（对齐 yuanrong-datasystem）：
  *   业务层(kv_bench.cpp) -> 管理层(urma/urma_manager) ->
  * 资源层(urma/urma_resource) -> liburma 数据通路只走 URMA： write(Put):
- * 客户端每轮从 bonding 双源 CPU 并发 2 条 WRITE 直写服务器内存 （--dual-mode
- * mirror: 各发满 size, 轮数据量 2*size; split: 各 size/2）。 get(Get):   客户端
- * WRITE 32B 请求进服务器请求环；服务器回写线程并发 2 条 WRITE（数据 + 完成标志
- * 2-sge）回写客户端缓冲，客户端等双 flag 完成 （对齐 datasystem worker
- * UbWriteHelper -> UrmaWritePayload 模型）。 统计：每线程
+ * 分片流水线（一次请求 80MB = 20 × 4MB 分片，每分片独立 jetty，亲和分片
+ * src==dst 交替 chip1/chip2，--concurrency 请求并发，jetty 池驱动发送）。
+ * get(Get): 客户端直接 READ 服务器数据区（URMA_OPC_READ）。 统计：每线程
  * HdrHistogram-lite，输出 avg/p50/p90/p99/p999/p9999/pmax + 带宽/IOPS。
- * 亲和：affinity(源/目的固定 CPU + 双
- * chip)/anti(源随机&目的固定)/none(双随机)。 无 bthread/brpc/protobuf 依赖。
+ * 亲和：affinity(分片源==目的==chip)/anti(源随机&目的固定)/none(双随机)。
+ * 无 bthread/brpc/protobuf 依赖。
  */
 
 #include "hist.h"
@@ -47,10 +45,6 @@
 #define MAX_CLIENT_CNT 10
 #define POLL_SLEEP_NS 1000L /* 1us */
 #define DEFAULT_PORT 13857
-#define GET_REQ_SIZE 32
-#define RING_SLOTS 4096
-#define RING_BYTES ((uint64_t)RING_SLOTS * GET_REQ_SIZE)
-#define FLAG_PER_THREAD 16 /* 2 x 8B */
 #define DATA_WINDOW_PER_THREAD                                                 \
   4 /* 客户端 data_len = threads * 4 * value_size（get/mixed 用） */
 #define SERVER_DATA_WINDOW 4
@@ -71,9 +65,8 @@
 #define INVALID_CHIP 0xFFu
 #define ROUND_UP(x, a) (((x) + (uint64_t)(a) - 1) & ~((uint64_t)(a) - 1))
 
-/* 操作类型 / 双发模式 / 亲和模式 */
+/* 操作类型 / 亲和模式 */
 enum { OP_WRITE = 0, OP_GET = 1, OP_MIXED = 2 };
-enum { DUAL_MIRROR = 0, DUAL_SPLIT = 1 };
 enum { AFF_AFFINITY = 0, AFF_ANTI = 1, AFF_NONE = 2 };
 
 typedef struct argument {
@@ -94,10 +87,7 @@ typedef struct argument {
   int concurrency; /* write 请求并发度 1..10，默认 1（在飞分片 = 20×N） */
   int op;
   uint32_t mixed_ratio;
-  int dual_mode;
   uint32_t report_interval;
-  uint32_t server_workers; /* 0=auto(=client threads) */
-  bool get_fence;
   bool mbind; /* NUMA 绑定，默认关（Kunpeng/部分平台 mbind 不可用），--mbind
                  显式开启 */
   bool drv_ext; /* bonding chip 路由（has_drv_ext + src/dst chip），默认关 */
@@ -108,16 +98,6 @@ typedef struct argument {
   int timeout_ms;
   bool query_chips; /* 只查询 chip 路由选择（不初始化 URMA），打印后退出 */
 } argument_t;
-
-/* 客户端 -> 服务器 请求（seq 放最后，读方 acquire 保证前置字段可见）; 32B
- * packed */
-typedef struct get_req {
-  uint64_t client_seg_va; /* 客户端 DataArea 起始 VA */
-  uint64_t client_off;
-  uint32_t size;
-  uint32_t flag_off;
-  uint64_t seq;
-} __attribute__((packed)) get_req_t;
 
 typedef struct context context_t;
 
@@ -132,7 +112,7 @@ typedef struct wr_slot {
 
 typedef struct worker {
   uint32_t id;          /* UrmaManager workerId（进程级全局） */
-  uint32_t local_index; /* 本连接/本进程内序号（get 环槽位分配用） */
+  uint32_t local_index; /* 本连接/本进程内序号 */
   kv_hist_t hist;
   volatile uint64_t ops;
   volatile uint64_t bytes;
@@ -140,8 +120,6 @@ typedef struct worker {
   uint64_t off; /* 客户端数据偏移（窗口内） */
   uint64_t next_post_ns;
   uint32_t rng;
-  uint64_t get_seq;
-  uint32_t *seen; /* 服务器 get 回写: RING_SLOTS */
   bool stop;
   pthread_t tid;
   void *run_arg;
@@ -156,10 +134,7 @@ typedef struct conn {
   bool used;
   context_t *ctx;
   std::shared_ptr<kv_bench::UrmaConnection> conn; /* 对端连接（import 结果） */
-  worker_t *workers;
-  uint32_t worker_count;
   pthread_t tid;
-  volatile bool fatal; /* 首错即中断（服务器 get 回写） */
 } conn_t;
 
 struct context {
@@ -169,11 +144,8 @@ struct context {
 
   void *va; /* 整个注册缓冲 */
   uint64_t buf_len;
-  uint64_t req_bytes; /* 客户端: threads*32 */
-  uint64_t data_len;  /* 客户端: threads*4*size; 服务器: 4*size */
-  uint64_t flag_bytes;
-  uint8_t *client_data;  /* 客户端: va+req_bytes; 服务器: va+RING_BYTES */
-  uint8_t *client_flags; /* 客户端: va+req_bytes+data_len */
+  uint64_t data_len;     /* 客户端: 每线程数据窗口; 服务器: 数据区 */
+  uint8_t *client_data;  /* 数据区起始（客户端读缓冲/写源；服务器数据源） */
 
   worker_t *workers;
   uint32_t worker_count;
@@ -185,7 +157,6 @@ struct context {
   bool server_stop;
   pthread_t sock_thread;
   conn_t conns[MAX_CLIENT_CNT];
-  uint64_t *server_flag_slot;
 };
 
 /* ---------------- 基础工具 ---------------- */
@@ -409,7 +380,7 @@ static int mbind_to_node(void *addr, size_t len, int node) {
 
 /* ---------------- 缓冲布局 ---------------- */
 
-/* 注意：这里只计算各区域【尺寸】；client_data/client_flags 等【指针】必须在
+/* 注意：这里只计算各区域【尺寸】；client_data 等【指针】必须在
  * ctx->va = memalign() 之后计算（setup_buffer 内），否则会用 NULL
  * 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx) {
@@ -423,25 +394,20 @@ static int layout_client_buffer(context_t *ctx) {
                           ? (uint64_t)args->threads * pipe_chunks * KV_CHUNK_SIZE
                           : (uint64_t)args->threads * DATA_WINDOW_PER_THREAD *
                                 args->value_size;
-  ctx->req_bytes = ROUND_UP((uint64_t)args->threads * GET_REQ_SIZE, PAGE_SIZE);
   ctx->data_len = data_len;
-  ctx->flag_bytes = (uint64_t)args->threads * FLAG_PER_THREAD;
-  ctx->buf_len =
-      ROUND_UP(ctx->req_bytes + ctx->data_len + ctx->flag_bytes, PAGE_SIZE);
+  ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
   return 0;
 }
 
 static int layout_server_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
   uint64_t size = args->value_size;
-  ctx->req_bytes = 0;
-  /* 服务器数据区：容纳 write 分片流水线最大窗口（10 并发 × 80MB = 800MB） */
+  /* 服务器数据区：容纳 write 分片流水线最大窗口（10 并发 × 80MB = 800MB）；
+   * get 为数据源（客户端 READ） */
   ctx->data_len =
       (args->op == OP_WRITE) ? SERVER_PIPE_BYTES
                              : (uint64_t)SERVER_DATA_WINDOW * size;
-  ctx->flag_bytes = 0;
-  ctx->buf_len = ROUND_UP(RING_BYTES + ctx->data_len + 16,
-                          PAGE_SIZE); /* +16 回写标志源槽 */
+  ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
   return 0;
 }
 
@@ -460,14 +426,8 @@ static int setup_buffer(context_t *ctx, bool is_server) {
     return -1;
   }
   (void)memset(ctx->va, 0, ctx->buf_len);
-  /* va 就绪后再计算区域指针 */
-  if (is_server) {
-    ctx->client_data = (uint8_t *)ctx->va + RING_BYTES;
-    ctx->client_flags = NULL;
-  } else {
-    ctx->client_data = (uint8_t *)ctx->va + ctx->req_bytes;
-    ctx->client_flags = ctx->client_data + ctx->data_len;
-  }
+  /* va 就绪后再计算区域指针：数据区从缓冲起始 */
+  ctx->client_data = (uint8_t *)ctx->va;
   if (!ctx->mgr->RegisterBuffer(ctx->va, ctx->buf_len)) {
     fprintf(stderr, "Failed to register buffer\n");
     return -1;
@@ -490,10 +450,6 @@ static int setup_buffer(context_t *ctx, bool is_server) {
         }
       }
     }
-  }
-  if (is_server) {
-    ctx->server_flag_slot =
-        (uint64_t *)((uint8_t *)ctx->va + RING_BYTES + ctx->data_len);
   }
   return 0;
 }
@@ -635,15 +591,12 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
   uint32_t size = (uint32_t)args->value_size;
-  uint32_t wr_len = (args->dual_mode == DUAL_MIRROR) ? size : size / 2;
+  uint32_t wr_len = size;
   uint64_t off_a = w->off;
   uint64_t off_b = w->off + wr_len;
   uint64_t server_data_len = (uint64_t)SERVER_DATA_WINDOW * size;
-  /* 服务器数据区在服务器段 RING_BYTES 之后 */
-  uint64_t remote_a =
-      conn.RemoteSegVa() + RING_BYTES + (off_a % server_data_len);
-  uint64_t remote_b =
-      conn.RemoteSegVa() + RING_BYTES + (off_b % server_data_len);
+  uint64_t remote_a = conn.RemoteSegVa() + (off_a % server_data_len);
+  uint64_t remote_b = conn.RemoteSegVa() + (off_b % server_data_len);
 
   /* 每轮从 jetty 池取一条新的 send lane（对齐 yuanrong AcquireSendLane） */
   std::shared_ptr<kv_bench::UrmaJetty> jetty;
@@ -698,8 +651,7 @@ static int post_one_chunk(context_t *ctx, worker_t *w, uint32_t slot_idx,
       (uint32_t)(KV_CHUNKS_PER_REQ *
                  (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
   uint64_t off = (chunk_seq % window_chunks) * KV_CHUNK_SIZE;
-  uint64_t remote =
-      conn.RemoteSegVa() + RING_BYTES + (off % SERVER_PIPE_BYTES);
+  uint64_t remote = conn.RemoteSegVa() + (off % SERVER_PIPE_BYTES);
 
   int src, dst;
   pick_chunk_chip(args, w, (uint32_t)(chunk_seq % KV_CHUNKS_PER_REQ), &src,
@@ -842,62 +794,33 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   return 0;
 }
 
+/* get：客户端直接 READ 服务器数据区（value-size 字节）到本地读缓冲 */
 static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_chip) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
-  uint64_t seq = ++w->get_seq;
-  uint32_t slot = (uint32_t)(seq % RING_SLOTS);
-  get_req_t *req =
-      (get_req_t *)((uint8_t *)ctx->va + (uint64_t)w->id * GET_REQ_SIZE);
-  req->client_seg_va = (uint64_t)ctx->client_data;
-  req->client_off = w->off;
-  req->size = (uint32_t)args->value_size;
-  req->flag_off = (uint32_t)w->id * FLAG_PER_THREAD;
-  __atomic_store_n(&req->seq, seq, __ATOMIC_RELEASE);
+  uint32_t size = (uint32_t)args->value_size;
+  uint64_t window = (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * size;
+  uint64_t off = w->off % window;
+  uint64_t remote = conn.RemoteSegVa() + (off % ((uint64_t)SERVER_DATA_WINDOW * size));
 
-  /* 每轮从 jetty 池取一条新的 send lane 发请求 */
   std::shared_ptr<kv_bench::UrmaJetty> jetty;
   if (!mgr->AcquireSendLane(jetty)) {
     fprintf(stderr, "[get] send lane pool exhausted\n");
     return -1;
   }
-
   uint64_t seq_e;
   uint64_t ue = mgr->PostEvent(w->id, seq_e);
-  if (!mgr->PostWrite(jetty, conn, (uint64_t)req,
-                      conn.RemoteSegVa() + (uint64_t)slot * GET_REQ_SIZE,
-                      GET_REQ_SIZE, (uint32_t)src_a, (uint32_t)dst_chip, ue)) {
-    fprintf(stderr, "[get] post request failed\n");
+  if (!mgr->PostRead(jetty, conn, (uint64_t)ctx->client_data + off, remote,
+                     size, (uint32_t)src_a, (uint32_t)dst_chip, ue)) {
+    fprintf(stderr, "[get] post read failed\n");
     mgr->AbortEvent(w->id, seq_e);
     mgr->ReleaseSendLane(jetty);
     return -1;
   }
-  if (!mgr->WaitEvent(w->id, seq_e, args->timeout_ms)) {
-    mgr->ReleaseSendLane(jetty);
-    return -1;
-  }
+  bool ok = mgr->WaitEvent(w->id, seq_e, args->timeout_ms);
   mgr->ReleaseSendLane(jetty);
-
-  /* 等服务器回写双 flag（服务器 WRITE 落客户端内存，acquire 保证数据可见） */
-  uint64_t *flag_a =
-      (uint64_t *)(ctx->client_flags + (uint64_t)w->id * FLAG_PER_THREAD);
-  uint64_t *flag_b = flag_a + 1;
-  uint64_t deadline = now_ns() + (uint64_t)args->timeout_ms * 1000000ULL;
-  bool done = false;
-  while (!done) {
-    uint64_t va = __atomic_load_n(flag_a, __ATOMIC_ACQUIRE);
-    uint64_t vb = __atomic_load_n(flag_b, __ATOMIC_ACQUIRE);
-    if (va == seq && vb == seq) {
-      done = true;
-      break;
-    }
-    if (now_ns() >= deadline) {
-      break;
-    }
-    sleep_ns(POLL_SLEEP_NS);
-  }
-  return done ? 0 : -1;
+  return ok ? 0 : -1;
 }
 
 static void *client_worker_main(void *arg) {
@@ -929,14 +852,14 @@ static void *client_worker_main(void *arg) {
   }
   uint64_t deadline = now_ns() + args->duration_sec * 1000000000ULL;
   w->next_post_ns = now_ns();
-  uint64_t round_bytes = (args->dual_mode == DUAL_MIRROR)
-                             ? 2ULL * args->value_size
-                             : args->value_size;
+  /* get 每请求读 value-size；mixed 的 write 为 mirror 双 WR（2×size） */
+  uint64_t round_bytes = (args->op == OP_GET) ? args->value_size
+                                              : 2ULL * args->value_size;
   uint64_t window =
       (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
   w->off = (uint64_t)w->id * DATA_WINDOW_PER_THREAD * args->value_size;
 
-  /* write：分片流水线（80MB 请求 = 20×4MB 分片，滑动窗口，持续到 deadline） */
+  /* write：分片流水线（80MB 请求 = 20×4MB 分片，jetty 池驱动，持续到 deadline） */
   if (args->op == OP_WRITE) {
     if (client_write_pipeline(ctx, w, deadline) != 0) {
       __atomic_add_fetch(&w->errors, 1, __ATOMIC_RELAXED);
@@ -1017,143 +940,6 @@ static void *client_worker_main(void *arg) {
   return NULL;
 }
 
-/* ---------------- 服务器 get 回写 ---------------- */
-
-static int server_write_back(context_t *ctx, conn_t *conn, worker_t *w,
-                             const get_req_t *req, int src_a, int src_b,
-                             int dst_chip) {
-  kv_bench::UrmaManager *mgr = ctx->mgr;
-  kv_bench::UrmaConnection &remote = *conn->conn;
-  uint32_t wr_len =
-      (conn->conn->peer.dualMode == DUAL_MIRROR) ? req->size : req->size / 2;
-  uint64_t s_off = req->client_off % ctx->data_len; /* 服务器本地数据源偏移 */
-  uint64_t d_off = req->client_off; /* 客户端目标偏移（相对客户端数据区） */
-  /* 客户端 flag 地址 = client_seg_va(数据区) + 客户端 data_len + flag_off */
-  uint64_t client_data_len =
-      (uint64_t)conn->conn->peer.threads * DATA_WINDOW_PER_THREAD * req->size;
-  uint64_t flag_remote = req->client_seg_va + client_data_len + req->flag_off;
-  uint64_t flag_local = (uint64_t)ctx->server_flag_slot;
-
-  /* 每轮（每个请求）从 jetty 池取一条新的 send lane 并发回写 */
-  std::shared_ptr<kv_bench::UrmaJetty> jetty;
-  if (!mgr->AcquireSendLane(jetty)) {
-    fprintf(stderr, "[wb] send lane pool exhausted\n");
-    return -1;
-  }
-
-  uint64_t seq_a, seq_b;
-  uint64_t ua = mgr->PostEvent(w->id, seq_a);
-  uint64_t ub = mgr->PostEvent(w->id, seq_b);
-
-  bool ok_post = true;
-  if (ctx->args.get_fence) {
-    /* 数据 WR + fence 标志 WR（每个半条 2 个 WQE） */
-    if (!mgr->PostWriteFencedFlag(
-            jetty, remote, (uint64_t)ctx->client_data + s_off,
-            req->client_seg_va + d_off, wr_len, flag_local, flag_remote,
-            (uint32_t)src_a, (uint32_t)dst_chip, ua)) {
-      ok_post = false;
-    }
-    if (ok_post &&
-        !mgr->PostWriteFencedFlag(
-            jetty, remote, (uint64_t)ctx->client_data + s_off + wr_len,
-            req->client_seg_va + d_off + wr_len, wr_len, flag_local,
-            flag_remote + 8, (uint32_t)src_b, (uint32_t)dst_chip, ub)) {
-      ok_post = false;
-    }
-  } else {
-    /* 单 WQE 2-sge: 数据 + 完成标志 */
-    if (!mgr->PostWriteWithFlag(
-            jetty, remote, (uint64_t)ctx->client_data + s_off,
-            req->client_seg_va + d_off, wr_len, flag_local, flag_remote,
-            (uint32_t)src_a, (uint32_t)dst_chip, ua)) {
-      ok_post = false;
-    }
-    if (ok_post &&
-        !mgr->PostWriteWithFlag(
-            jetty, remote, (uint64_t)ctx->client_data + s_off + wr_len,
-            req->client_seg_va + d_off + wr_len, wr_len, flag_local,
-            flag_remote + 8, (uint32_t)src_b, (uint32_t)dst_chip, ub)) {
-      ok_post = false;
-    }
-  }
-  if (!ok_post) {
-    mgr->AbortEvent(w->id, seq_a);
-    mgr->AbortEvent(w->id, seq_b);
-    mgr->ReleaseSendLane(jetty);
-    return -1;
-  }
-  bool ok_a = mgr->WaitEvent(w->id, seq_a, ctx->args.timeout_ms);
-  bool ok_b = mgr->WaitEvent(w->id, seq_b, ctx->args.timeout_ms);
-  mgr->ReleaseSendLane(jetty);
-  return (ok_a && ok_b) ? 0 : -1;
-}
-
-static void *server_get_worker_main(void *arg) {
-  worker_t *w = (worker_t *)arg;
-  conn_t *conn = (conn_t *)w->run_arg;
-  context_t *ctx = conn->ctx;
-  const argument_t *args = &ctx->args;
-
-  if (args->affinity_mode == AFF_AFFINITY) {
-    int mine[MAX_CPUS];
-    int n = my_cpu_list(args, false, mine, MAX_CPUS);
-    if (n > 0) {
-      int cpu = mine[w->id % n];
-      if (pin_thread_to_cpu(cpu) != 0) {
-        fprintf(stderr, "[srv-worker %u] pin to cpu %d failed: %s\n", w->id,
-                cpu, strerror(errno));
-      }
-    }
-  }
-
-  get_req_t *ring = (get_req_t *)ctx->va;
-  uint32_t g = conn->worker_count;
-  while (!w->stop && !ctx->stop && !conn->fatal) {
-    bool worked = false;
-    for (uint32_t slot = w->local_index % g; slot < RING_SLOTS; slot += g) {
-      uint64_t seq = __atomic_load_n(&ring[slot].seq, __ATOMIC_ACQUIRE);
-      if (seq == 0 || seq == w->seen[slot]) {
-        continue;
-      }
-      get_req_t req = ring[slot]; /* 拷贝; seq acquire 已保证前置字段可见 */
-      int src_a, src_b, dst_chip;
-      pick_round_chips(args, false, w, &src_a, &src_b, &dst_chip);
-      /* get 回写目的 = 客户端缓冲 -> 客户端目的 chip（亲和/反亲和使用） */
-      if (args->drv_ext && conn->conn != nullptr &&
-          conn->conn->peer.dstChip != INVALID_CHIP) {
-        dst_chip = (int)conn->conn->peer.dstChip;
-      }
-      if (!args->drv_ext) {
-        src_a = src_b = dst_chip = INVALID_CHIP;
-      }
-      if (server_write_back(ctx, conn, w, &req, src_a, src_b, dst_chip) == 0) {
-        w->seen[slot] = seq;
-        __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
-        __atomic_add_fetch(&w->bytes,
-                           (conn->conn->peer.dualMode == DUAL_MIRROR)
-                               ? 2ULL * req.size
-                               : req.size,
-                           __ATOMIC_RELAXED);
-      } else {
-        __atomic_add_fetch(&w->errors, 1, __ATOMIC_RELAXED);
-        w->seen[slot] = seq; /* 放弃该请求，避免死循环 */
-        /* 首错即中断 */
-        if (!conn->fatal) {
-          conn->fatal = true;
-          fprintf(stderr,
-                  "[fatal] write-back failed, aborting server workers\n");
-        }
-      }
-      worked = true;
-    }
-    if (!worked) {
-      sleep_ns(POLL_SLEEP_NS);
-    }
-  }
-  return NULL;
-}
-
 /* ---------------- 统计 ---------------- */
 
 static void print_latency_line_us(const char *tag, const kv_hist_t *h) {
@@ -1173,10 +959,6 @@ static void print_latency_line_us(const char *tag, const kv_hist_t *h) {
 
 static const char *op_name(int op) {
   return op == OP_WRITE ? "write" : (op == OP_GET ? "get" : "mixed");
-}
-
-static const char *dual_name(int m) {
-  return m == DUAL_MIRROR ? "mirror" : "split";
 }
 
 static const char *aff_name(int m) {
@@ -1208,9 +990,9 @@ static void print_client_summary(context_t *ctx, double seconds) {
   double bw_mb_s =
       seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
   double bw_mbps = bw_mb_s * 8.0;                        /* 小 b: Mb/s */
-  /* wr_rate：write = 请求 × 20 分片（分片 WR/秒）；get/mixed = 请求 × 2 */
+  /* wr_rate：write = 请求 × 20 分片（分片 WR/秒）；get/mixed = 请求 × 1 READ/WR */
   double wr_rate = iops * (args->op == OP_WRITE ? (double)KV_CHUNKS_PER_REQ
-                                                : 2.0);
+                                                : 1.0);
   printf("requests=%" PRIu64
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
@@ -1274,7 +1056,6 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args) {
   kv_bench::HandshakeParams params;
   params.threads = args->threads;
   params.opCode = (uint32_t)args->op;
-  params.dualMode = (uint32_t)args->dual_mode;
   params.valueSize = (uint32_t)args->value_size;
   params.transMode = args->trans_mode;
   params.dstChip = INVALID_CHIP;
@@ -1452,7 +1233,6 @@ static void *server_conn_main(void *arg) {
   kv_bench::HandshakeParams params;
   params.threads = ctx->args.threads;
   params.opCode = (uint32_t)ctx->args.op;
-  params.dualMode = (uint32_t)ctx->args.dual_mode;
   params.valueSize = (uint32_t)ctx->args.value_size;
   params.transMode = ctx->args.trans_mode;
   params.dstChip = INVALID_CHIP;
@@ -1466,66 +1246,11 @@ static void *server_conn_main(void *arg) {
     goto out;
   }
 
-  printf("[conn] remote threads=%u op=%s dual=%s dst_chip=%u\n",
+  printf("[conn] remote threads=%u op=%s dst_chip=%u\n",
          conn->conn->peer.threads, op_name((int)conn->conn->peer.opCode),
-         dual_name((int)conn->conn->peer.dualMode), conn->conn->peer.dstChip);
+         conn->conn->peer.dstChip);
 
-  /* get/mixed: 启动回写线程（每个回写线程独占一条 jetty） */
-  if (conn->conn->peer.opCode != OP_WRITE) {
-    uint32_t g = ctx->args.server_workers > 0 ? ctx->args.server_workers
-                                              : conn->conn->peer.threads;
-    if (g < 1)
-      g = 1;
-    if (g > ctx->mgr->Resource().SendJettyCount()) {
-      fprintf(stderr,
-              "[conn] get workers %u > server jettys %u, capped (raise "
-              "--jetty-count on server)\n",
-              g, ctx->mgr->Resource().SendJettyCount());
-      g = ctx->mgr->Resource().SendJettyCount();
-    }
-    conn->workers = new worker_t[g]; /* worker_t 含 shared_ptr，须用 new */
-    conn->worker_count = g;
-    if (conn->workers == NULL) {
-      goto out;
-    }
-    bool worker_ok = true;
-    for (uint32_t i = 0; i < g; i++) {
-      worker_t *w = &conn->workers[i];
-      uint32_t wid = 0;
-      if (!ctx->mgr->RegisterWorker(wid)) {
-        worker_ok = false;
-        break;
-      }
-      w->id = wid;
-      w->local_index = i;
-      w->run_arg = conn;
-      w->seen = (uint32_t *)calloc(RING_SLOTS, sizeof(uint32_t));
-      w->rng = ctx->args.seed + wid * 2654435761u;
-      if (w->seen == NULL ||
-          kv_hist_init(&w->hist, 1, 60ULL * 1000000000ULL, 3) != 0) {
-        worker_ok = false;
-        break;
-      }
-    }
-    if (!worker_ok) {
-      for (uint32_t i = 0; i < g; i++) {
-        kv_hist_destroy(&conn->workers[i].hist);
-        free(conn->workers[i].seen);
-      }
-      delete[] conn->workers;
-      conn->workers = NULL;
-      conn->worker_count = 0;
-      goto out;
-    }
-    for (uint32_t i = 0; i < g; i++) {
-      if (pthread_create(&conn->workers[i].tid, NULL, server_get_worker_main,
-                         &conn->workers[i]) != 0) {
-        fprintf(stderr, "[conn] failed to start get worker %u\n", i);
-      }
-    }
-    printf("[conn] started %u get write-back workers (dst_chip=%u)\n", g,
-           conn->conn->peer.dstChip);
-  }
+  /* get/mixed 为客户端直接 READ 服务器数据，服务器无需回写线程 */
 
   /* 等待客户端结束（EOF） */
   {
@@ -1538,23 +1263,6 @@ static void *server_conn_main(void *arg) {
     }
   }
 
-  if (conn->workers != NULL) {
-    for (uint32_t i = 0; i < conn->worker_count; i++) {
-      conn->workers[i].stop = true;
-    }
-    for (uint32_t i = 0; i < conn->worker_count; i++) {
-      if (conn->workers[i].tid != 0) {
-        pthread_join(conn->workers[i].tid, NULL);
-      }
-    }
-    for (uint32_t i = 0; i < conn->worker_count; i++) {
-      kv_hist_destroy(&conn->workers[i].hist);
-      free(conn->workers[i].seen);
-    }
-    delete[] conn->workers;
-    conn->workers = NULL;
-    conn->worker_count = 0;
-  }
 out:
   conn->conn.reset();
   close(conn->fd);
@@ -1717,10 +1425,7 @@ static struct option g_long_options[] = {
     {"threads", required_argument, NULL, 1008},
     {"op", required_argument, NULL, 1009},
     {"mixed-ratio", required_argument, NULL, 1010},
-    {"dual-mode", required_argument, NULL, 1011},
     {"report-interval", required_argument, NULL, 1012},
-    {"server-workers", required_argument, NULL, 1013},
-    {"get-fence", no_argument, NULL, 1014},
     {"mbind", no_argument, NULL, 1015},
     {"drv-ext", no_argument, NULL, 1019},
     {"import-rtp", no_argument, NULL, 1023},
@@ -1762,12 +1467,7 @@ static void usage(void) {
   printf("      --op <op>              write | get | mixed (default write)\n");
   printf("      --mixed-ratio <pct>    write percentage in mixed mode (default "
          "50)\n");
-  printf("      --dual-mode <m>        mirror | split (default mirror): 每轮从 "
-         "bonding 双源 CPU 并发 2 条 WR\n");
   printf("      --report-interval <s>  periodic report interval (default 1)\n");
-  printf("      --server-workers <n>   server get write-back workers per conn "
-         "(0=auto=client threads)\n");
-  printf("      --get-fence            get 回写拆成 data WR + fence flag WR\n");
   printf("      --mbind                enable NUMA mbind of the buffer "
          "(default off; unsupported on some platforms)\n");
   printf("      --drv-ext              enable bonding chip routing "
@@ -1801,14 +1501,6 @@ static int validate_input_params(argument_t *args) {
   }
   if (args->op < OP_WRITE || args->op > OP_MIXED) {
     fprintf(stderr, "Invalid op\n");
-    return -1;
-  }
-  if (args->dual_mode != DUAL_MIRROR && args->dual_mode != DUAL_SPLIT) {
-    fprintf(stderr, "Invalid dual mode\n");
-    return -1;
-  }
-  if (args->dual_mode == DUAL_SPLIT && (args->value_size % 2) != 0) {
-    fprintf(stderr, "split dual mode requires even value-size\n");
     return -1;
   }
   if (args->mixed_ratio > 100) {
@@ -1850,9 +1542,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->concurrency = 1;
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
-  args->dual_mode = DUAL_MIRROR;
   args->report_interval = 1;
-  args->server_workers = 0;
   args->seed = 42;
   args->timeout_ms = DEFAULT_TIMEOUT_MS;
 
@@ -1937,25 +1627,8 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
     case 1010:
       args->mixed_ratio = (uint32_t)strtoul(optarg, NULL, 0);
       break;
-    case 1011: {
-      if (strcmp(optarg, "mirror") == 0)
-        args->dual_mode = DUAL_MIRROR;
-      else if (strcmp(optarg, "split") == 0)
-        args->dual_mode = DUAL_SPLIT;
-      else {
-        fprintf(stderr, "Invalid dual mode: %s\n", optarg);
-        return -1;
-      }
-      break;
-    }
     case 1012:
       args->report_interval = (uint32_t)strtoul(optarg, NULL, 0);
-      break;
-    case 1013:
-      args->server_workers = (uint32_t)strtoul(optarg, NULL, 0);
-      break;
-    case 1014:
-      args->get_fence = true;
       break;
     case 1015:
       args->mbind = true;

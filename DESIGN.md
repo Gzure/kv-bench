@@ -13,7 +13,7 @@
 | --- | --- |
 | 带宽测试 | 全速打流（`--qps 0`），统计吞吐（MB/s 大 B 与 Mb/s 小 b 双单位）与 IOPS |
 | 时延测试 | 固定 QPS 节流打流，统计 avg / p50 / p90 / p99 / p999 / p9999 / pmax（us） |
-| 操作类型 | `write`（KV Put：客户端分片流水线直写服务器内存）、`get`（KV Get：**服务器 WRITE 回写客户端缓冲**，对齐 datasystem `UbWriteHelper → UrmaWritePayload` 模型，见 §6）、`mixed`（按 `--mixed-ratio` 混合） |
+| 操作类型 | `write`（KV Put：客户端分片流水线直写服务器内存）、`get`（KV Get：**客户端直接 READ 服务器数据区**，`URMA_OPC_READ`，见 §6）、`mixed`（按 `--mixed-ratio` 混合） |
 | 分片流水线 | **write：一次请求 = 80MB（固定）= 20 × 4MB 分片**，每分片独立 WR + 独立新 jetty，**分片按请求内序号交替 chip1/chip2（10+10 均匀打散）**；请求并发度 `--concurrency` 1~10，**jetty 池驱动发送**（有请求一直发，取不到可用 jetty 就等待释放后再继续），见 §6.1 |
 | bonding 亲和 | `affinity`（**分片源==目的==同一 chip**，交替打散双 chip）、`anti`（源随机 & 目的固定）、`none`（源/目的全随机），见 §8 |
 | 可配置 | 线程数 `--threads`、时长 `--duration`、目标 QPS `--qps`（请求/秒）、请求并发度 `--concurrency`、jetty 池大小 `--jetty-count` 等 |
@@ -30,7 +30,7 @@ kv-bench/
 ├── DESIGN.md                     本文档
 └── src/
     ├── kv_bench.cpp              业务层（单文件 ~1800 行）：参数解析/亲和/chip/
-    │                             打流引擎/get 请求环与回写/统计/首错即中断
+    │                             打流引擎/get 直接 READ/统计/首错即中断
     ├── hist.h                    HdrHistogram-lite（ns 精度 3 位有效数字）
     └── urma/
         ├── urma_manager.{h,cpp}  管理层：Init/设备发现/RegisterBuffer/握手
@@ -45,7 +45,7 @@ Provider 层  liburma (umdk)        urma_* API（urma_api.h / urma_ubagg.h）
 ### 分层职责（对齐参考分层，业务杂质剥离）
 
 ```
-业务层   kv_bench.cpp             选项/亲和(chip)/打流引擎/get 请求环与回写/统计
+业务层   kv_bench.cpp             选项/亲和(chip)/打流引擎/get 直接 READ/统计
 管理层   urma_manager.*           UrmaManager：init/设备发现/握手(交换+import)/
                                   AcquireSendLane/PostWrite 系列(内联 PostJettyRw)/
                                   轮询线程+事件槽/清理
@@ -57,7 +57,7 @@ Provider liburma (umdk)           urma_* API
 ### 线程模型（无 bthread，全部 std::thread / pthread）
 
 - **客户端**：1 主线程（run_client）+ N 打流线程 + 1 URMA 轮询线程（进程级共享 JFC）+ 1 统计采样线程。
-- **服务器**：1 accept 线程（非阻塞轮询）+ 每连接 G 个 get 回写工作线程（get 模式，默认 = 客户端线程数，`--server-workers` 可覆盖）+ 1 URMA 轮询线程。
+- **服务器**：1 accept 线程（非阻塞轮询）+ 1 URMA 轮询线程（如不主动发 WR 则不启动）。get 为客户端发起 READ，服务器无回写线程。
 
 ---
 
@@ -144,7 +144,7 @@ client                                  server
 - **轮询线程**（进程级单线程）：`urma_poll_jfc(jfc, 32, crs)` 循环，无事件 `SleepNs(1us)` 退避；`--event-mode` 时改 `urma_wait_jfc(1,100ms) + poll + ack + rearm`。每个 CQE 按 `user_ctx` 拆 `workerId/seq`，CAS 槽 `seq<<2 → seq<<2|1(成功)/|2(失败)`；失败 CQE 打日志。
 - `WaitEvent(workerId, seq, timeoutMs)`：轮询槽（ACQUIRE）至 doneOk/doneFail/超时，随后槽复位 0（允许复用）。
 - `AbortEvent`：post 失败时槽复位 0。
-- 数据面（write 分片流水线）：每个分片 `PostWrite`（事件 ue）→ `ProbeEvent` 轮询完成 → 完成一个补发一个（见 §6.1）；get 回写见 §6.3。
+- 数据面（write 分片流水线）：每个分片 `PostWrite`（事件 ue）→ `ProbeEvent` 轮询完成 → 完成一个补发一个（见 §6.1）；get 为 `PostRead` 直接 READ（见 §6.3）。
 
 **send lane（每分片取新 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从游标起找第一个空闲下标并移除、游标前移——**每个分片都取到"新的" jetty**，多线程下天然分散。池大小 = `max(--jetty-count, threads)`。
 
@@ -183,30 +183,18 @@ client                                  server
 服务器: [ RequestRing: 4096*32B ] [ DataArea: 最大窗口 800MB（10 并发 × 80MB，固定，客户端任意并发度不越界）]
 ```
 
-### 6.3 get（Get）—— 服务器 WRITE 回写
+### 6.3 get（Get）—— 客户端直接 READ
 
-对齐 datasystem `worker_request_manager.cpp UbWriteHelper → UrmaWritePayload` 模型；无 RPC 响应通道，用"请求环 + 内存完成标志"替代 RPC 应答。源 = 服务器 bonding（数据方向决定，见 §8.2）。**get 保留现有请求环 + mirror 双 WR 回写模型**（回写流水线化改造留待后续）：
+客户端发起 `URMA_OPC_READ` WR（`PostRead`，src/dst sge 对调：src=服务器段、dst=本地读缓冲），从服务器数据区读 `value-size` 字节到本地，CQE 完成记一次时延。服务器仅为数据源（预置数据），无回写线程：
 
 ```
-GetReq（32B packed）: client_seg_va | client_off | size | seq | flag_off
-
-客户端打流线程（每线程独立 seq）:
-  填 GetReq（client_seg_va/client_off/size/flag_off=线程槽位），seq RELEASE 落请求环
-  WR①: 请求环槽（4096 槽轮转）
-  spin 等待 flagA[flagOff]==seq && flagB[flagOff]==seq（ACQUIRE + 超时）
-  时延口径 = 填请求 → 观察到双 flag（完整 KV Get 往返）
-
-服务器 get 回写线程（G 个，轮询环槽位，seen[slot] 防重）:
-  if ring[slot].seq > seen[slot]:
-    WR②-A: 数据 size + 8B flagA（客户端 FlagArea 槽），src_a
-    WR②-B: 数据 size + 8B flagB，src_b        （mirror，双源并发回写）
-    WaitEvent A、B 都完成 → seen[slot] = seq
+客户端打流线程:
+  t0 = now()
+  取新 jetty → PostRead(本地读缓冲+off, 服务器数据源+off, size, src_chip, dst_chip)
+  WaitEvent(CQE)
+  t1 = now(); hist.Record(t1 - t0)          // 时延口径 = READ 完成
+  bytes += size
 ```
-
-- **WR② 回写默认 = 单 WR 2 个 src sge**（数据 sge + 8B 完成标志 sge，`jfs max_sge=2`）：数据与标志同一条 WR 落客户端内存，客户端观察到 `flag==seq` 即数据可见（同一 WR 内 sge 顺序落盘）。mirror 两条 WR 各带独立 flag 槽，客户端等双 flag。
-- `--get-fence` 回退：拆成 data WR + fenced flag WR（`flag.bs.fence=1`），正确性优先、多一条 WR。
-- 客户端各线程串行发 get（阻塞模型），`flagA/flagB[flagOff]` 每线程独立无写冲突；`--qps` 节流只作用于客户端请求发出速率，服务器回写线程全速排空。
-- 服务器回写线程数 `--server-workers`（默认 0 = 客户端线程数），总回写线程数不超过服务器 jetty 数。
 
 ### 6.4 单线程打流循环（write）
 
@@ -224,11 +212,11 @@ while (!stop && !fatal && now < deadline):
 
 ## 7. 统计与报表
 
-- 每线程 HdrHistogram-lite（`hist.h`，ns 精度，3 位有效数字），**write 每请求记一次时延**（该请求 20 个分片全部完成）；get 每请求记一次（双 flag 观察到）。
+- 每线程 HdrHistogram-lite（`hist.h`，ns 精度，3 位有效数字），**write 每请求记一次时延**（该请求 20 个分片全部完成）；get 每请求记一次（READ CQE 完成）。
 - 汇总：`avg / min / p50 / p90 / p99 / p999 / p9999 / pmax`（us）。
 - 采样线程每 `--report-interval` 秒差分 `ops/bytes` → 瞬时 IOPS 与带宽。
 - **带宽双单位输出**：`bandwidth=33849.72 MB/s (270797.75 Mb/s)`（大 B 字节/s + 小 b 比特/s）。
-- 字节口径：write = 客户端→服务器 payload；get = 服务器→客户端回写 payload（请求 WR① 不计入）。
+- 字节口径：write = 客户端→服务器 payload；get = 服务器→客户端 READ payload。
 
 ---
 
@@ -242,9 +230,9 @@ while (!stop && !fatal && now < deadline):
 
 ### 8.2 三种模式（分片 chip 分配）
 
-"源 / 目的"按**数据方向**定义（谁发 WR 谁是源，数据落在谁的内存谁是目的），与进程角色解耦：
+"源 / 目的"按**数据方向**定义（谁发 WR 谁是源，数据落在谁的内存谁是目的）：
 - write（Put）：源 = 客户端打流线程（客户端 bonding），目的 = 服务器内存；
-- get（Get）：源 = **服务器回写线程**（服务器 bonding，发 WR②），目的 = **客户端缓冲**，角色互换。
+- get（Get）：源 = **客户端**（发起 READ），目的 = 客户端读缓冲；服务器为数据源。
 
 | 模式 | 源侧 | 目的侧 | 分片 chip 分配 |
 | --- | --- | --- | --- |
@@ -253,7 +241,7 @@ while (!stop && !fatal && now < deadline):
 | `none` | 不绑定，源随机 | 不绑定，目的随机 | `src`/`dst` 每分片全随机（全部 CPU） |
 
 - 随机性：每线程私有 `rng`（xorshift32，`--seed` 控制，`--seed + i*2654435761u` 每线程不同），可复现。
-- **CPU 绑定**：`sched_setaffinity`。client 打流线程 `source_cpus[i % n]`（仅 affinity）；server 主线程 `destination_cpus`（`affinity` 与 `anti` 都绑，`!=none` 即绑）；get 回写 worker `destination_cpus[i % n]`（仅 affinity）。
+- **CPU 绑定**：`sched_setaffinity`。client 打流线程 `source_cpus[i % n]`（仅 affinity）；server 主线程 `destination_cpus`（`affinity` 与 `anti` 都绑，`!=none` 即绑）。
 - `--drv-ext` 开时 WR 带 `has_drv_ext=1 + src_chip_id/dst_chip_id`（chip 路由）；默认关（`INVALID_CHIP=0xFF` → `drv=0`，WR 不带 chip 字段）。
 - `dst` 覆盖顺序：分片 chip 算出 → `--drv-ext` 且对端通告有效时用 `peer.dstChip` → `--drv-ext` 关时全部 `INVALID_CHIP`。
 
@@ -282,15 +270,13 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
          [--jetty-count <n>]            # 1..200，默认 1；池 = max(count, threads)
          [--affinity-mode <affinity|anti|none>]   # 默认 none
          [--source-cpus <list>]         # client 打流 CPU（"4,5" 或 "4,6-8"）
-         [--destination-cpus <list>]    # server CPU（主线程/回写 worker/mbind 目标）
+         [--destination-cpus <list>]    # server CPU（主线程/mbind 目标）
          [--cacheable]                  # 注册/导入 cacheable 段
          [--threads <n>]                # client 打流线程数，默认 1
          [--concurrency <1..10>]        # write 请求并发度（默认 1；在飞分片 = 20×N）
          [--op <write|get|mixed>]       # 默认 write
          [--mixed-ratio <pct>]          # mixed 中 write 占比，默认 50
          [--report-interval <s>]        # 默认 1
-         [--server-workers <n>]         # get 回写线程数；0 = auto = client threads
-         [--get-fence]                  # get 回写拆 data WR + fence flag WR
          [--mbind]                      # NUMA 绑定（默认关；MPOL_PREFERRED 实现）
          [--drv-ext]                    # bonding chip 路由（has_drv_ext + chip）
          [--import-rtp]                 # import 走普通 RTP（跳过 bondp/CTP）
@@ -302,14 +288,14 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
 
 - cpulist 语法：`0,2,4-7`（区间+列表）。
 - 参数校验：bonding 设备仅支持 `--trans-mode` 0（RM，自动 multi-path，jfs 固定 `multi_path=1`）或 1（RC）；`--concurrency` 1~10。
-- 已删除历史死参数：`--tp-type`（传输类型实际由 `--import-rtp` 决定，固定 CTP/RTP）、`--multi-path`（jfs 无条件 multi_path=1）、`--src-chip-a/b/--dst-chip`（chip 覆盖，布局敏感崩溃诱因，已移除）、`--dual-mode`（write 分片固定 4MB，get 回写固定 mirror 双 WR）。
+- 已删除历史死参数：`--tp-type`（传输类型实际由 `--import-rtp` 决定，固定 CTP/RTP）、`--multi-path`（jfs 无条件 multi_path=1）、`--src-chip-a/b/--dst-chip`（chip 覆盖，布局敏感崩溃诱因，已移除）、`--dual-mode`/`--server-workers`/`--get-fence`（get 回写模型已移除，get 改为客户端直接 READ）。
 
 ---
 
 ## 10. 错误处理与清理
 
-- **首错即中断**：客户端打流 / 服务器 get 回写遇到第一个失败轮次即置 `fatal` 标志并中止（不再"连续失败 100 次"）。
-- **超时**：`WaitEvent`/双 flag 等待超时（`--timeout-ms`）→ 计 error、释放 lane。
+- **首错即中断**：客户端打流 / get READ 遇到第一个失败即置 `fatal` 标志并中止。
+- **超时**：`WaitEvent` 等待超时（`--timeout-ms`）→ 计 error、释放 lane。
 - **TCP 无超时**：`connect()` 阻塞等待内核握手（SYN 重试约 2 分钟）；握手 `read()` 无限等待，对端关闭连接时报 `peer closed` 快速失败。
 - **清理顺序**（`destroy_context`）：
   1. `conn.reset()`（先 unimport 对端 target jetty/segment）；
@@ -338,4 +324,4 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
 | mbind | Kunpeng 4 节点上 `MPOL_BIND` 多 maxnode 候选 EINVAL；改 `MPOL_PREFERRED + maxnode=32 + 1GB 分块 + 逐页 touch` 成功；默认关（`--mbind` 开启） |
 | balance 模式 | 编译期默认关；开启时 `urma_user_ctl` 需在 create_context 后、建队列前调用（rc=0 成功，worker2 实测） |
 | 错误码经验 | `URMA_CR_LOC_ACCESS_ERR=4`（多为 SGE 地址/段错误）；`URMA_CR_GENERAL_ERR=9`；`EAGAIN=11`（驱动返回，真实错误看 /var/log/messages）；lib 包装值 `URMA_FAIL=0x1000` |
-| 完成标志顺序 | 默认单 WR 双 sge（数据+标志）同落；平台不保证时用 `--get-fence` 回退 |
+| get 数据验证 | get 为客户端 READ 服务器数据区（预置 0 数据），验证 READ 通路正确性 |

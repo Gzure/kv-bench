@@ -46,7 +46,7 @@ int 字段（或任何改布局的提交）就崩，改回去又可能不崩，�
 ## 分层（对齐 yuanrong-datasystem）
 
 ```text
-业务层   src/kv_bench.cpp            选项/亲和(chip)/打流引擎/get 请求环与回写/统计
+业务层   src/kv_bench.cpp            选项/亲和(chip)/打流引擎/get 直接 READ/统计
 管理层   src/urma/urma_manager.*     UrmaManager: init/设备发现/握手(交换+import)/AcquireSendLane/
                                      PostWrite 系列(内联 PostJettyRw)/轮询线程+事件槽/清理
 资源层   src/urma/urma_resource.*    UrmaResource + RAII 句柄(context/jfce/jfc/jfr/jetty/segment)
@@ -102,10 +102,8 @@ kv_bench 打流线程
 ## 操作类型
 
 - `--op write`（Put，默认）：客户端分片流水线直写服务器内存（上述模型）。
-- `--op get`（Get）：对齐 datasystem worker `UbWriteHelper -> UrmaWritePayload` 模型——
-  客户端把 32B 请求 WRITE 进服务器请求环，服务器回写线程并发 2 条 WRITE
-  （单 WQE 2-sge：数据 + 完成标志；`--get-fence` 可拆成 data WR + fence flag WR）
-  回写客户端缓冲，客户端观察到双 flag 完成记一轮时延。
+- `--op get`（Get）：客户端**直接 READ 服务器数据区**（`URMA_OPC_READ`，一次读 `value-size`
+  字节到本地读缓冲），CQE 完成记一次时延。服务器仅为数据源（预置数据），无回写线程。
 - `--op mixed`：按 `--mixed-ratio`（write 占比%）混合（write 部分沿用旧的 mirror 双 WR 模型）。
 
 ## 亲和（bonding）
@@ -127,7 +125,7 @@ mbind 会报 EINVAL，非必要）；`--fixed-offset` 恒压同一地址（热�
 - 每线程 HdrHistogram-lite（ns 精度，3 位有效数字），汇总输出
   `avg/min/p50/p90/p99/p999/p9999/pmax`（us）。
 - `--report-interval <s>` 周期打印瞬时 IOPS/带宽。
-- 汇总行含 requests/IOPS/WR 速率（write = 20×IOPS，get = 2×IOPS）/带宽（MB/s）/errors。
+- 汇总行含 requests/IOPS/WR 速率（write = 20×IOPS，get = 1×IOPS）/带宽（MB/s）/errors。
 
 ```text
 ==== summary role=client op=write threads=16 size=4194304 concurrency=4 affinity=affinity jetty_count=200 duration=30.0s ====
@@ -152,7 +150,6 @@ done
 ```
 
 池大小自动取 `max(jetty_count, threads, 20×并发度)`（保证并发度内的在飞分片都有 jetty 可取）。
-服务器 get 回写线程数 = 客户端线程数（`--server-workers` 可覆盖），且总回写线程数不超过服务器 jetty 数。
 
 ## 其它参数
 

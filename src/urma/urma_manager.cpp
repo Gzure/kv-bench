@@ -55,10 +55,9 @@ struct WireInfo {
   urma_jetty_id_t jetty_id;
   uint32_t threads;
   uint32_t op_code;
-  uint32_t dual_mode;
   uint32_t value_size;
   uint32_t dst_chip;
-  uint32_t reserved[2];
+  uint32_t reserved[3];
 } __attribute__((packed));
 
 int SockSyncData(int sockfd, int size, char *localData, char *remoteData) {
@@ -88,17 +87,18 @@ int SockSyncData(int sockfd, int size, char *localData, char *remoteData) {
 /* ---------------- PostJettyRw（对齐 yuanrong UrmaManager::PostJettyRw，WR
  * 构造） ---------------- */
 
-// Build a BONDP WRITE work request. For WRITE, src SGEs describe local memory
-// and dst SGEs describe the remote (imported) memory, matching YuanRong
-// PostJettyRw's SGE direction.
+// Build a BONDP work request. For WRITE, src SGEs describe local memory and dst
+// SGEs describe the remote (imported) memory; for READ (URMA_OPC_READ) the
+// caller passes src=dst-direction swapped SGEs (matching YuanRong PostJettyRw).
 static urma_jfs_wr_t *BuildBondpWr(bondp_jfs_wr_t *bondpWr,
                                    urma_target_jetty_t *targetJetty,
                                    urma_sge_t *srcSges, uint32_t numSges,
                                    urma_sge_t *dstSges, uint64_t userContext,
                                    uint32_t useDriverExt, uint32_t srcChipId,
-                                   uint32_t dstChipId, uint32_t fence) {
+                                   uint32_t dstChipId, uint32_t fence,
+                                   uint32_t opcode) {
   auto *wr = &bondpWr->base;
-  wr->opcode = URMA_OPC_WRITE;
+  wr->opcode = opcode;
   wr->flag.bs.complete_enable = 1;
   wr->flag.bs.inline_flag = 0;
   wr->flag.bs.fence = fence != 0;
@@ -113,7 +113,7 @@ static urma_jfs_wr_t *BuildBondpWr(bondp_jfs_wr_t *bondpWr,
   return wr;
 }
 
-// 单 SGE WRITE（数据）
+// 单 SGE WRITE（数据）：src=本地、dst=远端
 static urma_status_t
 PostJettyRw(urma_jetty_t *jetty, urma_target_jetty_t *targetJetty,
             urma_target_seg_t *localSeg, urma_target_seg_t *remoteSeg,
@@ -135,88 +135,34 @@ PostJettyRw(urma_jetty_t *jetty, urma_target_jetty_t *targetJetty,
   bondp_jfs_wr_t bondpWr{};
   urma_jfs_wr_t *wr =
       BuildBondpWr(&bondpWr, targetJetty, &localSge, 1, &remoteSge, userContext,
-                   useDriverExt, srcChipId, dstChipId, 0);
+                   useDriverExt, srcChipId, dstChipId, 0, URMA_OPC_WRITE);
   return urma_post_jetty_send_wr(jetty, wr, badWr);
 }
 
-// 单 WQE 2-sge：数据 + 8B 完成标志（接收方同一条 WR 内看到数据与标志）
+// 单 SGE READ（数据）：src=远端（被读）、dst=本地（数据落点），对齐参考
+// UrmaRead（src/dst sge 对调）
 static urma_status_t
-PostJettyRwWithFlag(urma_jetty_t *jetty, urma_target_jetty_t *targetJetty,
-                    urma_target_seg_t *localSeg, urma_target_seg_t *remoteSeg,
-                    uint64_t localAddress, uint64_t remoteAddress,
-                    uint32_t length, uint64_t flagLocalAddress,
-                    uint64_t flagRemoteAddress, uint64_t userContext,
-                    uint32_t useDriverExt, uint32_t srcChipId,
-                    uint32_t dstChipId, urma_jfs_wr_t **badWr) {
+PostJettyRd(urma_jetty_t *jetty, urma_target_jetty_t *targetJetty,
+            urma_target_seg_t *localSeg, urma_target_seg_t *remoteSeg,
+            uint64_t localAddress, uint64_t remoteAddress, uint32_t length,
+            uint64_t userContext, uint32_t useDriverExt, uint32_t srcChipId,
+            uint32_t dstChipId, urma_jfs_wr_t **badWr) {
   if (jetty == nullptr || targetJetty == nullptr || localSeg == nullptr ||
       remoteSeg == nullptr || length == 0) {
     return URMA_EINVAL;
   }
-  urma_sge_t srcSges[2] = {{.addr = localAddress,
-                            .len = length,
-                            .tseg = localSeg,
-                            .user_tseg = nullptr},
-                           {.addr = flagLocalAddress,
-                            .len = 8,
-                            .tseg = localSeg,
-                            .user_tseg = nullptr}};
-  urma_sge_t dstSges[2] = {{.addr = remoteAddress,
-                            .len = length,
-                            .tseg = remoteSeg,
-                            .user_tseg = nullptr},
-                           {.addr = flagRemoteAddress,
-                            .len = 8,
-                            .tseg = remoteSeg,
-                            .user_tseg = nullptr}};
+  urma_sge_t localSge = {.addr = localAddress,
+                         .len = length,
+                         .tseg = localSeg,
+                         .user_tseg = nullptr};
+  urma_sge_t remoteSge = {.addr = remoteAddress,
+                          .len = length,
+                          .tseg = remoteSeg,
+                          .user_tseg = nullptr};
   bondp_jfs_wr_t bondpWr{};
-  urma_jfs_wr_t *wr =
-      BuildBondpWr(&bondpWr, targetJetty, srcSges, 2, dstSges, userContext,
-                   useDriverExt, srcChipId, dstChipId, 0);
-  return urma_post_jetty_send_wr(jetty, wr, badWr);
-}
-
-// 数据 WR + fence 标志 WR（平台不保证单 WQE 内 sge 顺序时使用）
-static urma_status_t
-PostJettyRwFencedFlag(urma_jetty_t *jetty, urma_target_jetty_t *targetJetty,
-                      urma_target_seg_t *localSeg, urma_target_seg_t *remoteSeg,
-                      uint64_t localAddress, uint64_t remoteAddress,
-                      uint32_t length, uint64_t flagLocalAddress,
-                      uint64_t flagRemoteAddress, uint64_t userContext,
-                      uint32_t useDriverExt, uint32_t srcChipId,
-                      uint32_t dstChipId, urma_jfs_wr_t **badWr) {
-  if (jetty == nullptr || targetJetty == nullptr || localSeg == nullptr ||
-      remoteSeg == nullptr || length == 0) {
-    return URMA_EINVAL;
-  }
-  // 1) data WR (no fence)
-  urma_sge_t dataLocalSge = {.addr = localAddress,
-                             .len = length,
-                             .tseg = localSeg,
-                             .user_tseg = nullptr};
-  urma_sge_t dataRemoteSge = {.addr = remoteAddress,
-                              .len = length,
-                              .tseg = remoteSeg,
-                              .user_tseg = nullptr};
-  bondp_jfs_wr_t dataWr{};
-  urma_jfs_wr_t *wr =
-      BuildBondpWr(&dataWr, targetJetty, &dataLocalSge, 1, &dataRemoteSge,
-                   userContext, useDriverExt, srcChipId, dstChipId, 0);
-  urma_status_t ret = urma_post_jetty_send_wr(jetty, wr, badWr);
-  if (ret != URMA_SUCCESS) {
-    return ret;
-  }
-  // 2) 8-byte flag WR with fence (ordered after the data WR completes)
-  urma_sge_t flagLocalSge = {.addr = flagLocalAddress,
-                             .len = 8,
-                             .tseg = localSeg,
-                             .user_tseg = nullptr};
-  urma_sge_t flagRemoteSge = {.addr = flagRemoteAddress,
-                              .len = 8,
-                              .tseg = remoteSeg,
-                              .user_tseg = nullptr};
-  bondp_jfs_wr_t flagWr{};
-  wr = BuildBondpWr(&flagWr, targetJetty, &flagLocalSge, 1, &flagRemoteSge,
-                    userContext, useDriverExt, srcChipId, dstChipId, 1);
+  urma_jfs_wr_t *wr = BuildBondpWr(
+      &bondpWr, targetJetty, &remoteSge, 1, &localSge, userContext,
+      useDriverExt, srcChipId, dstChipId, 0, URMA_OPC_READ);
   return urma_post_jetty_send_wr(jetty, wr, badWr);
 }
 
@@ -530,7 +476,6 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   }
   localWire.threads = params.threads;
   localWire.op_code = params.opCode;
-  localWire.dual_mode = params.dualMode;
   localWire.value_size = params.valueSize;
   localWire.dst_chip = params.dstChip;
 
@@ -554,7 +499,6 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   newConn->peer.dstChip = remoteWire.dst_chip;
   newConn->peer.threads = remoteWire.threads;
   newConn->peer.opCode = remoteWire.op_code;
-  newConn->peer.dualMode = remoteWire.dual_mode;
   newConn->peer.valueSize = remoteWire.value_size;
   newConn->peer.seg.ubva.eid = remoteWire.eid;
   newConn->peer.seg.ubva.uasid = remoteWire.uasid;
@@ -690,46 +634,22 @@ bool UrmaManager::PostWrite(const std::shared_ptr<UrmaJetty> &jetty,
   return rc == URMA_SUCCESS;
 }
 
-bool UrmaManager::PostWriteWithFlag(const std::shared_ptr<UrmaJetty> &jetty,
-                                    UrmaConnection &conn, uint64_t localAddr,
-                                    uint64_t remoteAddr, uint32_t len,
-                                    uint64_t flagLocalAddr,
-                                    uint64_t flagRemoteAddr, uint32_t srcChip,
-                                    uint32_t dstChip, uint64_t userCtx) {
+bool UrmaManager::PostRead(const std::shared_ptr<UrmaJetty> &jetty,
+                           UrmaConnection &conn, uint64_t localAddr,
+                           uint64_t remoteAddr, uint32_t len, uint32_t srcChip,
+                           uint32_t dstChip, uint64_t userCtx) {
   if (jetty == nullptr || localSeg_ == nullptr || conn.targetJetty == nullptr ||
       conn.remoteSeg == nullptr) {
     return false;
   }
   uint32_t drv = (srcChip != kInvalidChip && dstChip != kInvalidChip) ? 1 : 0;
   urma_jfs_wr_t *bad = nullptr;
-  urma_status_t rc = PostJettyRwWithFlag(
-      jetty->Raw(), conn.targetJetty->Raw(), localSeg_->Raw(),
-      conn.remoteSeg->Raw(), localAddr, remoteAddr, len, flagLocalAddr,
-      flagRemoteAddr, userCtx, drv, srcChip, dstChip, &bad);
+  urma_status_t rc =
+      PostJettyRd(jetty->Raw(), conn.targetJetty->Raw(), localSeg_->Raw(),
+                  conn.remoteSeg->Raw(), localAddr, remoteAddr, len, userCtx,
+                  drv, srcChip, dstChip, &bad);
   if (rc != URMA_SUCCESS) {
-    fprintf(stderr, "[wr+flag] post failed rc=%d\n", rc);
-  }
-  return rc == URMA_SUCCESS;
-}
-
-bool UrmaManager::PostWriteFencedFlag(const std::shared_ptr<UrmaJetty> &jetty,
-                                      UrmaConnection &conn, uint64_t localAddr,
-                                      uint64_t remoteAddr, uint32_t len,
-                                      uint64_t flagLocalAddr,
-                                      uint64_t flagRemoteAddr, uint32_t srcChip,
-                                      uint32_t dstChip, uint64_t userCtx) {
-  if (jetty == nullptr || localSeg_ == nullptr || conn.targetJetty == nullptr ||
-      conn.remoteSeg == nullptr) {
-    return false;
-  }
-  uint32_t drv = (srcChip != kInvalidChip && dstChip != kInvalidChip) ? 1 : 0;
-  urma_jfs_wr_t *bad = nullptr;
-  urma_status_t rc = PostJettyRwFencedFlag(
-      jetty->Raw(), conn.targetJetty->Raw(), localSeg_->Raw(),
-      conn.remoteSeg->Raw(), localAddr, remoteAddr, len, flagLocalAddr,
-      flagRemoteAddr, userCtx, drv, srcChip, dstChip, &bad);
-  if (rc != URMA_SUCCESS) {
-    fprintf(stderr, "[wr+fence] post failed rc=%d\n", rc);
+    fprintf(stderr, "[rd] post failed rc=%d\n", rc);
   }
   return rc == URMA_SUCCESS;
 }

@@ -13,10 +13,9 @@
 
 ## 说明
 
-- `PostJettyRw` 系列（对齐 yuanrong `UrmaManager::PostJettyRw`）直接内联在
+- `PostJettyRw`（WRITE）/`PostJettyRd`（READ）直接内联在
   `urma_manager.cpp`：保留 SGE 方向、completion、target Jetty、driver extension、
-  bonding chip 字段；`PostJettyRwWithFlag` 为单 WQE 2-sge（数据+8B 完成标志），
-  `PostJettyRwFencedFlag` 为数据 WR + fence 标志 WR。
+  bonding chip 字段；READ 为 src/dst sge 对调（对齐参考 `UrmaRead`）。
 - 已移除 yuanrong 的故障生命周期（PostGate 状态机/退休/补池/异步事件）、protobuf、
   lane lease、metrics、worker RPC 与 bthread 依赖；bench 场景不做故障恢复。
 - 每轮（一次业务请求）经 `UrmaManager::AcquireSendLane` 从资源层 Jetty 池取一条

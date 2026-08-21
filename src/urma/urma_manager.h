@@ -31,7 +31,6 @@ constexpr uint64_t kRidMask = (1ULL << kRidShift) - 1;
 struct HandshakeParams {
   uint32_t threads = 1;
   uint32_t opCode = 0;
-  uint32_t dualMode = 0;
   uint32_t valueSize = 0;
   uint32_t dstChip = kInvalidChip; /* 本进程数据落地目的 chip */
   uint32_t transMode = 0; /* 0=RM 1=RC 2=UM 3=RS（RC 时绑定本地 jetty） */
@@ -45,7 +44,6 @@ struct UrmaPeerInfo {
   uint32_t dstChip = kInvalidChip;
   uint32_t threads = 1;  /* 对端打流线程数 */
   uint32_t opCode = 0;   /* 对端 op（write/get/mixed） */
-  uint32_t dualMode = 0; /* 对端 dual mode */
   uint32_t valueSize = 0;
   urma_seg_t seg{};
 };
@@ -113,17 +111,10 @@ public:
   bool PostWrite(const std::shared_ptr<UrmaJetty> &jetty, UrmaConnection &conn,
                  uint64_t localAddr, uint64_t remoteAddr, uint32_t len,
                  uint32_t srcChip, uint32_t dstChip, uint64_t userCtx);
-  bool PostWriteWithFlag(const std::shared_ptr<UrmaJetty> &jetty,
-                         UrmaConnection &conn, uint64_t localAddr,
-                         uint64_t remoteAddr, uint32_t len,
-                         uint64_t flagLocalAddr, uint64_t flagRemoteAddr,
-                         uint32_t srcChip, uint32_t dstChip, uint64_t userCtx);
-  bool PostWriteFencedFlag(const std::shared_ptr<UrmaJetty> &jetty,
-                           UrmaConnection &conn, uint64_t localAddr,
-                           uint64_t remoteAddr, uint32_t len,
-                           uint64_t flagLocalAddr, uint64_t flagRemoteAddr,
-                           uint32_t srcChip, uint32_t dstChip,
-                           uint64_t userCtx);
+  /* READ：从对端段读 len 字节到本地（src/dst sge 对调，对齐参考 UrmaRead） */
+  bool PostRead(const std::shared_ptr<UrmaJetty> &jetty, UrmaConnection &conn,
+                uint64_t localAddr, uint64_t remoteAddr, uint32_t len,
+                uint32_t srcChip, uint32_t dstChip, uint64_t userCtx);
 
 private:
   struct EventSlots {
