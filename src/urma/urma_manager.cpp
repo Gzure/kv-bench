@@ -96,7 +96,7 @@ static urma_jfs_wr_t *BuildBondpWr(bondp_jfs_wr_t *bondpWr,
                                    urma_sge_t *dstSges, uint64_t userContext,
                                    uint32_t useDriverExt, uint32_t srcChipId,
                                    uint32_t dstChipId, uint32_t fence,
-                                   uint32_t opcode) {
+                                   urma_opcode_t opcode) {
   auto *wr = &bondpWr->base;
   wr->opcode = opcode;
   wr->flag.bs.complete_enable = 1;
