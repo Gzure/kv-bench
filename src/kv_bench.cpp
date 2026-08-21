@@ -577,10 +577,9 @@ static void pick_chunk_chip(const argument_t *args, worker_t *w,
     *src = ch0 > 0 ? ch0 : 1;
     *dst = ch1 > 0 ? ch1 : 1;
   }
-  /* --drv-ext 关闭：全部 INVALID_CHIP（不走 chip 路由） */
-  if (!args->drv_ext) {
-    *src = *dst = (int)INVALID_CHIP;
-  }
+  /* 注意：--drv-ext 关闭时的 INVALID_CHIP 覆盖由调用方（post_one_chunk）
+   * 完成，与 pick_round_chips 一致；本函数始终返回真实计算值，
+   * 便于 --query-chips 核对 */
 }
 
 /* ---------------- 客户端打流 ---------------- */
@@ -656,6 +655,10 @@ static int post_one_chunk(context_t *ctx, worker_t *w, uint32_t slot_idx,
   int src, dst;
   pick_chunk_chip(args, w, (uint32_t)(chunk_seq % KV_CHUNKS_PER_REQ), &src,
                   &dst);
+  /* --drv-ext 关闭：全部 INVALID_CHIP（不走 chip 路由，对齐默认路径） */
+  if (!args->drv_ext) {
+    src = dst = (int)INVALID_CHIP;
+  }
 
   uint64_t seq = 0;
   uint64_t ue = mgr->PostEvent(w->id, seq);
