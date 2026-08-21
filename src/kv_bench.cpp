@@ -687,8 +687,9 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
 
 /* ---------------- write 分片流水线（80MB 请求 = 20 × 4MB 分片） ------------- */
 
-/* post 一个分片：新 jetty + 事件槽 + PostWrite；登记到 wr_slots[slot_idx] */
+/* post 一个分片到指定槽（jetty 已由调用方取到）：事件槽 + PostWrite + 登记 */
 static int post_one_chunk(context_t *ctx, worker_t *w, uint32_t slot_idx,
+                          const std::shared_ptr<kv_bench::UrmaJetty> &jetty,
                           uint64_t chunk_seq) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
@@ -704,12 +705,6 @@ static int post_one_chunk(context_t *ctx, worker_t *w, uint32_t slot_idx,
   pick_chunk_chip(args, w, (uint32_t)(chunk_seq % KV_CHUNKS_PER_REQ), &src,
                   &dst);
 
-  std::shared_ptr<kv_bench::UrmaJetty> jetty;
-  if (!mgr->AcquireSendLane(jetty)) {
-    fprintf(stderr, "[pipe] send lane pool exhausted (window=%u)\n",
-            window_chunks);
-    return -1;
-  }
   uint64_t seq = 0;
   uint64_t ue = mgr->PostEvent(w->id, seq);
   if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off, remote,
@@ -718,7 +713,6 @@ static int post_one_chunk(context_t *ctx, worker_t *w, uint32_t slot_idx,
     fprintf(stderr, "[pipe] post chunk %llu failed (src=%d dst=%d)\n",
             (unsigned long long)chunk_seq, src, dst);
     mgr->AbortEvent(w->id, seq);
-    mgr->ReleaseSendLane(jetty);
     return -1;
   }
   wr_slot_t *s = &w->wr_slots[slot_idx];
@@ -730,28 +724,10 @@ static int post_one_chunk(context_t *ctx, worker_t *w, uint32_t slot_idx,
   return 0;
 }
 
-/* 等任一在飞分片完成：返回槽下标；失败返回 -(idx+1)；超时返回 -(window+1) */
-static int wait_any_chunk(context_t *ctx, worker_t *w, uint32_t window,
-                          uint64_t deadline_ns) {
-  kv_bench::UrmaManager *mgr = ctx->mgr;
-  for (;;) {
-    for (uint32_t i = 0; i < window; i++) {
-      if (!w->wr_slots[i].active)
-        continue;
-      int r = mgr->ProbeEvent(w->id, w->wr_slots[i].seq);
-      if (r == 1)
-        return (int)i;
-      if (r == -1)
-        return -(int)(i + 1);
-    }
-    if (now_ns() >= deadline_ns)
-      return -(int)(window + 1); /* 超时 */
-    sleep_ns(POLL_SLEEP_NS);
-  }
-}
-
-/* write 分片流水线主循环：填满窗口（20×并发度 个分片）→ 完成一个补发一个，
- * in-flight 恒 = 窗口；时延按请求（20 分片全完成）记录 */
+/* write 分片流水线主循环（jetty 池驱动）：
+ * 有请求就一直发分片（每分片取一条新 jetty），取不到可用 jetty（池空）就
+ * 等待在飞分片完成释放 jetty 后继续；--concurrency 限制同时在飞请求数 ≤ N；
+ * 时延按请求（20 分片全完成）记录。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;
@@ -760,7 +736,6 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       (args->concurrency >= 1 && args->concurrency <= KV_MAX_CONCURRENCY)
           ? (uint32_t)args->concurrency
           : 1;
-  uint32_t window = KV_CHUNKS_PER_REQ * concurrency;
   uint64_t interval_ns = 0;
   if (args->qps > 0) {
     uint64_t per_thread = args->qps / args->threads;
@@ -770,74 +745,92 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   }
   uint64_t next_req_ns = now_ns();
 
-  /* 填窗：前 window 个分片（前 concurrency 个请求）全部发出 */
-  uint64_t chunk_seq = 0;
-  for (uint32_t i = 0; i < window; i++) {
-    if (chunk_seq % KV_CHUNKS_PER_REQ == 0) {
-      uint64_t rid = chunk_seq / KV_CHUNKS_PER_REQ;
-      w->req_start[rid % concurrency] = now_ns();
-      w->req_done[rid % concurrency] = 0;
-    }
-    if (post_one_chunk(ctx, w, i, chunk_seq) != 0)
-      return -1;
-    chunk_seq++;
-  }
+  uint64_t chunk_seq = 0; /* 本线程全局分片序号（请求 id = chunk_seq/20） */
+  uint32_t req_active = 0; /* 同时在飞请求数（≤ concurrency） */
 
-  while (!w->stop && !ctx->fatal) {
-    if (now_ns() >= deadline)
-      break;
-    int r = wait_any_chunk(ctx, w, window, deadline);
-    if (r < 0) {
-      if (r == -(int)(window + 1))
-        break; /* 超时（deadline 到） */
-      uint32_t fidx = (uint32_t)(-r - 1);
-      fprintf(stderr, "[pipe] chunk %llu failed (seq=%llu), aborting\n",
-              (unsigned long long)w->wr_slots[fidx].chunk_seq,
-              (unsigned long long)w->wr_slots[fidx].seq);
-      return -1;
-    }
-    wr_slot_t *s = &w->wr_slots[r];
-    uint64_t now2 = now_ns();
-    __atomic_add_fetch(&w->bytes, KV_CHUNK_SIZE, __ATOMIC_RELAXED);
-    mgr->ReleaseSendLane(s->jetty);
-    s->jetty.reset();
-    s->active = false;
+  while (!w->stop && !ctx->fatal && now_ns() < deadline) {
+    bool progressed = false;
 
-    /* 请求级完成判定（该请求 20 分片全部完成） */
-    uint64_t req_id = s->chunk_seq / KV_CHUNKS_PER_REQ;
-    uint32_t ri = (uint32_t)(req_id % concurrency);
-    w->req_done[ri]++;
-    if (s->chunk_seq % KV_CHUNKS_PER_REQ == KV_CHUNKS_PER_REQ - 1) {
-      kv_hist_record(&w->hist, now2 - w->req_start[ri]);
-      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+    /* 1. 收完成：扫描全部在飞槽，完成的记账并归还 jetty（腾出池容量） */
+    for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
+      wr_slot_t *s = &w->wr_slots[i];
+      if (!s->active)
+        continue;
+      int r = mgr->ProbeEvent(w->id, s->seq);
+      if (r == 0)
+        continue;
+      progressed = true;
+      if (r < 0) {
+        fprintf(stderr, "[pipe] chunk %llu failed (seq=%llu), aborting\n",
+                (unsigned long long)s->chunk_seq,
+                (unsigned long long)s->seq);
+        return -1;
+      }
+      __atomic_add_fetch(&w->bytes, KV_CHUNK_SIZE, __ATOMIC_RELAXED);
+      mgr->ReleaseSendLane(s->jetty);
+      s->jetty.reset();
+      s->active = false;
+      /* 请求级完成判定（该请求 20 分片全部完成） */
+      uint64_t req_id = s->chunk_seq / KV_CHUNKS_PER_REQ;
+      uint32_t ri = (uint32_t)(req_id % concurrency);
+      w->req_done[ri]++;
+      if (s->chunk_seq % KV_CHUNKS_PER_REQ == KV_CHUNKS_PER_REQ - 1) {
+        kv_hist_record(&w->hist, now_ns() - w->req_start[ri]);
+        __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+        if (req_active > 0)
+          req_active--;
+      }
     }
 
-    if (now_ns() >= deadline)
-      break;
-    /* 补发一个分片；qps 节流在请求边界 */
-    if (chunk_seq % KV_CHUNKS_PER_REQ == 0 && interval_ns > 0) {
-      if (now_ns() < next_req_ns) {
-        uint64_t left = next_req_ns - now_ns();
-        if (left > 50000)
-          sleep_ns(left - 50000);
-        while (now_ns() < next_req_ns) {
+    /* 2. 发送：有请求就一直发，直到取不到可用 jetty（池空）或达到并发度上限 */
+    while (now_ns() < deadline && !ctx->fatal) {
+      if (chunk_seq % KV_CHUNKS_PER_REQ == 0) {
+        /* 新请求边界：qps 节流 + 并发度上限检查 */
+        if (req_active >= concurrency)
+          break; /* 并发度满，等请求完成腾名额 */
+        if (interval_ns > 0) {
+          if (now_ns() < next_req_ns) {
+            uint64_t left = next_req_ns - now_ns();
+            if (left > 50000)
+              sleep_ns(left - 50000);
+            while (now_ns() < next_req_ns) {
+            }
+          }
+          next_req_ns = now_ns() + interval_ns;
+        }
+        uint64_t rid = chunk_seq / KV_CHUNKS_PER_REQ;
+        w->req_start[rid % concurrency] = now_ns();
+        w->req_done[rid % concurrency] = 0;
+        req_active++;
+      }
+      /* 找空槽 */
+      uint32_t slot = KV_MAX_WR_SLOTS;
+      for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
+        if (!w->wr_slots[i].active) {
+          slot = i;
+          break;
         }
       }
-      next_req_ns = now_ns() + interval_ns;
+      if (slot == KV_MAX_WR_SLOTS)
+        break; /* 槽满（池 ≤ 200，理论不会） */
+      std::shared_ptr<kv_bench::UrmaJetty> jetty;
+      if (!mgr->AcquireSendLane(jetty))
+        break; /* 池空：等待在飞分片完成释放 */
+      if (post_one_chunk(ctx, w, slot, jetty, chunk_seq) != 0) {
+        mgr->ReleaseSendLane(jetty);
+        return -1;
+      }
+      progressed = true;
+      chunk_seq++;
     }
-    if (chunk_seq % KV_CHUNKS_PER_REQ == 0) {
-      uint64_t rid = chunk_seq / KV_CHUNKS_PER_REQ;
-      w->req_start[rid % concurrency] = now_ns();
-      w->req_done[rid % concurrency] = 0;
-    }
-    if (post_one_chunk(ctx, w, (uint32_t)r, chunk_seq) != 0)
-      return -1;
-    chunk_seq++;
+
+    if (!progressed)
+      sleep_ns(POLL_SLEEP_NS);
   }
 
-  /* 收尾：等窗口内剩余在飞分片完成（或超时）并归还 jetty，避免退出时
-   * 在飞 WR / 未归还 lane 残留 */
-  for (uint32_t i = 0; i < window; i++) {
+  /* 收尾：等剩余在飞分片完成（或超时）并归还 jetty，避免退出时在飞
+   * WR / 未归还 lane 残留 */
+  for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
     wr_slot_t *s = &w->wr_slots[i];
     if (s->active) {
       (void)mgr->WaitEvent(w->id, s->seq, args->timeout_ms);

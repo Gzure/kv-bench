@@ -14,7 +14,7 @@
 | 带宽测试 | 全速打流（`--qps 0`），统计吞吐（MB/s 大 B 与 Mb/s 小 b 双单位）与 IOPS |
 | 时延测试 | 固定 QPS 节流打流，统计 avg / p50 / p90 / p99 / p999 / p9999 / pmax（us） |
 | 操作类型 | `write`（KV Put：客户端分片流水线直写服务器内存）、`get`（KV Get：**服务器 WRITE 回写客户端缓冲**，对齐 datasystem `UbWriteHelper → UrmaWritePayload` 模型，见 §6）、`mixed`（按 `--mixed-ratio` 混合） |
-| 分片流水线 | **write：一次请求 = 80MB（固定）= 20 × 4MB 分片**，每分片独立 WR + 独立新 jetty，**分片按请求内序号交替 chip1/chip2（10+10 均匀打散）**；请求并发度 `--concurrency` 1~10，滑动窗口流水线（完成一个分片补发一个），见 §6.1 |
+| 分片流水线 | **write：一次请求 = 80MB（固定）= 20 × 4MB 分片**，每分片独立 WR + 独立新 jetty，**分片按请求内序号交替 chip1/chip2（10+10 均匀打散）**；请求并发度 `--concurrency` 1~10，**jetty 池驱动发送**（有请求一直发，取不到可用 jetty 就等待释放后再继续），见 §6.1 |
 | bonding 亲和 | `affinity`（**分片源==目的==同一 chip**，交替打散双 chip）、`anti`（源随机 & 目的固定）、`none`（源/目的全随机），见 §8 |
 | 可配置 | 线程数 `--threads`、时长 `--duration`、目标 QPS `--qps`（请求/秒）、请求并发度 `--concurrency`、jetty 池大小 `--jetty-count` 等 |
 | 依赖 | 仅 liburma + pthread；无 bthread/brpc/protobuf/TBB/gflags |
@@ -159,17 +159,17 @@ client                                  server
 - 一条独立 WR（`PostWrite`，长度 4MB），**独立取一条新 jetty**（SendJettyPool 游标轮转，每分片"新的"）；
 - **亲和（`--affinity-mode affinity`）= 分片源与目的在同一 chip**：分片在请求内的序号 `j`（0..19）→ `chip = j % 2 ? 2 : 1`，`src == dst == chip`，20 分片 = chip1/chip2 各 10，**交替均匀打散**，两个 chip 的物理口同时满负荷。
 
-**请求并发度 `--concurrency N`（1~10）**：同时 in-flight N 个请求（每请求 20 分片），稳态在飞分片 = **20×N**。
+**请求并发度 `--concurrency N`（1~10）**：同时在飞请求数 ≤ N（在飞分片 ≤ 20×N）。
 
-**滑动窗口流水线**：
+**jetty 池驱动流水线**（发送节奏由 jetty 池容量决定）：
 
 ```
-填窗：连续发出 20×N 个分片 WR（前 N 个请求全部分片，全部 in-flight）
 循环（直到时长结束）:
-  ProbeEvent 扫描窗口槽，等到任一在飞分片完成（成功/失败）
-  失败 → 首错即中断（fatal）
-  成功 → bytes += 4MB；若该分片是某请求的第 20 个 → hist.Record(请求时延)
-         补发下一个分片（下一请求的下一分片），in-flight 恒 = 20×N
+  收完成: ProbeEvent 扫描全部在飞槽，完成的 → bytes += 4MB、该请求第 20 个分片
+          完成时 hist.Record(请求时延)、归还 jetty（腾出池容量）
+  发送:   有请求就一直发分片（每分片取一条新 jetty）
+          取不到可用 jetty（池空）→ 等待在飞分片完成释放后继续
+          新请求边界受 --concurrency 限制（在飞请求 ≤ N）
 ```
 
 - 分片全局序号 `chunk_seq` 单调递增 → `请求 id = chunk_seq / 20`，请求内序号 `j = chunk_seq % 20`。
@@ -211,12 +211,9 @@ GetReq（32B packed）: client_seg_va | client_off | size | seq | flag_off
 ### 6.4 单线程打流循环（write）
 
 ```
-填窗（首个窗口 20×concurrency 个分片全发）
 while (!stop && !fatal && now < deadline):
-  if qps > 0: PaceToNextSlot()            // 请求/秒，漂移补偿
-  idx = ProbeEvent 等到任一在飞分片完成
-  失败 → fatal 中断
-  成功 → bytes += 4MB；请求级完成 → hist.Record(请求时延)；补发下一分片
+  收完成（ProbeEvent 扫描在飞槽 → 记账/记时延/归还 jetty）
+  发送（有请求一直发分片；池空则等；新请求受并发度 ≤ N 限制）
 ```
 
 ### 6.5 QPS 节流
