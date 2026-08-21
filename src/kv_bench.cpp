@@ -488,7 +488,8 @@ static int first_dst_chip(const argument_t *args) {
 }
 
 static void pick_round_chips(const argument_t *args, bool is_client,
-                             worker_t *w, int *src_a, int *src_b, int *dst) {
+                             worker_t *w, int *src_a, int *src_b, int *dst_a,
+                             int *dst_b) {
   int all_cpus[MAX_CPUS];
   int n_all = enumerate_all_cpus(all_cpus, MAX_CPUS);
   int mine[MAX_CPUS];
@@ -509,7 +510,9 @@ static void pick_round_chips(const argument_t *args, bool is_client,
     }
     *src_a = my_chip;
     *src_b = (my_chip == 1) ? 2 : 1;
-    *dst = my_chip; /* 亲和: dst 跟随 src_a，src=1->dst=1, src=2->dst=2 */
+    /* 亲和: 每包 dst 跟随本包 src, src=1->dst=1, src=2->dst=2 */
+    *dst_a = *src_a;
+    *dst_b = *src_b;
   } else if (args->affinity_mode == AFF_ANTI) {
     int pool[MAX_CPUS];
     int np = n_mine > 0 ? n_mine : n_all;
@@ -539,7 +542,7 @@ static void pick_round_chips(const argument_t *args, bool is_client,
     }
     int ch1 = cpu_to_chip(c1);
     *src_b = ch1 > 0 ? ch1 : ((*src_a == 1) ? 2 : 1);
-    *dst = dst_chip;
+    *dst_a = *dst_b = dst_chip;
   } else {
     int c0 = all_cpus[rng_next(&w->rng) % n_all];
     int c1 = all_cpus[rng_next(&w->rng) % n_all];
@@ -549,14 +552,14 @@ static void pick_round_chips(const argument_t *args, bool is_client,
     int ch2 = cpu_to_chip(c2);
     *src_a = ch0 > 0 ? ch0 : 1;
     *src_b = ch1 > 0 ? ch1 : 2;
-    *dst = ch2 > 0 ? ch2 : 1;
+    *dst_a = *dst_b = ch2 > 0 ? ch2 : 1;
   }
 }
 
 /* ---------------- 客户端打流 ---------------- */
 
 static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
-                           int dst_chip) {
+                           int dst_a, int dst_b) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
@@ -582,14 +585,14 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   uint64_t ua = mgr->PostEvent(w->id, seq_a);
   uint64_t ub = mgr->PostEvent(w->id, seq_b);
   if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_a, remote_a,
-                      wr_len, (uint32_t)src_a, (uint32_t)dst_chip, ua)) {
+                      wr_len, (uint32_t)src_a, (uint32_t)dst_a, ua)) {
     fprintf(stderr, "[wr] post A failed\n");
     mgr->AbortEvent(w->id, seq_a);
     mgr->ReleaseSendLane(jetty);
     return -1;
   }
   if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_b, remote_b,
-                      wr_len, (uint32_t)src_b, (uint32_t)dst_chip, ub)) {
+                      wr_len, (uint32_t)src_b, (uint32_t)dst_b, ub)) {
     fprintf(stderr, "[wr] post B failed\n");
     mgr->AbortEvent(w->id, seq_b);
     (void)mgr->WaitEvent(w->id, seq_a,
@@ -601,17 +604,17 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   bool ok_b = mgr->WaitEvent(w->id, seq_b, args->timeout_ms);
   if (!ok_a) {
     fprintf(stderr, "[wr] wait A failed (seq=%lu, src_chip=%d, dst_chip=%d)\n",
-            (unsigned long)seq_a, src_a, dst_chip);
+            (unsigned long)seq_a, src_a, dst_a);
   }
   if (!ok_b) {
     fprintf(stderr, "[wr] wait B failed (seq=%lu, src_chip=%d, dst_chip=%d)\n",
-            (unsigned long)seq_b, src_b, dst_chip);
+            (unsigned long)seq_b, src_b, dst_b);
   }
   mgr->ReleaseSendLane(jetty);
   return (ok_a && ok_b) ? 0 : -1;
 }
 
-static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_chip) {
+static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_a) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
@@ -636,7 +639,7 @@ static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_chip) {
   uint64_t ue = mgr->PostEvent(w->id, seq_e);
   if (!mgr->PostWrite(jetty, conn, (uint64_t)req,
                       conn.RemoteSegVa() + (uint64_t)slot * GET_REQ_SIZE,
-                      GET_REQ_SIZE, (uint32_t)src_a, (uint32_t)dst_chip, ue)) {
+                      GET_REQ_SIZE, (uint32_t)src_a, (uint32_t)dst_a, ue)) {
     fprintf(stderr, "[get] post request failed\n");
     mgr->AbortEvent(w->id, seq_e);
     mgr->ReleaseSendLane(jetty);
@@ -718,32 +721,32 @@ static void *client_worker_main(void *arg) {
       }
     }
 
-    int src_a, src_b, dst_chip;
-    pick_round_chips(args, true, w, &src_a, &src_b, &dst_chip);
+    int src_a, src_b, dst_a, dst_b;
+    pick_round_chips(args, true, w, &src_a, &src_b, &dst_a, &dst_b);
     /* 目的 chip 优先用服务器握手通告值（与服务器 --destination-cpus 一致） */
     if (args->drv_ext && ctx->conn != nullptr &&
         ctx->conn->peer.dstChip != INVALID_CHIP) {
-      dst_chip = (int)ctx->conn->peer.dstChip;
+      dst_a = dst_b = (int)ctx->conn->peer.dstChip;
     }
     /* 默认不走 bonding chip 路由（has_drv_ext=0 + INVALID
      * chip，对齐参考默认路径）；
      * --drv-ext 显式开启后使用 src/dst chip 路由（自动值，参考 NumaIdToChipId）
      */
     if (!args->drv_ext) {
-      src_a = src_b = dst_chip = INVALID_CHIP;
+      src_a = src_b = dst_a = dst_b = INVALID_CHIP;
     }
 
     uint64_t t0 = now_ns();
     int rc;
     if (args->op == OP_WRITE) {
-      rc = client_do_write(ctx, w, src_a, src_b, dst_chip);
+      rc = client_do_write(ctx, w, src_a, src_b, dst_a, dst_b);
     } else if (args->op == OP_GET) {
-      rc = client_do_get(ctx, w, src_a, dst_chip);
+      rc = client_do_get(ctx, w, src_a, dst_a);
     } else {
       if (rng_next(&w->rng) % 100 < args->mixed_ratio) {
-        rc = client_do_write(ctx, w, src_a, src_b, dst_chip);
+        rc = client_do_write(ctx, w, src_a, src_b, dst_a, dst_b);
       } else {
-        rc = client_do_get(ctx, w, src_a, dst_chip);
+        rc = client_do_get(ctx, w, src_a, dst_a);
       }
     }
     uint64_t t1 = now_ns();
@@ -776,7 +779,7 @@ static void *client_worker_main(void *arg) {
 
 static int server_write_back(context_t *ctx, conn_t *conn, worker_t *w,
                              const get_req_t *req, int src_a, int src_b,
-                             int dst_chip) {
+                             int dst_a, int dst_b) {
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &remote = *conn->conn;
   uint32_t wr_len =
@@ -806,14 +809,14 @@ static int server_write_back(context_t *ctx, conn_t *conn, worker_t *w,
     if (!mgr->PostWriteFencedFlag(
             jetty, remote, (uint64_t)ctx->client_data + s_off,
             req->client_seg_va + d_off, wr_len, flag_local, flag_remote,
-            (uint32_t)src_a, (uint32_t)dst_chip, ua)) {
+            (uint32_t)src_a, (uint32_t)dst_a, ua)) {
       ok_post = false;
     }
     if (ok_post &&
         !mgr->PostWriteFencedFlag(
             jetty, remote, (uint64_t)ctx->client_data + s_off + wr_len,
             req->client_seg_va + d_off + wr_len, wr_len, flag_local,
-            flag_remote + 8, (uint32_t)src_b, (uint32_t)dst_chip, ub)) {
+            flag_remote + 8, (uint32_t)src_b, (uint32_t)dst_b, ub)) {
       ok_post = false;
     }
   } else {
@@ -821,14 +824,14 @@ static int server_write_back(context_t *ctx, conn_t *conn, worker_t *w,
     if (!mgr->PostWriteWithFlag(
             jetty, remote, (uint64_t)ctx->client_data + s_off,
             req->client_seg_va + d_off, wr_len, flag_local, flag_remote,
-            (uint32_t)src_a, (uint32_t)dst_chip, ua)) {
+            (uint32_t)src_a, (uint32_t)dst_a, ua)) {
       ok_post = false;
     }
     if (ok_post &&
         !mgr->PostWriteWithFlag(
             jetty, remote, (uint64_t)ctx->client_data + s_off + wr_len,
             req->client_seg_va + d_off + wr_len, wr_len, flag_local,
-            flag_remote + 8, (uint32_t)src_b, (uint32_t)dst_chip, ub)) {
+            flag_remote + 8, (uint32_t)src_b, (uint32_t)dst_b, ub)) {
       ok_post = false;
     }
   }
@@ -872,17 +875,17 @@ static void *server_get_worker_main(void *arg) {
         continue;
       }
       get_req_t req = ring[slot]; /* 拷贝; seq acquire 已保证前置字段可见 */
-      int src_a, src_b, dst_chip;
-      pick_round_chips(args, false, w, &src_a, &src_b, &dst_chip);
+      int src_a, src_b, dst_a, dst_b;
+      pick_round_chips(args, false, w, &src_a, &src_b, &dst_a, &dst_b);
       /* get 回写目的 = 客户端缓冲 -> 客户端目的 chip（亲和/反亲和使用） */
       if (args->drv_ext && conn->conn != nullptr &&
           conn->conn->peer.dstChip != INVALID_CHIP) {
-        dst_chip = (int)conn->conn->peer.dstChip;
+        dst_a = dst_b = (int)conn->conn->peer.dstChip;
       }
       if (!args->drv_ext) {
-        src_a = src_b = dst_chip = INVALID_CHIP;
+        src_a = src_b = dst_a = dst_b = INVALID_CHIP;
       }
-      if (server_write_back(ctx, conn, w, &req, src_a, src_b, dst_chip) == 0) {
+      if (server_write_back(ctx, conn, w, &req, src_a, src_b, dst_a, dst_b) == 0) {
         w->seen[slot] = seq;
         __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&w->bytes,
@@ -1782,9 +1785,9 @@ static int run_chip_query(const argument_t *args) {
       (void)memset(&w, 0, sizeof(w));
       w.id = i;
       w.rng = tmp.seed + i * 2654435761u;
-      int sa, sb, dst;
-      pick_round_chips(&tmp, true, &w, &sa, &sb, &dst);
-      printf("  worker %u: src_a=%d src_b=%d dst=%d\n", i, sa, sb, dst);
+      int sa, sb, da, db;
+      pick_round_chips(&tmp, true, &w, &sa, &sb, &da, &db);
+      printf("  worker %u: src_a=%d src_b=%d dst_a=%d dst_b=%d\n", i, sa, sb, da, db);
     }
   }
   return 0;
