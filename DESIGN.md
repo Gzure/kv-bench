@@ -1,443 +1,342 @@
 # kv-bench 设计文档（基于 URMA）
 
 > 通用 URMA 性能测试工具：带宽 / 时延，模拟 KV 打流。
-> URMA 实现参考同级目录 `yuanrong-datasystem`（`src/datasystem/common/rdma/*`），
+> 实现参考同级目录 `yuanrong-datasystem`（`src/datasystem/common/rdma/*`），
 > 剥离 bthread/brpc/protobuf/TBB 等第三方依赖，只保留"KV 调 URMA"的代码模型。
+> **本文档与当前代码（`main` 分支）保持一致**；参考实现的行号仅作溯源。
 
 ---
 
-## 1. 目标
+## 1. 目标与能力
 
 | 能力 | 说明 |
 | --- | --- |
-| 带宽测试 | 全速打流，统计吞吐（MB/s）与 IOPS |
-| 时延测试 | 固定 QPS 节流打流，统计 avg / p50 / p90 / p99 / p999 / p9999 / pmax |
-| 操作类型 | `write`（KV Put：客户端 WRITE 直写服务器内存）、`get`（KV Get：**服务器 WRITE 回写客户端缓冲**，对齐 datasystem worker `UbWriteHelper → UrmaWritePayload` 模型，见 §6.1） |
-| 双源并发发送 | **每轮（round）从源侧 bonding 设备的两个 CPU 并发发出 2 条 WR**（mirror：各发满 `size`，轮数据量 = `2×size`；split：各 `size/2`），见 §6.1 |
-| 可配置 | 包大小 `--size`、线程数 `--threads`、时长 `--duration`、目标 QPS `--qps`（单位：轮/秒） |
-| bonding 亲和 | `affinity`（源/目的都固定 CPU）、`anti-affinity`（源随机 & 目的固定）、`non-affinity`（源/目的都随机）；源 = bonding 双 CPU（见 §8） |
+| 带宽测试 | 全速打流（`--qps 0`），统计吞吐（MB/s 大 B 与 Mb/s 小 b 双单位）与 IOPS |
+| 时延测试 | 固定 QPS 节流打流，统计 avg / p50 / p90 / p99 / p999 / p9999 / pmax（us） |
+| 操作类型 | `write`（KV Put：客户端 WRITE 直写服务器内存）、`get`（KV Get：**服务器 WRITE 回写客户端缓冲**，对齐 datasystem `UbWriteHelper → UrmaWritePayload` 模型，见 §6）、`mixed`（按 `--mixed-ratio` 混合） |
+| 双源并发发送 | **每轮（round）并发发出 2 条 WR**（mirror：各发满 `size`，轮数据量 = `2×size`；split：各 `size/2`），见 §6.1 |
+| bonding 亲和 | `affinity`（源/目的固定）、`anti`（源随机 & 目的固定）、`none`（源/目的全随机），见 §8 |
+| 可配置 | 包大小 `--value-size`、线程数 `--threads`、时长 `--duration`、目标 QPS `--qps`（轮/秒）、jetty 池大小 `--jetty-count` 等 |
 | 依赖 | 仅 liburma + pthread；无 bthread/brpc/protobuf/TBB/gflags |
 
 ---
 
-## 2. 参考实现分析（yuanrong-datasystem）
-
-### 2.1 分层架构（参考 `docs/urma_call_flow.md`）
-
-```
-业务层      object_cache client/worker（Get/Put 回写、迁移）        ← 本工具剥离
-封装层      fast_transport_manager_wrapper.{h,cpp}                ← 剥离（仅保留调用模型）
-管理层      UrmaManager 单例 (urma_manager.{h,cpp})               ← 精简保留
-资源层      UrmaResource (urma_resource.{h,cpp})                  ← 精简保留
-Provider 层 liburma (umdk) urma_api.h，经 ds_urma_* shim 直链    ← 保留
-```
-
-### 2.2 关键流程（对应实现位置）
-
-| 流程 | 参考实现 | 要点 |
-| --- | --- | --- |
-| 初始化 | `UrmaManager::Init` L246 / `UrmaResource::Init` L724 | `urma_init` → 设备候选（env `DS_URMA_DEV_NAME`，默认 `bonding_dev_0`，失败依次尝试其它 bonding 设备）→ `create_context(device, eidIndex)` → `create_jfce` → `create_jfc`（depth=max_jfc_depth）→ bonding 设备 `ChangeBondingBalanceMode`（BALANCE/PORT）→ `PreFillSendJettyPool`（默认 200 个 send jetty lane）→ 启动 `UrmaPollJfc` 轮询线程 |
-| 握手 | `ProcessHandshakePeer` L2473 / `FinalizeOutboundConnection` L1622 | 交换双方 eid/uasid/本地 jettyId/segment(va,len)/host:port/instanceId；`ImportTargetJetty`（L1583，`ds_urma_get_rjetty` 委托 blob 或 legacy `bondp_rjetty`，tp_type=URMA_CTP，`flag.bs.has_drv_ext=1`）+ `import_seg` |
-| 写 | `UrmaWritePayload` L1926 → `UrmaWritePayloadImpl` L1951 → `UrmaWriteImpl` L1724 | 查连接 → `GetRemoteSeg` → `GetOrRegisterSegment`（本地注册缓存）→ 分块（≤ `GetMaxWriteSize` = `FLAGS_urma_max_write_size_mb`×1MB 与设备能力取小）→ `PostJettyRw`（L1678：`urma_bondp_jfs_wr` 带 `src_chip_id/dst_chip_id`，`flag.bs.has_drv_ext=1` 开启跨 chip 路由）→ `ds_urma_post_jetty_send_wr`，CQE `user_ctx=reqId` |
-| 读 | `UrmaRead` L2079 | 同上，`URMA_OPC_READ`，src/dst sge 对调 |
-| 完成 | `ServerEventHandleThreadMain` L912 → `PollJfcWait` L1409 → `CheckCompletionRecordStatus` L1335 → `CheckAndNotify` L963 | busy-poll `ds_urma_poll_jfc`（最多 10 次，无事件 `nanosleep(1us)`）或事件模式 `wait_jfc+poll+ack+rearm`；完成事件 map（reqId→UrmaEvent，CV 等待，`WaitToFinish` L1229） |
-| 亲和 | `PostJettyRw` + `GetAffinitySrcChipId` | chip id 来自 NUMA 映射（`NumaIdToChipId`）；`urma_bondp_jfs_wr_t` = `urma_jfs_wr_t base + int src_chip_id + int dst_chip_id` |
-
-### 2.3 关键 ABI 类型（`urma_abi_compat.h` 镜像真实 `urma_api.h`）
-
-- 句柄：`urma_device_t / urma_context_t / urma_jfce_t / urma_jfc_t / urma_jfr_t / urma_jetty_t / urma_target_jetty_t / urma_target_seg_t`
-- 配置：`urma_jfc_cfg_t / urma_jfr_cfg_t / urma_jetty_cfg_t / urma_seg_cfg_t`
-- WR：`urma_jfs_wr_t{opcode, flag(complete_enable), tjetty, user_ctx, rw{src,dst}, next}`、`urma_bondp_jfs_wr_t{base, src_chip_id, dst_chip_id}`、`urma_sge_t{addr,len,tseg}`、`urma_sg_t{sge,num_sge}`
-- 完成：`urma_cr_t{status, completion_len, local_id(jettyId), user_ctx, opcode}`
-- 常量：`URMA_OPC_WRITE=0 / URMA_OPC_READ=1`、`URMA_CR_SUCCESS=0`、`URMA_SUCCESS=0`、`URMA_EAGAIN`、`URMA_TM_RM`、`URMA_TYPICAL_MIN_RNR_TIMER=0x10`、`URMA_TYPICAL_RNR_RETRY=6`
-- 资源规模：send jetty `JETTY_SIZE=256`，recv jetty `RECV_JETTY_JFS_DEPTH=32`，reqId 40-bit mask
-
-### 2.4 剥离清单
-
-| 参考依赖 | 剥离方案 |
-| --- | --- |
-| bthread/brpc（RPC 握手） | 自研 TCP 控制通道 + POD 序列化（见 §5） |
-| protobuf（meta_transport.pb：UrmaHandshakeReqPb/RspPb、UrmaRemoteAddrPb） | POD 结构体 + 固定字节序 |
-| TBB concurrent_hash_map | `std::mutex + std::unordered_map` |
-| ThreadPool(RetireJfs)、UrmaAsyncEventHandler | bench 场景下 CQE 错误即打日志 + 标记失败；不实现 jetty 异步退休/补池 |
-| OsXprtPipln / pipeline H2D / GatherWrite | 删除 |
-| 内存分配器/shm arena/CUDA 注册/`InitMemoryBufferPool` | 直接 `mmap` + `register_seg` |
-| flags 框架、metrics、perf 线程、故障恢复/降级（fallback TCP、success rate tracker） | 删除；CLI 自解析 |
-
----
-
-## 3. 总体架构
+## 2. 总体架构与文件布局
 
 ```
 kv-bench/
-├── CMakeLists.txt
-├── README.md
-├── DESIGN.md
-├── include/kvbench/
-│   ├── options.h            CLI 选项解析（含 cpulist 解析）
-│   ├── log.h                极简日志（级别 + 前缀，stderr）
-│   ├── affinity.h           CPU 绑定 / chip id 解析 / NUMA 缓冲分配
-│   ├── histogram.h          HdrHistogram-lite 时延直方图（3 位有效精度）
-│   ├── stats.h              每线程计数器 + 周期合并 + 报表
-│   ├── handshake.h          TCP 控制通道 + POD 消息
-│   ├── urma_provider.h      ds_urma_* 直链 shim + ABI 类型（镜像 urma_api.h）
-│   ├── urma_resource.h      简化资源层（context/jfce/jfc/jfr/segment/jetty 池）
-│   ├── urma_manager.h       简化管理层（Init/握手/Write/Read/轮询/事件）
-│   └── bench/
-│       ├── kv_worker.h      单打流线程（QPS 节流 + 时延采样）
-│       ├── client.h         客户端主控（起线程、聚合统计、收尾）
-│       └── server.h         服务器（注册缓冲、握手、可选亲和绑定）
+├── CMakeLists.txt                URMA_ROOT 查找、KV_BENCH_BONDP_CTL 编译选项
+├── README.md                     使用说明（构建/CLI/亲和三模式/import 说明）
+├── DESIGN.md                     本文档
 └── src/
-    ├── main.cpp             入口：server | client 子命令
-    ├── options.cpp / log.cpp / affinity.cpp / histogram.cpp / stats.cpp / handshake.cpp
-    ├── urma_provider.cpp / urma_resource.cpp / urma_manager.cpp
-    └── bench/kv_worker.cpp / client.cpp / server.cpp
+    ├── kv_bench.cpp              业务层（单文件 ~1800 行）：参数解析/亲和/chip/
+    │                             打流引擎/get 请求环与回写/统计/首错即中断
+    ├── hist.h                    HdrHistogram-lite（ns 精度 3 位有效数字）
+    └── urma/
+        ├── urma_manager.{h,cpp}  管理层：Init/设备发现/RegisterBuffer/握手
+        │                         (Exchange：WireInfo 交换 + import)/AcquireSendLane/
+        │                         PostWrite 系列/轮询线程+事件槽/Stop
+        ├── urma_resource.{h,cpp} 资源层：UrmaResource + RAII 句柄
+        │                         (context/jfce/jfc/jfr/jetty/targetJetty/segment)
+        └── urma_send_lane.h      SendJettyPool（线程安全内建，游标轮转）
+Provider 层  liburma (umdk)        urma_* API（urma_api.h / urma_ubagg.h）
 ```
 
-线程模型（无 bthread，全部 std::thread）：
+### 分层职责（对齐参考分层，业务杂质剥离）
 
-- **客户端**：1 个主控线程 + N 个打流线程 + 1 个 URMA 轮询线程（进程级共享 JFC）+ 1 个统计采样线程。
-- **服务器**：1 个握手服务线程（每客户端连接一个）+ 可选 M 个亲和绑定线程（占位 CPU，稳定目的侧拓扑）+ **G 个 get 回写工作线程**（get 模式下轮询请求环并执行 `UrmaWritePayload` 回写，见 §6.1）+ 1 个 URMA 轮询线程。
+```
+业务层   kv_bench.cpp             选项/亲和(chip)/打流引擎/get 请求环与回写/统计
+管理层   urma_manager.*           UrmaManager：init/设备发现/握手(交换+import)/
+                                  AcquireSendLane/PostWrite 系列(内联 PostJettyRw)/
+                                  轮询线程+事件槽/清理
+资源层   urma_resource.*          UrmaResource + RAII 句柄 + SendJettyPool 委托
+池对象   urma_send_lane.h         SendJettyPool（每轮取"新的"空闲 jetty）
+Provider liburma (umdk)           urma_* API
+```
+
+### 线程模型（无 bthread，全部 std::thread / pthread）
+
+- **客户端**：1 主线程（run_client）+ N 打流线程 + 1 URMA 轮询线程（进程级共享 JFC）+ 1 统计采样线程。
+- **服务器**：1 accept 线程（非阻塞轮询）+ 每连接 G 个 get 回写工作线程（get 模式，默认 = 客户端线程数，`--server-workers` 可覆盖）+ 1 URMA 轮询线程。
 
 ---
 
-## 4. URMA 层设计（对照参考精简）
+## 3. 初始化流程（UrmaManager::Init → UrmaResource::Init）
 
-### 4.1 `urma_provider.{h,cpp}`
-
-- 直接 `-lurma` 链接（与参考一致：`urma_dlopen_util.cpp` 非 mock 路径就是直链），`ds_urma_*` shim 逐个转发到 `urma_*`。
-- 头文件：真实环境 `#include <ub/umdk/urma/urma_api.h>`；为便于无 SDK 环境下编译检查，提供 `include/kvbench/abi/urma_abi_compat.h`（从参考 `urma_mock/abi/urma_abi_compat.h` 精简，仅保留本工具用到的类型，用宏 `KV_BENCH_USE_ABI_COMPAT` 切换）。
-
-### 4.2 `urma_resource.{h,cpp}` —— 资源层
-
-职责（对齐参考 `urma_resource`，去掉故障生命周期）：
+对齐参考 `UrmaManager::Init L246 / UrmaResource::Init L724`：
 
 ```
-class UrmaResource {
-  Status Init(const std::string &devName, int eidIndex);  // 同参考 Init L724 流程
-  // 句柄
-  urma_context_t *ctx(); urma_jfce_t *jfce(); urma_jfc_t *jfc();
-  uint64_t MaxWriteSize(); uint64_t MaxReadSize();        // 设备能力取小
-  // segment
-  Status RegisterSegment(uint64_t va, uint64_t len);      // 返回已注册 segment（缓存 map）
-  // jetty
-  Status CreateJetty(JettyType type, shared_ptr<UrmaJetty>& out);   // send: 共享 JFR; recv: 独立 JFR
-  Status GetOrCreateSharedRecvJetty(shared_ptr<UrmaJetty>& out);    // 进程级 recv jetty（握手发布用）
-  Status AcquireSendJetty(shared_ptr<UrmaJetty>& out);              // 从池取（--jetty-pool 个）
-  void   ReleaseSendJetty(const shared_ptr<UrmaJetty>& jetty);
-  // import（对端）
-  Status ImportTargetJetty(const UrmaInfo& remote, unique_ptr<UrmaTargetJetty>& out); // 同参考 L1583
-  Status ImportSegment(const urma_seg_t& seg, unique_ptr<UrmaRemoteSegment>& out);
-};
+urma_init
+  → urma_get_device_by_name(dev_name)          （默认 bonding0；失败返回）
+  → GetEidIndex(dev)：遍历设备 eid 选首个可用
+  → urma_create_context(device, eidIndex)
+  → urma_create_jfce / urma_create_jfc(depth)
+  → （可选，编译期）bonding balance 模式：
+      #ifdef KV_BENCH_BONDP_CTL  urma_user_ctl(URMA_USER_CTL_BONDP_BONDING_MODE,
+                                   BONDP_BONDING_MODE_BALANCE)   ← 默认关
+  → 创建 send jetty 池：max(--jetty-count, threadsMin) 条 send jetty
+      （共享 JFR；jfsCfg：depth=256、max_sge=2、multi_path=1、order_type(RS)）
+  → 首个打流线程注册时 EnsurePollThread() 启动轮询线程
 ```
 
-- `UrmaJetty` 精简封装：持有 `urma_jetty_t*`、jettyId、共享 JFR；**去掉** PostGate 生命周期状态机（bench 不做故障退休），仅保留极简计数（若未来需要可再加）。
-- send jetty 池：`SendJettyPool`（照搬参考 `urma_send_lane.h` 的池实现，去掉 lease 的 retire/force-release 分支，只留 acquire/release + 计数）。
-- 参考默认池大小 200；本工具默认 `--jetty-pool = max(threads, 32)`，可配。
-
-### 4.3 `urma_manager.{h,cpp}` —— 管理层
-
-```
-class UrmaManager {
-  Status Init(const Options& opt);              // 参考 L246：urma_init→设备候选→Resource::Init→注册 bench 缓冲→起轮询线程
-  Status StartHandshakeAsServer(TcpChannel& ch); // 参考 ProcessHandshakePeer L2473（TCP 版）
-  Status FinalizeHandshakeAsClient(TcpChannel& ch);// 参考 FinalizeOutboundConnection L1622
-  // KV 数据通路
-  struct WriteOpt {                     // get 回写用：第二 src sge（完成标志）
-    uint64_t extraSgeAddr = 0;          // 客户端 FlagArea 槽位地址
-    uint32_t extraSgeLen = 0;           // 8（标志）
-    bool     fence = false;             // --get-fence 回退：数据/标志分两条 WR
-  };
-  // 非阻塞投递（双源并发发送用：一轮 2 条 WR 先并发 post，再统一等待）
-  Status PostWrite(const RemoteAddr& dst, uint64_t localOff, uint32_t size,
-                   int srcChip, int dstChip, const WriteOpt& opt,
-                   std::vector<uint64_t>& eventKeys);       // 参考 blocking=false 路径(L1724/L2070)
-  Status WaitEvents(const std::vector<uint64_t>& keys, int64_t timeoutMs); // 参考 WaitFastTransportEventWithFailure
-  // 阻塞便捷封装 = PostWrite + WaitEvents
-  Status Write(const RemoteAddr& dst, uint64_t localOff, uint32_t size,
-               int srcChip, int dstChip, const WriteOpt& opt = {});
-  void Stop();                                              // 停轮询线程 + 清理 + urma_uninit
-};
-```
-
-关键实现要点（照搬参考语义，去掉业务杂质）：
-
-1. **写**：查连接 map（key=对端 host:port，握手时建立）→ `connection->GetRemoteSeg(segVa)` → `GetOrRegisterSegment(本地)` → 分块循环：`GenerateReqId()`（40-bit）→ `CreateEvent`（reqId→事件，记 t_post）→ 池取 jetty lane → `PostJettyRw(URMA_OPC_WRITE, bondp_wr{src_chip_id,dst_chip_id, has_drv_ext})` → 失败清理事件/lane。
-2. **get 回写**：复用同一条 Write 通路；`WriteOpt.extraSge` 时构造 2 个 src sge（数据 + 完成标志，`urma_sg_t.num_sge=2`，对齐参考 `UrmaGatherWrite` 多 sge 能力），`--get-fence` 时拆为数据 WR + fence 标志 WR。
-3. **非阻塞投递**：`PostWrite` 只 post 不等待，返回 eventKeys；`WaitEvents` 轮询事件表等待全部完成——双源并发发送 = 一轮里两条 WR（src_chip_id = bonding 双 CPU）各 `PostWrite` 一次（两条 WR 同时 in-flight），再 `WaitEvents(2 个 key)`。
-4. **轮询线程**：`PollJfcWait` 精简版——`ds_urma_poll_jfc(jfc, 64, crs)`，无事件 `nanosleep(1us)` 退避；收到 CQE 按 `user_ctx=reqId` 找到事件：成功记完成时间并 `NotifyAll`；失败打日志 + 事件标记失败。（事件模式 `wait_jfc/ack/rearm` 保留为 `--event-mode` 选项，与参考一致。）
-5. **事件**：`std::unordered_map<uint64_t, UrmaEvent>` + `std::mutex` + `std::condition_variable`；`UrmaEvent` 记录 `t_create / t_complete / status / dataSize`（替代参考的 tbbEventMap_ + Event/EventWaiter）。
-6. **握手**：消息内容对齐参考 `UrmaJfrInfo` + segment 列表（见 §5），import 逻辑逐行照搬：
-   - 服务器侧收到对端信息：`ImportRemoteJetty`（建连接 + import target jetty + import 对端 segment）→ 回包携带本地 recv jetty id + 本地 segment(s)。
-   - 客户端侧：收服务器信息 → 建连接 + import target jetty + import segments → 回包本地信息 → 服务器再 import 客户端 jetty/segment。
-   - 可选：采用参考的 rjetty 委托路径（`ds_urma_get_rjetty/put_rjetty` + `import_jetty(blob)`）；若 SDK 不支持则退回 legacy `bondp_rjetty` 构造路径（参考 L1604-1614），代码两条路径都保留，运行时按 `rjettyBuf` 是否非空选择。
-
-### 4.4 连接与地址表示（替代 protobuf）
-
-```
-struct UrmaInfo {          // 对齐参考 UrmaJfrInfo
-  uint8_t  eid[16];
-  uint32_t uasid;
-  uint32_t jettyId;        // 本地 recv jetty id（握手发布）
-  char     host[64];
-  uint16_t port;
-  char     instanceId[40];
-  uint32_t segCount;       // ≤16
-  struct { uint64_t va; uint64_t len; } segs[16];
-};
-struct RemoteAddr {        // 对齐参考 UrmaRemoteAddrPb 语义
-  uint64_t segVa;
-  uint32_t segDataOffset;  // 本工具 = 0（每 op 偏移由打流层自算）
-  char     host[64];
-  uint16_t port;
-};
-struct UrmaConnection {    // 对齐参考 UrmaConnection
-  std::unique_ptr<UrmaTargetJetty> targetJetty;
-  UrmaInfo remoteInfo;
-  std::unordered_map<uint64_t, std::unique_ptr<UrmaRemoteSegment>> remoteSegs; // segVa→imported
-};
-```
+- `UrmaResource::Init` 返回后业务层 `RegisterBuffer(va, len)` 注册单个本地段（`localSeg_`），供握手发布与数据面使用。
+- **balance 编译选项**：`urma_ubagg.h` 已引入（类型可用），但 `urma_user_ctl` 调 balance 在部分平台不可用/驱动崩溃，默认 `OFF`；需要时 `-DKV_BENCH_BONDP_CTL=ON`。
 
 ---
 
-## 5. 握手控制通道（替代 brpc RPC）
+## 4. 握手与 import（UrmaManager::Exchange）
 
-纯 TCP + POD（固定布局、小端、magic+version），消息类型：
-
-```
-enum MsgType : u8 { HELLO_REQ=1, HELLO_RSP=2, URMA_INFO=3, READY=4, DONE=5, ERROR=6 };
-struct MsgHeader { u32 magic; u8 version; u8 type; u16 len; };  // 8B，后跟 payload
-```
-
-流程（每客户端一条 TCP 连接）：
+纯 TCP + POD 固定布局（`WireInfo`，packed，无 protobuf/brpc）。单次同步交换：
 
 ```
-client                     server
-  |-- HELLO_REQ -------------->|   (role=client, bench 参数预览: op/size/threads)
-  |<-- HELLO_RSP + URMA_INFO ---|   (server: eid/uasid/recvJettyId/segs/host:port/instanceId)
-  |-- URMA_INFO -------------->|   (client: 同上)
-  |   (client import server jetty+segs)     (server import client jetty+segs)
-  |-- READY ------------------>|
-  |========= 打流（URMA 数据面，不走 TCP） =========|
-  |-- DONE -------------------->|
+struct WireInfo {                 // __attribute__((packed))
+  urma_eid_t      eid;            // 本进程 eid
+  uint32_t        uasid;
+  uint64_t        seg_va;         // 本地注册段
+  uint64_t        seg_len;
+  uint32_t        seg_flag;       // 段属性
+  uint32_t        seg_token_id;
+  urma_jetty_id_t jetty_id;       // 进程级共享 RECV jetty（发布供对端 import）
+  uint32_t        threads;        // 打流线程数
+  uint32_t        op_code;        // write/get/mixed
+  uint32_t        dual_mode;      // mirror/split
+  uint32_t        value_size;
+  uint32_t        dst_chip;       // 本进程数据落地目的 chip
+  uint32_t        reserved[2];
+};
 ```
 
-- 服务器支持多客户端：每连接一个线程，各自独立建连接、独立打流（多客户端模式自然支持）。
-- 序列化手写 `ReadExact/WriteExact` + 逐字段 memcpy，无 protobuf。
+流程（client/server 对称）：
+
+```
+client                                  server
+  |—— connect（阻塞，无超时）———————>|
+  |—— 写 localWire —— 读 remoteWire ——>|   （SockSyncData：write 全部 + read 循环）
+  |   （各自 import 对端资源）            |
+```
+
+1. 先发布进程级共享 RECV jetty（`GetOrCreateSharedRecvJetty`，独立 JFR，惰性创建），其 `jetty_id` 写入 localWire。
+2. 交换完成后各自 import 对端：
+   - **默认（bondp CTP）**：`bondp_rjetty_t`，`tp_type=URMA_CTP`、`flag.bs.has_drv_ext=1`、**`bondp.jetty = nullptr`**（对齐参考 `ImportRemoteJetty/FinalizeOutboundConnection`；传本地 jetty 指针在部分固件崩溃——见 §12）。失败自动回退普通 `urma_rjetty_t`（`tp_type=URMA_RTP`）。
+   - **`--import-rtp`**：直接走普通 RTP import（跳过 bondp/CTP），用于头库版本不匹配或 bondp 驱动崩溃的绕行。
+   - RC 模式（`--trans-mode 1/3`）：import 成功后把所有本地 send jetty 绑定到对端 target jetty。
+3. `import_seg` 对端 segment（`peer.seg`）。
+4. 握手读/写均**阻塞无超时**（`connect` 阻塞等待内核握手；`SockSyncData` read 循环无限等待，对端关闭连接时报 `peer closed`）。
+
+**握手参数**（`HandshakeParams`）：threads / opCode / dualMode / valueSize / dstChip / transMode，随 TCP 发送。
 
 ---
 
-## 6. 打流引擎（KV 模型，模拟 QPS）
+## 5. 完成模型（事件槽 + 单轮询线程）
 
-### 6.1 数据通路（对应 KV 语义，只走 URMA）
+对齐参考 `ServerEventHandleThreadMain → PollJfcWait → CheckAndNotify`，但**去掉了 map+CV**，改为**每打流线程固定事件槽数组**：
 
-**双源并发发送（核心模型）**：源侧进程使用 bonding 设备（两个端口各绑定一个 CPU：`S0`/`S1`）。**每轮（round）= 从 bonding 的两个源 CPU 并发发出 2 条 WR**（两条同时 in-flight，`src_chip_id = {chip(S0), chip(S1)}` 由 bondp WR 的 drv ext 路由到对应源端口）。`--dual-mode` 决定每条 WR 字节数：
+```
+常量：kEventSlotsPerWorker = 256，kRidShift = 40，kRidMask = 2^40-1
+事件槽编码：user_ctx = (workerId << 40) | seq
+槽状态：seq<<2        （已登记，等待完成）
+        seq<<2 | 1    （成功完成）
+        seq<<2 | 2    （失败完成）
+        0             （空闲/复位）
+```
 
-- `mirror`（默认）：两条 WR 各发满 `size`，轮数据量 = `2×size`（双发/镜像，压满 bonding 双端口）；
+- `PostEvent(workerId, seq)`：取本地 `localSeq++`，槽写 `seq<<2`（RELEASE），返回 `user_ctx`。
+- **轮询线程**（进程级单线程）：`urma_poll_jfc(jfc, 32, crs)` 循环，无事件 `SleepNs(1us)` 退避；`--event-mode` 时改 `urma_wait_jfc(1,100ms) + poll + ack + rearm`。每个 CQE 按 `user_ctx` 拆 `workerId/seq`，CAS 槽 `seq<<2 → seq<<2|1(成功)/|2(失败)`；失败 CQE 打日志。
+- `WaitEvent(workerId, seq, timeoutMs)`：轮询槽（ACQUIRE）至 doneOk/doneFail/超时，随后槽复位 0（允许复用）。
+- `AbortEvent`：post 失败时槽复位 0。
+- 数据面每轮：`PostWrite A（事件 ua）→ PostWrite B（事件 ub）→ WaitEvent ua → WaitEvent ub`——两条 WR 并发 in-flight。
+
+**send lane（每轮取新 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从游标起找第一个空闲下标并移除、游标前移——**每轮都取到"新的" jetty**，多线程下天然分散。池大小 = `max(--jetty-count, threads)`。
+
+---
+
+## 6. 数据通路（KV 模型，模拟 QPS）
+
+### 6.1 双源并发发送（核心模型）
+
+源侧进程使用 bonding 设备（双 chip）。**每轮（round）= 并发发出 2 条 WR**（A/B 背靠背 post，同时 in-flight），`src_chip_id = {src_a, src_b}`。`--dual-mode` 决定每条 WR 字节：
+
+- `mirror`（默认）：两条 WR 各发满 `size`，轮数据量 = `2×size`（压满 bonding 双端口）；
 - `split`：两条 WR 各发 `size/2`，轮数据量 = `size`。
 
-一轮完成 = 两条 WR 的 CQE 都到达（`PostWrite × 2` 并发 in-flight + `WaitEvents`）。
+一轮完成 = 两条 WR 的 CQE 都到达（`PostWrite × 2` + `WaitEvent × 2`）。
 
-**目的侧缓冲**（write = 服务器缓冲；get = 客户端缓冲，目的亲和时 `mbind` 到目的 CPU 的 NUMA）：
-
-```
-目的侧缓冲(单 region): [ DataArea (mbind→目的 CPU NUMA, 亲和模式) ]  → register_seg，握手发布 1 个 seg
-```
-
-**write（Put）—— 客户端发起（源 = 客户端 bonding），数据 客户端→服务器：**
+### 6.2 write（Put）—— 客户端发起
 
 ```
-客户端打流线程 (每线程独立 off, 每轮 mirror):
-  t0 = now()
-  keys.clear()
-  mgr.PostWrite(serverSegVa + off,      clientOff,      size, chip(S0), dstChip, {}, keys)  // WR-0 ← bonding CPU S0
-  mgr.PostWrite(serverSegVa + off+size, clientOff+size, size, chip(S1), dstChip, {}, keys)  // WR-1 ← bonding CPU S1（并发）
-  mgr.WaitEvents(keys, timeout)                       // 两条 CQE 都到
-  t1 = now()
+客户端缓冲: [ ReqArea: threads*32B ] [ DataArea: threads*4*size ] [ FlagArea: threads*16B ]
+服务器缓冲: [ RequestRing: 4096*32B ] [ DataArea: 4*size ] [ 回写标志源槽 8B ]
+
+每线程每轮（mirror）:
+  off 在窗口内轮转（% window）
+  WR-A: 本地 client_data+off      → 服务器 RING_BYTES + off%server_data_len, size, src_a
+  WR-B: 本地 client_data+off+size → 服务器 ...+size, size, src_b
+  WaitEvent A、B 都完成 → 记时延（一轮一次）、bytes += 2*size（mirror）
 ```
 
-对齐参考 `UrmaWritePayload(L1926) → UrmaWriteImpl(L1724) → PostJettyRw(URMA_OPC_WRITE, bondp_wr{src_chip_id,dst_chip_id})`；`src_chip_id = chip(S0)/chip(S1)`（线程自身绑定与亲和模式见 §8）。
+- `--drv-ext` 开时 WR 带 `has_drv_ext=1 + src_chip_id/dst_chip_id`（chip 路由）；默认关（`INVALID_CHIP=0xFF` → `drv=0`，WR 不带 chip 字段）。
+- 数据区窗口 `DATA_WINDOW_PER_THREAD=4`，服务器数据区 `SERVER_DATA_WINDOW=4`。
 
-**get（Get）—— 服务器 WRITE 回写，数据 服务器→客户端**（对齐 datasystem `worker_request_manager.cpp UbWriteHelper → UrmaWritePayload` 模型；因无 RPC 响应通道，用"请求环 + 内存完成标志"替代 RPC 应答；源 = 服务器 bonding 双 CPU）：
+### 6.3 get（Get）—— 服务器 WRITE 回写
+
+对齐 datasystem `worker_request_manager.cpp UbWriteHelper → UrmaWritePayload` 模型；无 RPC 响应通道，用"请求环 + 内存完成标志"替代 RPC 应答。源 = 服务器 bonding 双 CPU（数据方向决定，见 §8.2）。
 
 ```
-服务器缓冲划分:      [ RequestRing: R 槽 × sizeof(GetReq) ] [ DataArea ]
-客户端缓冲划分:      [ DataArea (目的亲和时 mbind) ] [ FlagArea: 每线程 2×8B 完成标志 ]
+GetReq（32B packed）: client_seg_va | client_off | size | seq | flag_off
 
-GetReq { u64 clientSegVa; u32 clientOff; u32 size; u64 seq; u32 flagOff; }   // 32B POD
+客户端打流线程（每线程独立 seq）:
+  填 GetReq（client_seg_va/client_off/size/flag_off=线程槽位），seq RELEASE 落请求环
+  WR①: 请求环槽（4096 槽轮转）
+  spin 等待 flagA[flagOff]==seq && flagB[flagOff]==seq（ACQUIRE + 超时）
+  时延口径 = 填请求 → 观察到双 flag（完整 KV Get 往返）
 
-客户端打流线程 (每线程独立 seq):
-  t0 = now()
-  填 GetReq（目的偏移、size、seq、flagOff=线程槽位）
-  mgr.Write(serverSegVa + (seq % R) * sizeof(GetReq), 本地req槽, sizeof(GetReq))       // WR① 请求（单条控制）
-  spin 等待 flagA[flagOff]==seq && flagB[flagOff]==seq（acquire 语义 + 超时）
-  t1 = now()          // 两个标志都观察到即完成
-
-服务器 get 回写线程 (G 个, 轮询各自槽位; 每请求 mirror 双 WR 并发回写):
+服务器 get 回写线程（G 个，轮询环槽位，seen[slot] 防重）:
   if ring[slot].seq > seen[slot]:
-    keys.clear()
-    mgr.PostWrite(clientSegVa + off,      serverDataOff,      size, chip(S0), dstChip, {flagAAddr, 8B}, keys)  // WR②-0
-    mgr.PostWrite(clientSegVa + off+size, serverDataOff+size, size, chip(S1), dstChip, {flagBAddr, 8B}, keys)  // WR②-1（并发）
-    mgr.WaitEvents(keys, timeout)                   // 两条回写都完成
-    seen[slot] = req.seq
+    WR②-A: 数据 size + 8B flagA（客户端 FlagArea 槽），src_a
+    WR②-B: 数据 size + 8B flagB，src_b        （mirror，双源并发回写）
+    WaitEvent A、B 都完成 → seen[slot] = seq
 ```
 
-- **WR② 回写 = 单条 WRITE、2 个 src sge**（数据 sge + 标志 sge，对齐参考 `UrmaGatherWrite` 的多 sge 能力，jfs `max_sge=13`）：数据与完成标志同一条 WR 落客户端内存，客户端观察到 `flag==seq` 即数据可见（同一 WR 内 sge 顺序落盘）。mirror 两条 WR 各带独立 flag 槽（`flagA`/`flagB`），客户端等双 flag。
-- 若目标平台对单 WR 多 sge 顺序无保证，提供 `--get-fence` 回退：数据 WR + fence 标志 WR 两条（`flag.bs.fence=1`），正确性优先、多一条 WR。
-- 客户端各线程串行发 get（阻塞模型），`flagA/flagB[flagOff]` 每线程独立，无写冲突；`--qps` 节流只作用于客户端请求发出速率，服务器回写线程全速排空（`--server-workers` 默认 = 客户端线程数）。
-- **时延口径（get）= t0(填请求) → t1(观察到双 flag)**，即完整的 KV Get 往返（含请求 WR + 服务器排空 + 双源回写 WR）。
-- 注：write 的"源 bonding 双 CPU"在客户端侧、get 的"源 bonding 双 CPU"在服务器侧（数据方向决定，见 §8.2），两进程都是 bonding 设备，对称处理。
+- **WR② 回写默认 = 单 WR 2 个 src sge**（数据 sge + 8B 完成标志 sge，`jfs max_sge=2`）：数据与标志同一条 WR 落客户端内存，客户端观察到 `flag==seq` 即数据可见（同一 WR 内 sge 顺序落盘）。mirror 两条 WR 各带独立 flag 槽，客户端等双 flag。
+- `--get-fence` 回退：拆成 data WR + fenced flag WR（`flag.bs.fence=1`），正确性优先、多一条 WR。
+- 客户端各线程串行发 get（阻塞模型），`flagA/flagB[flagOff]` 每线程独立无写冲突；`--qps` 节流只作用于客户端请求发出速率，服务器回写线程全速排空。
+- 服务器回写线程数 `--server-workers`（默认 0 = 客户端线程数），总回写线程数不超过服务器 jetty 数。
 
-### 6.2 单线程打流循环
+### 6.4 单线程打流循环
 
 ```
-client thread:
-for (elapsed < duration) {
-  if (targetQps > 0) PaceToNextSlot();                  // §6.3
-  t0 = now();
-  op = PickOp();                                        // write/get/mixed(按比例)
-  if (op==write) { PostWrite(src=S0); PostWrite(src=S1); WaitEvents(2); }   // 一轮双源并发 WR
-  else           { PostGetRequest(...); WaitDualFlag(...); }                // §6.1 WR① + 双 flag
-  t1 = now();
-  hist.Record(t1 - t0);                                 // 每线程独立直方图，无锁；一轮记一次
-  bytes += roundBytes; ops++; off = (off + size) % segLen;
-}
+while (!stop && !fatal && now < deadline):
+  if qps > 0: PaceToNextSlot()            // 轮/秒，漂移补偿
+  pick_round_chips(...) → src_a/src_b/dst
+  if !drv_ext: src_a = src_b = dst = INVALID_CHIP
+  op = PickOp()                           // write/get/mixed(按比例)
+  write: client_do_write（WR-A + WR-B + 双 Wait）
+  get:   client_do_get（WR① + 双 flag spin）
+  hist.Record(t1 - t0)；bytes += roundBytes；off = (off + roundBytes) % window
 ```
 
-- 全速模式（`--qps 0`）= 带宽测试；节流模式（`--qps N`）= 时延/QPS 测试（QPS 单位 = 轮/秒，WR 速率 = 2×IOPS），同时报吞吐。
-- 服务器侧 get 回写线程循环：轮询请求环（busy-spin + 退避），有请求即双源并发 WR 回写，统计回写字节/次数（服务器侧报表可选）。
+- 全速（`--qps 0`）= 带宽测试；节流 = 时延/QPS 测试（QPS 单位 = 轮/秒，WR 速率 = 2×IOPS）。
+- 服务器 get 回写线程：轮询请求环（busy-spin + 1us 退避），有请求即双源并发 WR 回写。
 
-### 6.3 QPS 节流
+### 6.5 QPS 节流
 
-- 每线程 slot 周期 `T = 1e9 / (qps / threads)` ns（QPS 单位 = **轮/秒**，一轮 = 2 条 WR）；维护 `nextSlotNs`，`PaceToNextSlot`：剩余 ≤50us 忙等，否则 `clock_nanosleep`；睡醒后按实际时间修正 `nextSlotNs`（漂移补偿），避免累计误差。
-
-### 6.4 统计与报表（§7）
-
-- 时延直方图按**轮**记录（一轮双 WR 全部完成后记一次）；WR 级时延可选 `--hist-per-wr` 单独记录。
+每线程 slot 周期 `T = 1e9 / (qps / threads)` ns；维护 `nextPostNs`，剩余 ≤50us 忙等，否则 `sleep_ns`；睡醒按实际时间修正（漂移补偿）。
 
 ---
 
-## 7. 统计模型
+## 7. 统计与报表
 
-### 7.1 时延直方图（`histogram.h`）
-
-HdrHistogram-lite：
-- 单位 ns；`lowest=100ns, highest=60s, sigfigs=3` → 桶数 ≈ 1024×log2(6e11) ≈ 37k，内存 ~300KB/线程。
-- 桶索引 = 编码函数（子桶 1024 幂次 + 指数段），`Record()` 原子（每线程私有，无竞争）。
-- 汇总时跨线程 `Merge`，再算：`avg / min / p50 / p90 / p99 / p999 / p9999 / max`，输出单位自动（ns/us/ms）。
-
-### 7.2 吞吐
-
-- 每线程 `std::atomic<uint64_t> ops, bytes`；统计采样线程每 `--report-interval` 秒读一次快照，差分得到瞬时 IOPS 与 MB/s。
-- **带宽口径按数据方向**：write = 客户端→服务器（payload 字节）；get = 服务器→客户端（服务器回写 payload 字节，请求 WR① 不计入带宽）。
-- **每轮字节 `roundBytes`**：`--dual-mode mirror`（默认）= `2×size`（两条 WR 各 size）；`split` = `size`。带宽 = `ops × roundBytes / elapsed`；WR 速率 = `2 × IOPS`。
-
-### 7.3 输出格式
-
-```
-[2026-xx-xx 12:00:01] [summary] duration=30.0s threads=16 op=write size=4096B dual=mirror affinity=affinity
-  rounds=9,000,000  iops=300,000/s  wr_rate=600,000/s  bandwidth=2343.75 MB/s  bytes=73.7GB  errors=0
-  round_latency(us): avg=53.33  min=16.24  p50=50.00  p90=61.00  p99=80.25  p999=176.70  p9999=304.80  pmax=2084.00
-```
+- 每线程 HdrHistogram-lite（`hist.h`，ns 精度，3 位有效数字），**每轮记一次时延**（双 WR 全部完成）。
+- 汇总：`avg / min / p50 / p90 / p99 / p999 / p9999 / pmax`（us）。
+- 采样线程每 `--report-interval` 秒差分 `ops/bytes` → 瞬时 IOPS 与带宽。
+- **带宽双单位输出**：`bandwidth=33849.72 MB/s (270797.75 Mb/s)`（大 B 字节/s + 小 b 比特/s）。
+- 字节口径：write = 客户端→服务器 payload；get = 服务器→客户端回写 payload（请求 WR① 不计入）。
 
 ---
 
-## 8. bonding 亲和模型
+## 8. bonding 亲和与 chip 路由
 
 ### 8.1 chip id 解析
 
-- cpu → NUMA node → chip id：读取 `/sys/devices/system/cpu/cpuN/nodeX`（避免依赖 libnuma）；chip id = 该 NUMA node 号（与参考 `NumaIdToChipId` 语义一致）。
-- 亲和模式下 WR 设置 `bondp_wr.src_chip_id / dst_chip_id` 且 `flag.bs.has_drv_ext = 1`；非亲和模式下置 `INVALID_CHIP_ID(0xFF)`（同参考，禁用 drv ext）。
+- cpu → NUMA node：读 `/sys/devices/system/cpu/cpuN/nodeX`（避免 libnuma），带缓存。
+- **双 chip 模型**（对齐参考 `NumaIdToChipId`）：NUMA 节点数前一半 → chip1，后一半 → chip2（`numa_to_chip`）。
+- WR 的 chip 字段：`urma_bondp_jfs_wr_t` = `urma_jfs_wr_t base + src_chip_id + dst_chip_id`；`--drv-ext` 时 `flag.bs.has_drv_ext=1`；默认 `INVALID_CHIP(0xFF)`（`drv=0` 禁用 chip 路由）。
 
-### 8.2 三种模式
+### 8.2 三种模式（pick_round_chips）
 
-**"源 / 目的"按数据方向定义**（谁发 WR 谁是源，数据落在谁的内存谁是目的），与具体 op 的进程角色解耦：
+"源 / 目的"按**数据方向**定义（谁发 WR 谁是源，数据落在谁的内存谁是目的），与进程角色解耦：
+- write（Put）：源 = 客户端打流线程（客户端 bonding），目的 = 服务器内存；
+- get（Get）：源 = **服务器回写线程**（服务器 bonding，发 WR②），目的 = **客户端缓冲**，角色互换。
 
-- write（Put）：源 = 客户端打流线程（客户端 bonding 双 CPU），目的 = 服务器内存；
-- get（Get）：源 = **服务器回写线程**（服务器 bonding 双 CPU，发 WR②），目的 = **客户端缓冲**，角色与 write 互换。
-
-**源侧 = bonding 双 CPU {S0, S1}**（每轮两条 WR 的 `src_chip_id = {chip(S0), chip(S1)}`；亲和模式下线程绑定与之一致）：
-
-| 模式 | 源侧（bonding 双 CPU） | 目的侧（数据落内存方） | src_chip_id | dst_chip_id |
+| 模式 | 源侧 | 目的侧 | src_a / src_b | dst |
 | --- | --- | --- | --- | --- |
-| `affinity` 亲和 | 线程固定绑定 bonding CPU（每线程 S0 或 S1，`--src-cpus`），两条 WR 固定 {S0, S1} | 固定绑定 `--dst-cpus` + 缓冲按目的 NUMA `mbind` | 固定 = {chip(S0), chip(S1)} | 固定 = chip(目的 cpu) |
-| `anti-affinity` 反亲和 | 线程不绑定，两条 WR 的源 CPU 每轮从候选池随机 | 固定绑定 `--dst-cpus` | 每轮随机 = {chip(随机 cpu₁), chip(随机 cpu₂)} | 固定 |
-| `non-affinity` 非亲和 | 不绑定，源 CPU 随机 | 不绑定，目的 CPU 随机 | 每轮随机 | 每轮随机 |
+| `affinity` | 线程固定绑定 `--source-cpus`，双 WR 固定 | 固定绑定 `--destination-cpus` | 固定：`src_a`=线程 CPU 的 chip，`src_b`=对侧（1↔2） | 固定（服务器握手通告 `peer.dstChip`，即服务器 destination-cpus 第一个有效 chip） |
+| `anti` | 线程不绑定，源每轮随机 | 固定绑定 destination-cpus | **`src_a` 全池随机；`src_b` 优先从对侧 chip 的 CPU 候选随机**（保证双源分属两 chip，bonding 双源不退化；对侧无可用 CPU 时回退全池随机） | 固定 |
+| `none` | 不绑定，源随机 | 不绑定，目的随机 | 每轮全随机（全部 CPU） | 每轮随机 |
 
-- 源 CPU 池：亲和 = `--src-cpus`（默认 bonding 双 CPU）；反亲和/非亲和 = 全部可用 CPU。
-- 随机性：每轮从对应 cpu 列表取随机 cpu → 其 chip id（每线程私有 `std::mt19937`，避免锁竞争；`--seed` 可复现）。
-- CPU 绑定：`pthread_setaffinity_np`（Linux）。目的方按 `--dst-cpus` 绑定占位线程数 = 目的 CPU 数（占位稳定拓扑；数据面硬件直达，无需拷贝 CPU）。
-- NUMA 缓冲：目的方缓冲 `mbind(MPOL_BIND)` 到目的 CPU 的 NUMA node（write=服务器缓冲；get=客户端缓冲），保证数据真正落在目的 chip；`--no-mbind` 可关。
-- 未指定 cpus 时默认：亲和 = 源 = bonding 双 CPU、目的按 `--dst-cpus` 或物理核数；反亲和 = 源随机池取全部可用 CPU + 目的固定；非亲和 = 源/目的都随机。
+- 随机性：每线程私有 `rng`（xorshift32，`--seed` 控制，`--seed + i*2654435761u` 每线程不同），可复现。
+- **CPU 绑定**：`sched_setaffinity`。client 打流线程 `source_cpus[i % n]`（仅 affinity）；server 主线程 `destination_cpus`（`affinity` 与 `anti` 都绑，`!=none` 即绑）；get 回写 worker `destination_cpus[i % n]`（仅 affinity）。
+- `dst` 覆盖顺序：`pick_round_chips` 算出 → `--drv-ext` 且对端通告有效时用 `peer.dstChip` → `--drv-ext` 关时全部 `INVALID_CHIP`。
+
+### 8.3 `--query-chips`（路由选择自检）
+
+不初始化 URMA，打印后退出：
+1. 系统全部 CPU → NUMA → chip 映射；
+2. `--source-cpus` / `--destination-cpus` 列表每个 CPU 的 numa/chip；
+3. `first_dst_chip` 结果；
+4. 三种亲和模式下每个 worker（0..threads-1）的 `src_a/src_b/dst`（同 seed 可复现）。
+
+用于核对亲和/双源路由配置是否符合预期（如 anti 模式 `src_a/src_b` 是否分属两 chip）。
 
 ---
 
-## 9. CLI 设计
+## 9. CLI（当前完整参数）
 
 ```
-kv-bench server --port 8000 [--seg-size 1073741824] [--dst-cpus 0,4,8,12]
-                [--server-workers 16] [--urma-dev bonding_dev_0] [--eid 0]
-                [--event-mode] [--jetty-pool 64]
-
-kv-bench client --server 10.0.0.1:8000
-                --threads 16 --op write|get|mixed --size 4096
-                --duration 30 --qps 0
-                --affinity affinity|anti-affinity|non-affinity
-                [--src-cpus 0-15] [--dst-cpus 0,4,8,12]
-                [--dual-mode split|mirror]     # 每轮双源并发发送: 默认 mirror（两条各 size，轮=2×size）
-                [--mixed-ratio 50]            # mixed 模式下 write 占比
-                [--get-fence]                 # get 回写拆成 数据WR+fence标志WR
-                [--report-interval 1] [--seg-size 268435456]
-                [--urma-dev bonding_dev_0] [--eid 0] [--event-mode]
-                [--jetty-pool 64] [--timeout-ms 5000] [--seed 42]
+kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>] 
+         [-i/--server-ip <ip>]          # 有 = client；无 = server
+         [-p/--server-port <port>]      # 默认 13857
+         [-e/--event-mode]              # wait_jfc/ack/rearm 事件模式
+         [--value-size <bytes>]         # 默认 4M
+         [--qps <n>]                    # 轮/秒；0 = 全速
+         [--duration <sec>]             # 默认 10
+         [--jetty-count <n>]            # 1..200，默认 1；池 = max(count, threads)
+         [--affinity-mode <affinity|anti|none>]   # 默认 none
+         [--source-cpus <list>]         # client 打流 CPU（"4,5" 或 "4,6-8"）
+         [--destination-cpus <list>]    # server CPU（主线程/回写 worker/mbind 目标）
+         [--cacheable]                  # 注册/导入 cacheable 段
+         [--threads <n>]                # client 打流线程数，默认 1
+         [--op <write|get|mixed>]       # 默认 write
+         [--mixed-ratio <pct>]          # mixed 中 write 占比，默认 50
+         [--dual-mode <mirror|split>]   # 默认 mirror（轮 = 2×size）
+         [--report-interval <s>]        # 默认 1
+         [--server-workers <n>]         # get 回写线程数；0 = auto = client threads
+         [--get-fence]                  # get 回写拆 data WR + fence flag WR
+         [--mbind]                      # NUMA 绑定（默认关；MPOL_PREFERRED 实现）
+         [--drv-ext]                    # bonding chip 路由（has_drv_ext + chip）
+         [--import-rtp]                 # import 走普通 RTP（跳过 bondp/CTP）
+         [--seed <n>]                   # 随机种子，默认 42
+         [--fixed-offset]               # 恒压 offset 0（热缓存测试）
+         [--timeout-ms <ms>]            # 完成等待超时，默认 5000
+         [--query-chips]                # 打印 chip 路由选择后退出
 ```
 
-- cpulist 语法：`0,2,4-7` 区间+列表。
-- `--src-cpus` = 源侧 bonding 双 CPU（亲和模式固定使用；反亲和/非亲和作为随机池）。
-- 环境变量（对齐参考）：`DS_URMA_DEV_NAME`（默认 `bonding_dev_0`）可覆盖 `--urma-dev`。
+- cpulist 语法：`0,2,4-7`（区间+列表）。
+- 参数校验：bonding 设备仅支持 `--trans-mode` 0（RM，自动 multi-path，jfs 固定 `multi_path=1`）或 1（RC）；`split` 模式要求 `--value-size` 为偶数等。
+- 已删除历史死参数：`--tp-type`（传输类型实际由 `--import-rtp` 决定，固定 CTP/RTP）、`--multi-path`（jfs 无条件 multi_path=1）、`--src-chip-a/b/--dst-chip`（chip 覆盖，布局敏感崩溃诱因，已移除）。
 
 ---
 
-## 10. 构建
+## 10. 错误处理与清理
 
-- CMake ≥ 3.16，Linux x86_64/arm64，`-pthread`。
-- 查找 liburma：参考 `FindURMA.cmake` 思路——优先 `URMA_INCLUDE_LOCATION` / `URMA_LIB_LOCATION`（下载包模式），否则系统路径 `/usr/include`、`/usr/lib64/urma`。
-- 无 SDK 环境编译检查：`-DKV_BENCH_USE_ABI_COMPAT=ON` 使用自带 ABI 镜像头（仅编译用，运行仍需真实 liburma）。
-- 可选 `-DKV_BENCH_WITH_MOCK=ON`：移植参考 `urma_mock` 的极简内存回环 backend，支持无硬件自测（P1 后加入，见 §12）。
-
----
-
-## 11. 错误处理与清理（简化）
-
-- 打流期错误：单 op 失败 → 计数 errors++、打日志，继续；连续失败阈值（默认 100）→ 中止打流并报错退出（服务器侧回写失败同样计入服务器 errors，DONE 消息带回客户端汇总）。
-- 超时：客户端 `WaitFlag` / `WaitToFinish(timeoutMs)` 超时 → 计数 error、jetty lane 释放（不回退重试）。
-- 清理顺序（对齐参考 Stop/Clear）：停轮询线程 → 释放并 `delete` jetty/jfr/jfc/jfce/context → `unimport_seg`/`unimport_jetty` → `unregister_seg` → `urma_uninit` → 关闭 TCP。
+- **首错即中断**：客户端打流 / 服务器 get 回写遇到第一个失败轮次即置 `fatal` 标志并中止（不再"连续失败 100 次"）。
+- **超时**：`WaitEvent`/双 flag 等待超时（`--timeout-ms`）→ 计 error、释放 lane。
+- **TCP 无超时**：`connect()` 阻塞等待内核握手（SYN 重试约 2 分钟）；握手 `read()` 无限等待，对端关闭连接时报 `peer closed` 快速失败。
+- **清理顺序**（`destroy_context`）：
+  1. `conn.reset()`（先 unimport 对端 target jetty/segment）；
+  2. `mgr->Stop()`：停轮询线程 → `localSeg_.reset()`（`urma_unregister_seg`）→ `urma_uninit`（必须在 unregister 之后）；
+  3. 释放 worker/直方图/缓冲。
 
 ---
 
-## 12. 实施阶段
+## 11. 构建
 
-| 阶段 | 内容 | 产出 |
-| --- | --- | --- |
-| P0 | 骨架：CMake、options/log、histogram、stats、affinity | 可编译框架，单元自测直方图/亲和解析 |
-| P1 | urma_provider + urma_resource（init/segment/jetty 池） | 资源层初始化日志正确 |
-| P2 | urma_manager（写/轮询/事件/握手 import）+ TCP handshake | 双端握手成功，import 日志正确 |
-| P3 | 打流引擎：write 双源并发发送（PostWrite×2，src={S0,S1} + WaitEvents）全速/节流 + 统计报表 | write 模式跑通，指标输出 |
-| P4 | get 回写：请求环 + 双 FlagArea + 服务器回写线程（双源并发回写，含 `--get-fence` 回退） | get 模式跑通 |
-| P5 | bonding 亲和三模式（绑定 + 双 src chip id + 目的 mbind，含 get 角色互换） | 三种模式 × 两种 op 可运行 |
-| P6 | 打磨：多客户端、mixed、错误处理、README、真实环境验证 | 发布 |
+- CMake ≥ 3.16，C++20，默认 `Release`；`-pthread`。
+- 查找 URMA：`URMA_ROOT`（或环境变量）→ 系统路径，`urma_api.h`（`urma_ubagg.h` 单独查找）与 `liburma`。
+- 编译选项：`-DKV_BENCH_BONDP_CTL=ON` 启用 bonding balance `urma_user_ctl`（**默认 OFF**）。
+- **UMDK 头库必须同源（同版本）**：`bondp_rjetty_t` 跨版本布局不同（26.06 含 `urma_bond_jetty_ext_t`，25.12 不含）。编译头与运行 `liburma_ubagg.so` 不匹配时 `bondp_import_jetty` 按错误布局解析 → 段错误（见 §12）。必须在目标机器上编译，或 `-DUMDK_ROOT` 指向与运行库同版本的头。
 
 ---
 
-## 13. 风险与待确认
+## 12. 实测经验与已知问题
 
-| 项 | 说明 |
+| 项 | 状态 |
 | --- | --- |
-| 真实环境验证 | 本仓库无 URMA 硬件/SDK，代码在 Linux + liburma 环境编译验证；建议先在目标机器跑通 `urma_init`/`create_context` |
-| 双源并发发送（补充需求） | 已并入设计：**每轮 = 从源侧 bonding 双 CPU 并发发 2 条 WR**（§6.1/§8.2），`--dual-mode mirror`（默认，各发满 size，轮=2×size）/ `split`（各 size/2，轮=size）。若"两个 cpu"还涉及其他含义（如每轮需真实双线程各绑一个 CPU 发），请指正 |
-| get 完成标志顺序 | 默认单 WR 2 sge（数据+标志，每条回写 WR 各带独立 flag）；若平台不保证单 WR 内 sge 顺序，启用 `--get-fence` 回退 |
-| 握手通道 | TCP + POD（已确认，无 brpc/protobuf） |
-| 随机粒度 | 每轮随机 chip（已确认；反亲和 = 源随机 + 目的固定，非亲和 = 源/目的都随机） |
-| rjetty 委托 | 优先走 `get_rjetty` 委托路径，SDK 不支持时退回 legacy 构造路径（代码双路径保留） |
-
-已确认决策：get 采用**服务器 WRITE 回写**模型（§6.1）；不做 mock；**每轮 = 从源侧 bonding 双 CPU 并发发 2 条 WR、mirror 各发满 size**（§6.1）；亲和"源/目的"按数据方向定义（§8.2）。
+| 带宽实测 | 单线程 mirror 双源 ~33.8 GB/s（270 Gbps），round 时延 avg 240us / p50 223us，0 错误 |
+| 双源上限待确认 | 每个 UB 口规格 ~50GB/s，亲和双源理论应 ≥50GB；实测聚合 ~36GB 且 `--drv-ext`/`--mbind`/线程数（1~8）几乎不变——**待端口感测**（`sar -n DEV` / 成员口 `tx_bytes`）确认是设备聚合上限还是单口路由问题 |
+| UMDK 头库不匹配崩溃 | 编译机 26.06 + 运行机 25.12.0-B105 → `bondp_import_jetty` 段错误，且表现为"进程内存布局敏感"（加 3 个无用 int 字段即崩，去掉可能又不崩），gdb 栈 `bondp_import_jetty` ← `urma_import_jetty`。修复：头库同源（目标机编译或统一版本）；临时绕行 `--import-rtp`（RTP 路径用普通 `urma_rjetty_t`，跨版本稳定） |
+| bondp.jetty | 必须传 `nullptr`（传本地 RECV jetty 指针在部分固件 import 时崩溃；worker2 实测） |
+| mbind | Kunpeng 4 节点上 `MPOL_BIND` 多 maxnode 候选 EINVAL；改 `MPOL_PREFERRED + maxnode=32 + 1GB 分块 + 逐页 touch` 成功；默认关（`--mbind` 开启） |
+| balance 模式 | 编译期默认关；开启时 `urma_user_ctl` 需在 create_context 后、建队列前调用（rc=0 成功，worker2 实测） |
+| 错误码经验 | `URMA_CR_LOC_ACCESS_ERR=4`（多为 SGE 地址/段错误）；`URMA_CR_GENERAL_ERR=9`；`EAGAIN=11`（驱动返回，真实错误看 /var/log/messages）；lib 包装值 `URMA_FAIL=0x1000` |
+| 完成标志顺序 | 默认单 WR 双 sge（数据+标志）同落；平台不保证时用 `--get-fence` 回退 |
