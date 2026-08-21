@@ -87,29 +87,32 @@ kv_bench 打流线程
 `--server-ip` 存在时进程是 client；没有该参数时是 server。两端的 `--dev-name`
 应使用同一类 URMA/bonding 设备；`--destination-cpus` 两端保持一致（客户端用它计算目的 chip）。
 
-## 打流模型（每轮双源并发发送）
+## 打流模型（write：80MB 请求分片流水线）
 
-**每轮（round）= 从 bonding 设备的两个源 CPU 并发发出 2 条 WRITE**（两条同时 in-flight，
-`src_chip_id = {chip1, chip2}`，bondp driver extension 路由到两个源端口）：
+**一次请求 = 80MB（固定）= 20 × 4MB 分片**，每个分片独立 WRITE、**独立取一条新 jetty**。
+亲和模式下**每个分片源与目的在同一 chip**，分片按请求内序号交替 chip1/chip2
+（20 分片 = 10+10 均匀打散），两个 chip 的物理口同时满负荷：
 
-- `--dual-mode mirror`（默认）：两条 WR 各发满 `value-size`，轮数据量 = `2×size`（压满 bonding 双端口）；
-- `--dual-mode split`：两条 WR 各发 `size/2`，轮数据量 = `size`（要求 size 为偶数）。
+- **请求并发度 `--concurrency N`（1~10）**：同时 in-flight N 个请求，稳态在飞分片 = `20×N`。
+- **滑动窗口流水线**：首个窗口（20×N 分片）全部发出；之后**每完成一个 4MB 分片立即补发一个**，
+  in-flight 恒 = 窗口；时延按**请求**记录（该请求 20 个分片全部完成）。
+- 分片字节 = 4MB 固定；带宽 = 请求数 × 80MB / elapsed；WR 速率 = 请求 IOPS × 20。
 
 ## 操作类型
 
-- `--op write`（Put，默认）：客户端双源并发 WRITE 直写服务器内存，双 CQE 完成记一轮时延。
+- `--op write`（Put，默认）：客户端分片流水线直写服务器内存（上述模型）。
 - `--op get`（Get）：对齐 datasystem worker `UbWriteHelper -> UrmaWritePayload` 模型——
   客户端把 32B 请求 WRITE 进服务器请求环，服务器回写线程并发 2 条 WRITE
   （单 WQE 2-sge：数据 + 完成标志；`--get-fence` 可拆成 data WR + fence flag WR）
   回写客户端缓冲，客户端观察到双 flag 完成记一轮时延。
-- `--op mixed`：按 `--mixed-ratio`（write 占比%）混合。
+- `--op mixed`：按 `--mixed-ratio`（write 占比%）混合（write 部分沿用旧的 mirror 双 WR 模型）。
 
 ## 亲和（bonding）
 
-- `affinity`：源固定（客户端线程绑定 `--source-cpus`，每条 WR 固定 chip1/chip2）、
-  目的固定（`--destination-cpus` + 数据区 `mbind` 到目的 NUMA node）。
-- `anti`/`anti-affinity`：源随机（每轮随机 chip），目的固定。
-- `none`：两端都不绑定，源/目的 chip 每轮随机。
+- `affinity`：**分片源==目的==同一 chip**（分片序号 `%2` 交替 chip1/chip2）、
+  源线程绑定 `--source-cpus`、目的固定 `--destination-cpus`。
+- `anti`/`anti-affinity`：源随机（每分片随机 chip），目的固定。
+- `none`：两端都不绑定，源/目的 chip 每分片随机。
 
 CPU 亲和（线程绑定 + mbind）恒生效；**bonding chip 路由（WR 的 `has_drv_ext` +
 `src/dst_chip_id`）默认关闭**（对齐参考默认路径，部分平台 post 时会报
@@ -123,18 +126,19 @@ mbind 会报 EINVAL，非必要）；`--fixed-offset` 恒压同一地址（热�
 - 每线程 HdrHistogram-lite（ns 精度，3 位有效数字），汇总输出
   `avg/min/p50/p90/p99/p999/p9999/pmax`（us）。
 - `--report-interval <s>` 周期打印瞬时 IOPS/带宽。
-- 汇总行含 requests/IOPS/WR 速率（= 2×IOPS）/带宽（MB/s）/errors。
+- 汇总行含 requests/IOPS/WR 速率（write = 20×IOPS，get = 2×IOPS）/带宽（MB/s）/errors。
 
 ```text
-==== summary role=client op=write threads=16 size=4194304 dual=mirror affinity=affinity jetty_count=16 duration=30.0s ====
-requests=9000000 iops=300000.00 wr_rate=600000.00 bandwidth=25165.82 MB/s (201326.59 Mb/s) bytes=75497472000 errors=0
-round latency(us): avg=53.33 min=16.24 p50=50.00 p90=61.00 p99=80.25 p999=176.70 p9999=304.80 pmax=2084.00
+==== summary role=client op=write threads=16 size=4194304 concurrency=4 affinity=affinity jetty_count=200 duration=30.0s ====
+requests=900000 iops=30000.00 wr_rate=600000.00 bandwidth=25165.82 MB/s (201326.59 Mb/s) bytes=75497472000 errors=0
+request latency(us): avg=5333.33 min=1624.00 p50=5000.00 p90=6100.00 p99=8025.00 p999=17670.00 p9999=30480.00 pmax=208400.00
 ```
 
 ## Jetty 线性度扫描
 
-**每轮（round）从 send Jetty 池取一条新的 jetty**（对齐 yuanrong `AcquireSendLane` 模型）：
-池按游标轮转 + in-use 标记分配，用后归还。`jetty_count` 越大，每轮拿到的 jetty 越分散，
+**每个 4MB 分片从 send Jetty 池取一条新的 jetty**（对齐 yuanrong `AcquireSendLane` 模型）：
+池按游标轮转 + in-use 标记分配，用后归还。`jetty_count` 越大，在飞分片拿到的 jetty 越分散，
+用于观察 Jetty 数量对带宽/时延的线性度（注意窗口在飞分片 = 20×并发度，池须 ≥ 该值）：
 用于观察 Jetty 数量对带宽/时延的线性度：
 
 ```bash
@@ -146,7 +150,7 @@ for n in 1 2 4 8 16 32 64 128 200; do
 done
 ```
 
-池大小自动取 `max(jetty_count, threads)`（保证每个打流线程每轮都有 jetty 可取）。
+池大小自动取 `max(jetty_count, threads, 20×并发度)`（保证窗口内每个在飞分片都有 jetty 可取）。
 服务器 get 回写线程数 = 客户端线程数（`--server-workers` 可覆盖），且总回写线程数不超过服务器 jetty 数。
 
 ## 其它参数

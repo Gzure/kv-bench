@@ -90,6 +90,8 @@ public:
   uint32_t WorkerCount() const;
   uint64_t PostEvent(uint32_t workerId, uint64_t &seq); /* 返回 user_ctx */
   bool WaitEvent(uint32_t workerId, uint64_t seq, int timeoutMs);
+  /* 非阻塞探测事件槽：1=成功完成（槽已复位），-1=失败完成，0=未完成 */
+  int ProbeEvent(uint32_t workerId, uint64_t seq);
   void AbortEvent(uint32_t workerId, uint64_t seq);
 
   /* TCP 控制面握手：交换元信息 + import 对端 jetty/segment。

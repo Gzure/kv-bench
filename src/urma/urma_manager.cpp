@@ -391,6 +391,25 @@ bool UrmaManager::WaitEvent(uint32_t workerId, uint64_t seq, int timeoutMs) {
   return ok;
 }
 
+int UrmaManager::ProbeEvent(uint32_t workerId, uint64_t seq) {
+  if (workerId >= workerSlots_.size() || workerSlots_[workerId] == nullptr) {
+    return 0;
+  }
+  uint64_t *slot = &workerSlots_[workerId]->slots[seq % kEventSlotsPerWorker];
+  uint64_t v = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+  uint64_t doneOk = (seq << 2) | 1;
+  uint64_t doneFail = (seq << 2) | 2;
+  if (v == doneOk) {
+    __atomic_store_n(slot, 0, __ATOMIC_RELEASE);
+    return 1;
+  }
+  if (v == doneFail) {
+    __atomic_store_n(slot, 0, __ATOMIC_RELEASE);
+    return -1;
+  }
+  return 0;
+}
+
 void UrmaManager::AbortEvent(uint32_t workerId, uint64_t seq) {
   if (workerId >= workerSlots_.size() || workerSlots_[workerId] == nullptr) {
     return;

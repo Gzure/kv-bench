@@ -52,8 +52,20 @@
 #define RING_BYTES ((uint64_t)RING_SLOTS * GET_REQ_SIZE)
 #define FLAG_PER_THREAD 16 /* 2 x 8B */
 #define DATA_WINDOW_PER_THREAD                                                 \
-  4 /* 客户端 data_len = threads * 4 * value_size */
+  4 /* 客户端 data_len = threads * 4 * value_size（get/mixed 用） */
 #define SERVER_DATA_WINDOW 4
+
+/* write 分片流水线模型（固定）：一次请求 = 80MB = 20 × 4MB 分片 */
+#define KV_CHUNK_SIZE (4UL * 1024 * 1024)
+#define KV_CHUNKS_PER_REQ 20
+#define KV_REQ_SIZE (KV_CHUNK_SIZE * KV_CHUNKS_PER_REQ) /* 80MB */
+#define KV_MAX_CONCURRENCY 10
+#define KV_MAX_WR_SLOTS (KV_CHUNKS_PER_REQ * KV_MAX_CONCURRENCY) /* 200 */
+
+/* 服务器数据区：容纳最大窗口（10 并发 × 80MB = 800MB），固定 */
+#define SERVER_PIPE_BYTES                                                      \
+  ((uint64_t)KV_CHUNKS_PER_REQ * KV_MAX_CONCURRENCY * KV_CHUNK_SIZE)
+
 #define DEFAULT_TIMEOUT_MS 5000
 #define MAX_CPUS 1024
 #define INVALID_CHIP 0xFFu
@@ -79,6 +91,7 @@ typedef struct argument {
   const char *destination_cpus;
   bool cacheable;
   uint32_t threads;
+  int concurrency; /* write 请求并发度 1..10，默认 1（在飞分片 = 20×N） */
   int op;
   uint32_t mixed_ratio;
   int dual_mode;
@@ -108,6 +121,15 @@ typedef struct get_req {
 
 typedef struct context context_t;
 
+/* write 分片流水线：一个在飞分片 = 一条 WR + 持活的 jetty（完成前不释放） */
+typedef struct wr_slot {
+  uint64_t ue;                                   /* user_ctx */
+  uint64_t seq;                                  /* 事件 seq */
+  std::shared_ptr<kv_bench::UrmaJetty> jetty;    /* 分片专用 lane，完成时归还 */
+  uint64_t chunk_seq;                            /* 全局分片序号（请求 id = /20） */
+  bool active;
+} wr_slot_t;
+
 typedef struct worker {
   uint32_t id;          /* UrmaManager workerId（进程级全局） */
   uint32_t local_index; /* 本连接/本进程内序号（get 环槽位分配用） */
@@ -123,6 +145,10 @@ typedef struct worker {
   bool stop;
   pthread_t tid;
   void *run_arg;
+  /* write 分片流水线状态 */
+  wr_slot_t wr_slots[KV_MAX_WR_SLOTS];
+  uint64_t req_start[KV_MAX_CONCURRENCY]; /* 每在飞请求的开始时间（请求 id % N） */
+  uint64_t req_done[KV_MAX_CONCURRENCY];  /* 每在飞请求已完成分片数 */
 } worker_t;
 
 typedef struct conn {
@@ -388,9 +414,17 @@ static int mbind_to_node(void *addr, size_t len, int node) {
  * 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
-  uint64_t size = args->value_size;
+  /* write（分片流水线）：每线程数据区 = 窗口分片数（20×并发度）× 4MB，循环复用；
+   * get/mixed：沿用 value_size 窗口 */
+  uint64_t pipe_chunks =
+      (uint64_t)KV_CHUNKS_PER_REQ *
+      (args->concurrency > 0 ? (uint64_t)args->concurrency : 1);
+  uint64_t data_len = (args->op == OP_WRITE)
+                          ? (uint64_t)args->threads * pipe_chunks * KV_CHUNK_SIZE
+                          : (uint64_t)args->threads * DATA_WINDOW_PER_THREAD *
+                                args->value_size;
   ctx->req_bytes = ROUND_UP((uint64_t)args->threads * GET_REQ_SIZE, PAGE_SIZE);
-  ctx->data_len = (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * size;
+  ctx->data_len = data_len;
   ctx->flag_bytes = (uint64_t)args->threads * FLAG_PER_THREAD;
   ctx->buf_len =
       ROUND_UP(ctx->req_bytes + ctx->data_len + ctx->flag_bytes, PAGE_SIZE);
@@ -401,7 +435,10 @@ static int layout_server_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
   uint64_t size = args->value_size;
   ctx->req_bytes = 0;
-  ctx->data_len = (uint64_t)SERVER_DATA_WINDOW * size;
+  /* 服务器数据区：容纳 write 分片流水线最大窗口（10 并发 × 80MB = 800MB） */
+  ctx->data_len =
+      (args->op == OP_WRITE) ? SERVER_PIPE_BYTES
+                             : (uint64_t)SERVER_DATA_WINDOW * size;
   ctx->flag_bytes = 0;
   ctx->buf_len = ROUND_UP(RING_BYTES + ctx->data_len + 16,
                           PAGE_SIZE); /* +16 回写标志源槽 */
@@ -553,6 +590,43 @@ static void pick_round_chips(const argument_t *args, bool is_client,
   }
 }
 
+/* write 分片 chip 分配：每分片一对 (src, dst)。
+ * affinity：源==目的==chip，分片在请求内序号 j → chip = j%2 ? 2 : 1（20 分片
+ * 交替打散 = 10+10 均匀分两 chip）；anti：源随机、目的固定；none：全随机。 */
+static void pick_chunk_chip(const argument_t *args, worker_t *w,
+                            uint32_t chunk_in_req, int *src, int *dst) {
+  int dst_chip = first_dst_chip(args);
+  if (dst_chip < 0) {
+    dst_chip = (int)(w->id % 2) + 1;
+  }
+  if (args->affinity_mode == AFF_AFFINITY) {
+    *src = *dst = (chunk_in_req % 2 == 0) ? 1 : 2; /* 交替 chip1/chip2 */
+  } else if (args->affinity_mode == AFF_ANTI) {
+    int all_cpus[MAX_CPUS];
+    int n_all = enumerate_all_cpus(all_cpus, MAX_CPUS);
+    int mine[MAX_CPUS];
+    int n_mine = my_cpu_list(args, true, mine, MAX_CPUS);
+    int np = n_mine > 0 ? n_mine : n_all;
+    int c0 = (n_mine > 0 ? mine : all_cpus)[rng_next(&w->rng) % np];
+    int ch0 = cpu_to_chip(c0);
+    *src = ch0 > 0 ? ch0 : ((int)(w->id % 2) + 1);
+    *dst = dst_chip;
+  } else {
+    int all_cpus[MAX_CPUS];
+    int n_all = enumerate_all_cpus(all_cpus, MAX_CPUS);
+    int c0 = all_cpus[rng_next(&w->rng) % n_all];
+    int c1 = all_cpus[rng_next(&w->rng) % n_all];
+    int ch0 = cpu_to_chip(c0);
+    int ch1 = cpu_to_chip(c1);
+    *src = ch0 > 0 ? ch0 : 1;
+    *dst = ch1 > 0 ? ch1 : 1;
+  }
+  /* --drv-ext 关闭：全部 INVALID_CHIP（不走 chip 路由） */
+  if (!args->drv_ext) {
+    *src = *dst = (int)INVALID_CHIP;
+  }
+}
+
 /* ---------------- 客户端打流 ---------------- */
 
 static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
@@ -609,6 +683,170 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   }
   mgr->ReleaseSendLane(jetty);
   return (ok_a && ok_b) ? 0 : -1;
+}
+
+/* ---------------- write 分片流水线（80MB 请求 = 20 × 4MB 分片） ------------- */
+
+/* post 一个分片：新 jetty + 事件槽 + PostWrite；登记到 wr_slots[slot_idx] */
+static int post_one_chunk(context_t *ctx, worker_t *w, uint32_t slot_idx,
+                          uint64_t chunk_seq) {
+  const argument_t *args = &ctx->args;
+  kv_bench::UrmaManager *mgr = ctx->mgr;
+  kv_bench::UrmaConnection &conn = *ctx->conn;
+  uint32_t window_chunks =
+      (uint32_t)(KV_CHUNKS_PER_REQ *
+                 (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
+  uint64_t off = (chunk_seq % window_chunks) * KV_CHUNK_SIZE;
+  uint64_t remote =
+      conn.RemoteSegVa() + RING_BYTES + (off % SERVER_PIPE_BYTES);
+
+  int src, dst;
+  pick_chunk_chip(args, w, (uint32_t)(chunk_seq % KV_CHUNKS_PER_REQ), &src,
+                  &dst);
+
+  std::shared_ptr<kv_bench::UrmaJetty> jetty;
+  if (!mgr->AcquireSendLane(jetty)) {
+    fprintf(stderr, "[pipe] send lane pool exhausted (window=%u)\n",
+            window_chunks);
+    return -1;
+  }
+  uint64_t seq = 0;
+  uint64_t ue = mgr->PostEvent(w->id, seq);
+  if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off, remote,
+                      (uint32_t)KV_CHUNK_SIZE, (uint32_t)src, (uint32_t)dst,
+                      ue)) {
+    fprintf(stderr, "[pipe] post chunk %llu failed (src=%d dst=%d)\n",
+            (unsigned long long)chunk_seq, src, dst);
+    mgr->AbortEvent(w->id, seq);
+    mgr->ReleaseSendLane(jetty);
+    return -1;
+  }
+  wr_slot_t *s = &w->wr_slots[slot_idx];
+  s->ue = ue;
+  s->seq = seq;
+  s->jetty = jetty;
+  s->chunk_seq = chunk_seq;
+  s->active = true;
+  return 0;
+}
+
+/* 等任一在飞分片完成：返回槽下标；失败返回 -(idx+1)；超时返回 -(window+1) */
+static int wait_any_chunk(context_t *ctx, worker_t *w, uint32_t window,
+                          uint64_t deadline_ns) {
+  kv_bench::UrmaManager *mgr = ctx->mgr;
+  for (;;) {
+    for (uint32_t i = 0; i < window; i++) {
+      if (!w->wr_slots[i].active)
+        continue;
+      int r = mgr->ProbeEvent(w->id, w->wr_slots[i].seq);
+      if (r == 1)
+        return (int)i;
+      if (r == -1)
+        return -(int)(i + 1);
+    }
+    if (now_ns() >= deadline_ns)
+      return -(int)(window + 1); /* 超时 */
+    sleep_ns(POLL_SLEEP_NS);
+  }
+}
+
+/* write 分片流水线主循环：填满窗口（20×并发度 个分片）→ 完成一个补发一个，
+ * in-flight 恒 = 窗口；时延按请求（20 分片全完成）记录 */
+static int client_write_pipeline(context_t *ctx, worker_t *w,
+                                 uint64_t deadline) {
+  const argument_t *args = &ctx->args;
+  kv_bench::UrmaManager *mgr = ctx->mgr;
+  uint32_t concurrency =
+      (args->concurrency >= 1 && args->concurrency <= KV_MAX_CONCURRENCY)
+          ? (uint32_t)args->concurrency
+          : 1;
+  uint32_t window = KV_CHUNKS_PER_REQ * concurrency;
+  uint64_t interval_ns = 0;
+  if (args->qps > 0) {
+    uint64_t per_thread = args->qps / args->threads;
+    if (per_thread == 0)
+      per_thread = 1;
+    interval_ns = 1000000000ULL / per_thread; /* 请求/秒（每线程） */
+  }
+  uint64_t next_req_ns = now_ns();
+
+  /* 填窗：前 window 个分片（前 concurrency 个请求）全部发出 */
+  uint64_t chunk_seq = 0;
+  for (uint32_t i = 0; i < window; i++) {
+    if (chunk_seq % KV_CHUNKS_PER_REQ == 0) {
+      uint64_t rid = chunk_seq / KV_CHUNKS_PER_REQ;
+      w->req_start[rid % concurrency] = now_ns();
+      w->req_done[rid % concurrency] = 0;
+    }
+    if (post_one_chunk(ctx, w, i, chunk_seq) != 0)
+      return -1;
+    chunk_seq++;
+  }
+
+  while (!w->stop && !ctx->fatal) {
+    if (now_ns() >= deadline)
+      break;
+    int r = wait_any_chunk(ctx, w, window, deadline);
+    if (r < 0) {
+      if (r == -(int)(window + 1))
+        break; /* 超时（deadline 到） */
+      uint32_t fidx = (uint32_t)(-r - 1);
+      fprintf(stderr, "[pipe] chunk %llu failed (seq=%llu), aborting\n",
+              (unsigned long long)w->wr_slots[fidx].chunk_seq,
+              (unsigned long long)w->wr_slots[fidx].seq);
+      return -1;
+    }
+    wr_slot_t *s = &w->wr_slots[r];
+    uint64_t now2 = now_ns();
+    __atomic_add_fetch(&w->bytes, KV_CHUNK_SIZE, __ATOMIC_RELAXED);
+    mgr->ReleaseSendLane(s->jetty);
+    s->jetty.reset();
+    s->active = false;
+
+    /* 请求级完成判定（该请求 20 分片全部完成） */
+    uint64_t req_id = s->chunk_seq / KV_CHUNKS_PER_REQ;
+    uint32_t ri = (uint32_t)(req_id % concurrency);
+    w->req_done[ri]++;
+    if (s->chunk_seq % KV_CHUNKS_PER_REQ == KV_CHUNKS_PER_REQ - 1) {
+      kv_hist_record(&w->hist, now2 - w->req_start[ri]);
+      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+    }
+
+    if (now_ns() >= deadline)
+      break;
+    /* 补发一个分片；qps 节流在请求边界 */
+    if (chunk_seq % KV_CHUNKS_PER_REQ == 0 && interval_ns > 0) {
+      if (now_ns() < next_req_ns) {
+        uint64_t left = next_req_ns - now_ns();
+        if (left > 50000)
+          sleep_ns(left - 50000);
+        while (now_ns() < next_req_ns) {
+        }
+      }
+      next_req_ns = now_ns() + interval_ns;
+    }
+    if (chunk_seq % KV_CHUNKS_PER_REQ == 0) {
+      uint64_t rid = chunk_seq / KV_CHUNKS_PER_REQ;
+      w->req_start[rid % concurrency] = now_ns();
+      w->req_done[rid % concurrency] = 0;
+    }
+    if (post_one_chunk(ctx, w, (uint32_t)r, chunk_seq) != 0)
+      return -1;
+    chunk_seq++;
+  }
+
+  /* 收尾：等窗口内剩余在飞分片完成（或超时）并归还 jetty，避免退出时
+   * 在飞 WR / 未归还 lane 残留 */
+  for (uint32_t i = 0; i < window; i++) {
+    wr_slot_t *s = &w->wr_slots[i];
+    if (s->active) {
+      (void)mgr->WaitEvent(w->id, s->seq, args->timeout_ms);
+      mgr->ReleaseSendLane(s->jetty);
+      s->jetty.reset();
+      s->active = false;
+    }
+  }
+  return 0;
 }
 
 static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_chip) {
@@ -704,6 +942,20 @@ static void *client_worker_main(void *arg) {
   uint64_t window =
       (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
   w->off = (uint64_t)w->id * DATA_WINDOW_PER_THREAD * args->value_size;
+
+  /* write：分片流水线（80MB 请求 = 20×4MB 分片，滑动窗口，持续到 deadline） */
+  if (args->op == OP_WRITE) {
+    if (client_write_pipeline(ctx, w, deadline) != 0) {
+      __atomic_add_fetch(&w->errors, 1, __ATOMIC_RELAXED);
+      if (!ctx->fatal) {
+        ctx->fatal = true;
+        fprintf(stderr,
+                "[fatal] first write request failed (worker %u), aborting...\n",
+                w->id);
+      }
+    }
+    return NULL;
+  }
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     uint64_t now = now_ns();
@@ -953,20 +1205,24 @@ static void print_client_summary(context_t *ctx, double seconds) {
     errors += __atomic_load_n(&ctx->workers[i].errors, __ATOMIC_RELAXED);
   }
   printf("\n==== summary role=client op=%s threads=%u size=%" PRIu64
-         " dual=%s affinity=%s "
+         " concurrency=%d affinity=%s "
          "jetty_count=%u duration=%.1fs ====\n",
-         op_name(args->op), args->threads, args->value_size,
-         dual_name(args->dual_mode), aff_name(args->affinity_mode),
+         op_name(args->op), args->threads,
+         args->op == OP_WRITE ? KV_CHUNK_SIZE : args->value_size,
+         args->concurrency, aff_name(args->affinity_mode),
          ctx->mgr->Resource().SendJettyCount(), seconds);
   double iops = seconds > 0 ? (double)ops / seconds : 0.0;
   double bw_mb_s =
       seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
   double bw_mbps = bw_mb_s * 8.0;                        /* 小 b: Mb/s */
+  /* wr_rate：write = 请求 × 20 分片（分片 WR/秒）；get/mixed = 请求 × 2 */
+  double wr_rate = iops * (args->op == OP_WRITE ? (double)KV_CHUNKS_PER_REQ
+                                                : 2.0);
   printf("requests=%" PRIu64
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
-         ops, iops, iops * 2.0, bw_mb_s, bw_mbps, bytes, errors);
-  print_latency_line_us("round", &merged);
+         ops, iops, wr_rate, bw_mb_s, bw_mbps, bytes, errors);
+  print_latency_line_us("request", &merged);
   kv_hist_destroy(&merged);
 }
 
@@ -1044,7 +1300,7 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args) {
 }
 
 static int create_workers(context_t *ctx, uint32_t count) {
-  ctx->workers = (worker_t *)calloc(count, sizeof(worker_t));
+  ctx->workers = new worker_t[count]; /* worker_t 含 shared_ptr，须用 new */
   if (ctx->workers == NULL)
     return -1;
   ctx->worker_count = count;
@@ -1069,7 +1325,7 @@ static void free_bench_workers(context_t *ctx) {
     for (uint32_t i = 0; i < ctx->worker_count; i++) {
       kv_hist_destroy(&ctx->workers[i].hist);
     }
-    free(ctx->workers);
+    delete[] ctx->workers;
     ctx->workers = NULL;
     ctx->worker_count = 0;
   }
@@ -1107,8 +1363,17 @@ static int run_client(const argument_t *args) {
   int sockfd = -1;
   pthread_t sampler_thread = 0;
 
+  /* jetty 池 ≥ max(线程数, write 分片流水线窗口 20×并发度) */
+  uint32_t min_lanes = args->threads;
+  if (args->op == OP_WRITE) {
+    uint32_t pipe =
+        (uint32_t)(KV_CHUNKS_PER_REQ *
+                   (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
+    if (pipe > min_lanes)
+      min_lanes = pipe;
+  }
   if (!ctx->mgr->Init(args->dev_name, args->cacheable, args->jetty_count,
-                      args->threads, args->event_mode, args->trans_mode)) {
+                      min_lanes, args->event_mode, args->trans_mode)) {
     fprintf(stderr, "failed to init URMA manager\n");
     destroy_context(ctx, sockfd);
     return -1;
@@ -1225,7 +1490,7 @@ static void *server_conn_main(void *arg) {
               g, ctx->mgr->Resource().SendJettyCount());
       g = ctx->mgr->Resource().SendJettyCount();
     }
-    conn->workers = (worker_t *)calloc(g, sizeof(worker_t));
+    conn->workers = new worker_t[g]; /* worker_t 含 shared_ptr，须用 new */
     conn->worker_count = g;
     if (conn->workers == NULL) {
       goto out;
@@ -1254,7 +1519,7 @@ static void *server_conn_main(void *arg) {
         kv_hist_destroy(&conn->workers[i].hist);
         free(conn->workers[i].seen);
       }
-      free(conn->workers);
+      delete[] conn->workers;
       conn->workers = NULL;
       conn->worker_count = 0;
       goto out;
@@ -1293,7 +1558,7 @@ static void *server_conn_main(void *arg) {
       kv_hist_destroy(&conn->workers[i].hist);
       free(conn->workers[i].seen);
     }
-    free(conn->workers);
+    delete[] conn->workers;
     conn->workers = NULL;
     conn->worker_count = 0;
   }
@@ -1470,6 +1735,7 @@ static struct option g_long_options[] = {
     {"fixed-offset", no_argument, NULL, 1017},
     {"timeout-ms", required_argument, NULL, 1018},
     {"query-chips", no_argument, NULL, 1024},
+    {"concurrency", required_argument, NULL, 1025},
     {NULL, 0, NULL, 0}};
 
 static void usage(void) {
@@ -1498,6 +1764,8 @@ static void usage(void) {
   printf("      --destination-cpus <list> server CPU list, e.g. 8,9\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
+  printf("      --concurrency <n>      write request concurrency 1..10 "
+         "(default 1; in-flight chunks = 20*n)\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
   printf("      --mixed-ratio <pct>    write percentage in mixed mode (default "
          "50)\n");
@@ -1531,6 +1799,11 @@ static int validate_input_params(argument_t *args) {
   }
   if (args->threads == 0 || args->threads > 512) {
     fprintf(stderr, "Invalid thread count %u\n", args->threads);
+    return -1;
+  }
+  if (args->concurrency < 1 || args->concurrency > KV_MAX_CONCURRENCY) {
+    fprintf(stderr, "Invalid concurrency %d (1..%d)\n", args->concurrency,
+            KV_MAX_CONCURRENCY);
     return -1;
   }
   if (args->op < OP_WRITE || args->op > OP_MIXED) {
@@ -1581,6 +1854,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->jetty_count = 1;
   args->affinity_mode = AFF_NONE;
   args->threads = 1;
+  args->concurrency = 1;
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
   args->dual_mode = DUAL_MIRROR;
@@ -1711,6 +1985,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
     case 1024:
       args->query_chips = true;
       break;
+    case 1025:
+      args->concurrency = (int)strtol(optarg, NULL, 0);
+      break;
     default:
       usage();
       return -1;
@@ -1778,13 +2055,26 @@ static int run_chip_query(const argument_t *args) {
     printf("== pick_round_chips (mode=%s, threads=%u, seed=%u) ==\n",
            mode_names[m], workers, tmp.seed);
     for (uint32_t i = 0; i < workers; i++) {
-      worker_t w;
-      (void)memset(&w, 0, sizeof(w));
+      worker_t w{};
       w.id = i;
       w.rng = tmp.seed + i * 2654435761u;
       int sa, sb, dst;
       pick_round_chips(&tmp, true, &w, &sa, &sb, &dst);
       printf("  worker %u: src_a=%d src_b=%d dst=%d\n", i, sa, sb, dst);
+    }
+    printf("== write 分片 chip 分配 (mode=%s, 每请求 %d 分片) ==\n",
+           mode_names[m], KV_CHUNKS_PER_REQ);
+    for (uint32_t i = 0; i < workers; i++) {
+      worker_t w{};
+      w.id = i;
+      w.rng = tmp.seed + i * 2654435761u;
+      printf("  worker %u: ", i);
+      for (uint32_t j = 0; j < KV_CHUNKS_PER_REQ; j++) {
+        int src, dst;
+        pick_chunk_chip(&tmp, &w, j, &src, &dst);
+        printf("%d%s", src, (j + 1 < KV_CHUNKS_PER_REQ) ? "," : "");
+      }
+      printf(" (src==dst)\n");
     }
   }
   return 0;
