@@ -556,7 +556,8 @@ static void pick_chunk_chip(const argument_t *args, worker_t *w,
     dst_chip = (int)(w->id % 2) + 1;
   }
   if (args->affinity_mode == AFF_AFFINITY) {
-    *src = *dst = (chunk_in_req % 2 == 0) ? 1 : 2; /* 交替 chip1/chip2 */
+    /* 每 chip 连续发 2 个分片再换：1,1,2,2,1,1,2,2,...（20 分片 = 10+10） */
+    *src = *dst = ((chunk_in_req / 2) % 2 == 0) ? 1 : 2;
   } else if (args->affinity_mode == AFF_ANTI) {
     int all_cpus[MAX_CPUS];
     int n_all = enumerate_all_cpus(all_cpus, MAX_CPUS);
