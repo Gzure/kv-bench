@@ -791,11 +791,12 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       mgr->ReleaseSendLane(s->jetty);
       s->jetty.reset();
       s->active = false;
-      /* 请求级完成判定（该请求 10 组全部完成） */
+      /* 请求级完成判定：该请求 10 组【全部完成】才记时延（组完成乱序，
+       * 不能用"发送序号的最后一组"判定） */
       uint64_t req_id = s->group_seq / KV_GROUPS_PER_REQ;
       uint32_t ri = (uint32_t)(req_id % concurrency);
       w->req_done[ri]++;
-      if (s->group_seq % KV_GROUPS_PER_REQ == KV_GROUPS_PER_REQ - 1) {
+      if (w->req_done[ri] >= KV_GROUPS_PER_REQ) {
         kv_hist_record(&w->hist, now_ns() - w->req_start[ri]);
         __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
         if (req_active > 0)
