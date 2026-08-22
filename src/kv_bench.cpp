@@ -90,7 +90,7 @@ typedef struct argument {
   bool cacheable;
   uint32_t threads;
   int concurrency; /* write 并发度 1..10（req）/ 1..100（group），默认 1 */
-  int concurrency_unit; /* 0=req：在飞请求数（窗口=10×N 组）；1=group：在飞 8M 组数 */
+  int concurrency_unit; /* 0=req_group：在飞请求数（窗口=10×N 组）；1=req：在飞 8M 组数 */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst） */
   int op;
   uint32_t mixed_ratio;
@@ -1564,10 +1564,10 @@ static void usage(void) {
   printf("      --destination-cpus <list> server CPU list, e.g. 8,9\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
-  printf("      --concurrency <n>      write concurrency: 1..10 (unit=req) or "
-         "1..100 (unit=group), default 1\n");
-  printf("      --concurrency-unit <u> req|group: req = inflight 80M requests "
-         "(window=10*n groups); group = inflight 8M groups\n");
+  printf("      --concurrency <n>      write concurrency: 1..10 (unit=req_group) "
+         "or 1..100 (unit=req), default 1\n");
+  printf("      --concurrency-unit <u> req|req_group: req = inflight 8M groups; "
+         "req_group = inflight 80M requests (window=10*n groups)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
@@ -1661,7 +1661,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->affinity_mode = AFF_NONE;
   args->threads = 1;
   args->concurrency = 1;
-  args->concurrency_unit = 0; /* 默认 req：在飞请求数 */
+  args->concurrency_unit = 0; /* 默认 req_group：在飞请求数 */
   args->single_chip = 0;
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
@@ -1778,12 +1778,16 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       args->concurrency = (int)strtol(optarg, NULL, 0);
       break;
     case 1027:
-      if (strcmp(optarg, "group") == 0 || strcmp(optarg, "8m") == 0) {
+      /* req = 在飞 8M 组数（组级并行，1..100）；req_group = 在飞 80M 请求数
+       * （请求级并行，1..10，默认） */
+      if (strcmp(optarg, "req") == 0 || strcmp(optarg, "8m") == 0) {
         args->concurrency_unit = 1;
-      } else if (strcmp(optarg, "req") == 0 || strcmp(optarg, "80m") == 0) {
+      } else if (strcmp(optarg, "req_group") == 0 ||
+                 strcmp(optarg, "80m") == 0) {
         args->concurrency_unit = 0;
       } else {
-        fprintf(stderr, "Invalid concurrency-unit: %s (req|group)\n", optarg);
+        fprintf(stderr, "Invalid concurrency-unit: %s (req|req_group)\n",
+                optarg);
         return -1;
       }
       break;

@@ -94,9 +94,9 @@ jetty、同一 chip）。亲和模式下**组源==目的==同一 chip**，组按
 chip1/chip2（第 1 个 8M chip1、第 2 个 8M chip2，10 组 = 5+5 均匀打散），两个
 chip 的物理口同时满负荷：
 
-- **`--concurrency N` + `--concurrency-unit <req|group>`**：
-  - `req`（默认）：**在飞 80M 请求数 ≤ N**（1~10；窗口 = 10×N 组，请求级并行）
-  - `group`：**在飞 8M 组数 ≤ N**（1~100；窗口 = N 组，组级并行）
+- **`--concurrency N` + `--concurrency-unit <req|req_group>`**：
+  - `req_group`（默认）：**在飞 80M 请求数 ≤ N**（1~10；窗口 = 10×N 组，请求级并行）
+  - `req`：**在飞 8M 组数 ≤ N**（1~100；窗口 = N 组，组级并行）
 - **jetty 池驱动流水线**：有请求就一直发 8M 组（每组取一条新 jetty）；**取不到可用
   jetty（池空）就等待在飞组完成释放后再继续**；组内 2 条 WR 都完成才归还 jetty。
   时延按**请求**记录（该请求 10 组全部完成）。
