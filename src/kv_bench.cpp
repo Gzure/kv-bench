@@ -827,17 +827,19 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       sleep_ns(POLL_SLEEP_NS);
   }
 
-  /* 收尾：等剩余在飞组完成（或超时）并归还 jetty，避免退出时在飞
-   * WR / 未归还 lane 残留 */
+  /* 收尾：只等未完成的 WR（done_a/done_b 为 false 的）；已完成的槽已被
+   * ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty 避免残留 */
   for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
     wr_slot_t *s = &w->wr_slots[i];
-    if (s->active) {
+    if (!s->active)
+      continue;
+    if (!s->done_a)
       (void)mgr->WaitEvent(w->id, s->seq_a, args->timeout_ms);
+    if (!s->done_b)
       (void)mgr->WaitEvent(w->id, s->seq_b, args->timeout_ms);
-      mgr->ReleaseSendLane(s->jetty);
-      s->jetty.reset();
-      s->active = false;
-    }
+    mgr->ReleaseSendLane(s->jetty);
+    s->jetty.reset();
+    s->active = false;
   }
   return 0;
 }
