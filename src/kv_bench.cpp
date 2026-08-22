@@ -56,13 +56,13 @@
 #define KV_GROUP_SIZE (KV_CHUNK_SIZE * KV_WR_PER_GROUP)  /* 8MB */
 #define KV_GROUPS_PER_REQ 10               /* 80MB / 8MB */
 #define KV_REQ_SIZE (KV_GROUP_SIZE * KV_GROUPS_PER_REQ)  /* 80MB */
-#define KV_MAX_INFLIGHT_GROUPS 100         /* --concurrency 上限：在飞 8M 组数 */
-#define KV_MAX_WR_SLOTS KV_MAX_INFLIGHT_GROUPS /* 槽数组 = 在飞组上限 */
-#define KV_MAX_INFLIGHT_REQS (KV_MAX_WR_SLOTS / KV_GROUPS_PER_REQ) /* 10 */
+#define KV_MAX_CONCURRENCY 10              /* --concurrency 上限：在飞请求数 */
+#define KV_MAX_WR_SLOTS (KV_GROUPS_PER_REQ * KV_MAX_CONCURRENCY) /* 100 组在飞 */
 
-/* 服务器数据区：容纳最大窗口（100 组 × 8MB = 800MB），固定 */
+/* 服务器数据区：容纳最大窗口（10 并发 × 80MB = 800MB），固定 */
 #define SERVER_PIPE_BYTES                                                      \
-  ((uint64_t)KV_WR_PER_GROUP * KV_MAX_INFLIGHT_GROUPS * KV_CHUNK_SIZE)
+  ((uint64_t)KV_WR_PER_GROUP * KV_GROUPS_PER_REQ * KV_MAX_CONCURRENCY *        \
+   KV_CHUNK_SIZE)
 
 #define DEFAULT_TIMEOUT_MS 5000
 #define MAX_CPUS 1024
@@ -88,7 +88,7 @@ typedef struct argument {
   const char *destination_cpus;
   bool cacheable;
   uint32_t threads;
-  int concurrency; /* write 在飞 8M 组数 1..100，默认 1 */
+  int concurrency; /* write 请求并发度 1..10，默认 1（在飞组 = 10×N） */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst） */
   int op;
   uint32_t mixed_ratio;
@@ -132,8 +132,8 @@ typedef struct worker {
   void *run_arg;
   /* write 分片流水线状态 */
   wr_slot_t wr_slots[KV_MAX_WR_SLOTS];
-  uint64_t req_start[KV_MAX_INFLIGHT_REQS]; /* 每在飞请求开始时间（请求 id % 10） */
-  uint64_t req_done[KV_MAX_INFLIGHT_REQS];  /* 每在飞请求已完成组数 */
+  uint64_t req_start[KV_MAX_CONCURRENCY]; /* 每在飞请求的开始时间（请求 id % N） */
+  uint64_t req_done[KV_MAX_CONCURRENCY];  /* 每在飞请求已完成组数 */
 } worker_t;
 
 typedef struct conn {
@@ -403,10 +403,11 @@ static int mbind_to_node(void *addr, size_t len, int node) {
  * 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
-  /* write（8M 组流水线）：每线程数据区 = 在飞组窗口（--concurrency）× 8MB，
-   * 循环复用；get/mixed：沿用 value_size 窗口 */
+  /* write（8M 组流水线）：每线程数据区 = 窗口组数（10×并发度）× 8MB，循环复用；
+   * get/mixed：沿用 value_size 窗口 */
   uint64_t pipe_groups =
-      args->concurrency > 0 ? (uint64_t)args->concurrency : 1;
+      (uint64_t)KV_GROUPS_PER_REQ *
+      (args->concurrency > 0 ? (uint64_t)args->concurrency : 1);
   uint64_t data_len = (args->op == OP_WRITE)
                           ? (uint64_t)args->threads * pipe_groups *
                                 KV_GROUP_SIZE
@@ -681,7 +682,8 @@ static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
   uint32_t window_groups =
-      (uint32_t)(args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
+      (uint32_t)(KV_GROUPS_PER_REQ *
+                 (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
   uint64_t base_off = (group_seq % window_groups) * KV_GROUP_SIZE;
   uint64_t remote_base = conn.RemoteSegVa() + (base_off % SERVER_PIPE_BYTES);
 
@@ -723,15 +725,14 @@ static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
 
 /* write 流水线主循环（jetty 池驱动，精简 yuanrong pipeline）：
  * 有请求就一直发 8M 组（每组 1 条 jetty、2 条 4M WR），取不到可用 jetty（池空）
- * 就等待在飞组完成释放 jetty 后继续；--concurrency 限制在飞 8M 组数 ≤ N；
- * 时延按请求（10 组全完成）记录。 */
+ * 就等待在飞组完成释放 jetty 后继续；--concurrency 限制同时在飞请求数 ≤ N
+ * （每请求 10 组，在飞组 ≤ 10×N）；时延按请求（10 组全完成）记录。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   uint32_t concurrency =
-      (args->concurrency >= 1 &&
-       args->concurrency <= KV_MAX_INFLIGHT_GROUPS)
+      (args->concurrency >= 1 && args->concurrency <= KV_MAX_CONCURRENCY)
           ? (uint32_t)args->concurrency
           : 1;
   uint64_t interval_ns = 0;
@@ -744,7 +745,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   uint64_t next_req_ns = now_ns();
 
   uint64_t group_seq = 0; /* 本线程全局 8M 组序号（请求 id = group_seq/10） */
-  uint32_t inflight_groups = 0; /* 在飞 8M 组数（≤ concurrency） */
+  uint32_t req_active = 0; /* 同时在飞请求数（≤ concurrency） */
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
@@ -790,25 +791,24 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       mgr->ReleaseSendLane(s->jetty);
       s->jetty.reset();
       s->active = false;
-      if (inflight_groups > 0)
-        inflight_groups--;
       /* 请求级完成判定（该请求 10 组全部完成） */
       uint64_t req_id = s->group_seq / KV_GROUPS_PER_REQ;
-      uint32_t ri = (uint32_t)(req_id % KV_MAX_INFLIGHT_REQS);
+      uint32_t ri = (uint32_t)(req_id % concurrency);
       w->req_done[ri]++;
       if (s->group_seq % KV_GROUPS_PER_REQ == KV_GROUPS_PER_REQ - 1) {
         kv_hist_record(&w->hist, now_ns() - w->req_start[ri]);
         __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+        if (req_active > 0)
+          req_active--;
       }
     }
 
-    /* 2. 发送：有请求就一直发，直到在飞组达上限（concurrency）或取不到
-     * 可用 jetty（池空） */
+    /* 2. 发送：有请求就一直发，直到取不到可用 jetty（池空）或达到并发度上限 */
     while (now_ns() < deadline && !ctx->fatal) {
-      if (inflight_groups >= concurrency)
-        break; /* 在飞组数达上限，等组完成腾窗口 */
       if (group_seq % KV_GROUPS_PER_REQ == 0) {
-        /* 新请求边界：qps 节流 */
+        /* 新请求边界：qps 节流 + 并发度上限检查 */
+        if (req_active >= concurrency)
+          break; /* 并发度满，等请求完成腾名额 */
         if (interval_ns > 0) {
           if (now_ns() < next_req_ns) {
             uint64_t left = next_req_ns - now_ns();
@@ -820,8 +820,9 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           next_req_ns = now_ns() + interval_ns;
         }
         uint64_t rid = group_seq / KV_GROUPS_PER_REQ;
-        w->req_start[rid % KV_MAX_INFLIGHT_REQS] = now_ns();
-        w->req_done[rid % KV_MAX_INFLIGHT_REQS] = 0;
+        w->req_start[rid % concurrency] = now_ns();
+        w->req_done[rid % concurrency] = 0;
+        req_active++;
       }
       /* 找空槽 */
       uint32_t slot = KV_MAX_WR_SLOTS;
@@ -841,7 +842,6 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         return -1;
       }
       progressed = true;
-      inflight_groups++;
       group_seq++;
     }
 
@@ -1211,11 +1211,12 @@ static int run_client(const argument_t *args) {
   int sockfd = -1;
   pthread_t sampler_thread = 0;
 
-  /* jetty 池 ≥ max(线程数, write 在飞 8M 组数 concurrency) */
+  /* jetty 池 ≥ max(线程数, write 8M 组流水线窗口 10×并发度) */
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
     uint32_t pipe =
-        (uint32_t)(args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
+        (uint32_t)(KV_GROUPS_PER_REQ *
+                   (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
     if (pipe > min_lanes)
       min_lanes = pipe;
   }
@@ -1536,8 +1537,8 @@ static void usage(void) {
   printf("      --destination-cpus <list> server CPU list, e.g. 8,9\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
-  printf("      --concurrency <n>      write inflight 8M groups 1..100 "
-         "(default 1)\n");
+  printf("      --concurrency <n>      write request concurrency 1..10 "
+         "(default 1; inflight 8M groups = 10*n)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
@@ -1570,9 +1571,9 @@ static int validate_input_params(argument_t *args) {
     fprintf(stderr, "Invalid thread count %u\n", args->threads);
     return -1;
   }
-  if (args->concurrency < 1 || args->concurrency > KV_MAX_INFLIGHT_GROUPS) {
+  if (args->concurrency < 1 || args->concurrency > KV_MAX_CONCURRENCY) {
     fprintf(stderr, "Invalid concurrency %d (1..%d)\n", args->concurrency,
-            KV_MAX_INFLIGHT_GROUPS);
+            KV_MAX_CONCURRENCY);
     return -1;
   }
   if (args->single_chip < 0 || args->single_chip > 2) {
