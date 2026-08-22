@@ -14,7 +14,7 @@
 | 带宽测试 | 全速打流（`--qps 0`），统计吞吐（MB/s 大 B 与 Mb/s 小 b 双单位）与 IOPS |
 | 时延测试 | 固定 QPS 节流打流，统计 avg / p50 / p90 / p99 / p999 / p9999 / pmax（us） |
 | 操作类型 | `write`（KV Put：客户端分片流水线直写服务器内存）、`get`（KV Get：**客户端直接 READ 服务器数据区**，`URMA_OPC_READ`，见 §6）、`mixed`（按 `--mixed-ratio` 混合） |
-| 分片流水线 | **write：一次请求 = 80MB（固定）= 10 个 8MB 组**，每组 1 条 jetty、拆 2 条 4MB WR（同一 chip），**组间交替 chip1/chip2（第 1 个 8M chip1、第 2 个 8M chip2，5+5 均匀打散）**；`--concurrency` 1~10 = **在飞请求数**（在飞组 ≤ 10×N），`--single-chip 1\|2` 单 chip + 内存亲和场景；**jetty 池驱动发送**（有请求一直发，取不到可用 jetty 就等待释放后再继续），见 §6.1 |
+| 分片流水线 | **write：一个 KV 请求 = 8MB（固定）**，每请求 1 条 jetty、拆 2 条 4MB WR（同一 chip），**一次并发发 10 个请求（80MB）**，请求间交替 chip1/chip2（第 1 个 8M chip1、第 2 个 8M chip2，5+5 均匀打散）；`--concurrency` + `--concurrency-unit req\|req_group`（req_group=在飞批次(10 请求)数 1~10 / req=在飞请求数 1~100），`--single-chip 1\|2` 单 chip + 内存亲和场景；**jetty 池驱动发送**（有请求一直发，取不到可用 jetty 就等待释放后再继续），见 §6.1 |
 | bonding 亲和 | `affinity`（**分片源==目的==同一 chip**，交替打散双 chip）、`anti`（源随机 & 目的固定）、`none`（源/目的全随机），见 §8 |
 | 可配置 | 线程数 `--threads`、时长 `--duration`、目标 QPS `--qps`（请求/秒）、请求并发度 `--concurrency`、单 chip `--single-chip`、jetty 池大小 `--jetty-count` 等 |
 | 依赖 | 仅 liburma + pthread；无 bthread/brpc/protobuf/TBB/gflags |
@@ -146,7 +146,7 @@ client                                  server
 - `AbortEvent`：post 失败时槽复位 0。
 - 数据面（write 分片流水线）：每个分片 `PostWrite`（事件 ue）→ `ProbeEvent` 轮询完成 → 完成一个补发一个（见 §6.1）；get 为 `PostRead` 直接 READ（见 §6.3）。
 
-**send lane（每分片取新 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从游标起找第一个空闲下标并移除、游标前移——**每个分片都取到"新的" jetty**，多线程下天然分散。池大小 = `max(--jetty-count, threads)`。
+**send lane（每请求取新 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从游标起找第一个空闲下标并移除、游标前移——**每个请求都取到"新的" jetty**，多线程下天然分散。池大小 = `max(--jetty-count, threads, 在飞请求窗口)`。
 
 ---
 
@@ -154,26 +154,26 @@ client                                  server
 
 ### 6.1 write 分片流水线（核心模型）
 
-**一次请求 = 80MB（固定）= 10 个 8MB 组**（`KV_GROUP_SIZE=8MB`（2×4MB WR）、`KV_GROUPS_PER_REQ=10`、`KV_REQ_SIZE=80MB`）。每个组：
+**一个 KV 请求 = 8MB（固定）= 2 条 4MB WR**（`KV_CHUNK_SIZE=4MB`、`KV_WR_PER_GROUP=2`、`KV_GROUP_SIZE=8MB`）。**一次并发发 10 个请求**（`KV_GROUPS_PER_REQ=10`，共 80MB = `KV_REQ_SIZE`）。每个请求：
 - 一条 jetty（lane），拆 **2 条 4MB WR**（同一 jetty、同一 chip，`src==dst`）；
-- **亲和（`--affinity-mode affinity`）= 组源与目的在同一 chip**：组在请求内序号 `g`（0..9）→ `chip = g % 2 ? 2 : 1`（第 1 个 8M chip1、第 2 个 8M chip2，10 组 = 5+5 交替打散）；`--single-chip 1|2` 时全部组固定单 chip。
+- **亲和（`--affinity-mode affinity`）= 请求源与目的在同一 chip**：请求在批次内序号 `g`（0..9）→ `chip = g % 2 ? 2 : 1`（第 1 个 8M chip1、第 2 个 8M chip2，10 请求 = 5+5 交替打散）；`--single-chip 1|2` 时全部请求固定单 chip。
 
-**`--concurrency N` + `--concurrency-unit <req|req_group>`**：`req_group`（默认）= 在飞请求数 ≤ N（1~10，窗口 10×N 组）；`req` = 在飞 8M 组数 ≤ N（1~100，窗口 N 组）。
+**`--concurrency N` + `--concurrency-unit <req|req_group>`**：`req_group`（默认）= 在飞批次（10 个 8M 请求）数 ≤ N（1~10，窗口 10×N 请求）；`req` = 在飞请求（8M）数 ≤ N（1~100，窗口 N 请求）。
 
 **jetty 池驱动流水线**（发送节奏由 jetty 池容量决定）：
 
 ```
 循环（直到时长结束）:
-  收完成: ProbeEvent 扫描全部在飞槽，完成的 → bytes += 4MB、该请求第 20 个分片
-          完成时 hist.Record(请求时延)、归还 jetty（腾出池容量）
-  发送:   有请求就一直发分片（每分片取一条新 jetty）
-          取不到可用 jetty（池空）→ 等待在飞分片完成释放后继续
-          新请求边界受 --concurrency 限制（在飞请求 ≤ N）
+  收完成: ProbeEvent 扫描全部在飞槽，完成的 → bytes += 8MB、该批第 10 个请求
+          完成时 hist.Record(批时延)、归还 jetty（腾出池容量）
+  发送:   有请求就一直发 8M 请求（每请求取一条新 jetty）
+          取不到可用 jetty（池空）→ 等待在飞请求完成释放后继续
+          请求边界受 --concurrency 限制（req_group: 批 ≤ N；req: 请求 ≤ N）
 ```
 
-- 分片全局序号 `chunk_seq` 单调递增 → `请求 id = chunk_seq / 20`，请求内序号 `j = chunk_seq % 20`。
-- **时延口径 = 请求级**：某请求第 1 个分片发出 → 第 20 个分片完成（`hist.Record` 一次）；带宽按分片字节累计（= 请求数 × 80MB / elapsed）。
-- 数据 offset 循环复用：`off = (chunk_seq % 窗口分片数) × 4MB`（窗口分片数 = 20×N），客户端数据区每线程 = 20×N×4MB。
+- 请求全局序号 `group_seq` 单调递增 → `批次 id = group_seq / 10`，请求在批内序号 `g = group_seq % 10`。
+- **时延口径 = 批次级**：该批第 1 个请求发出 → 第 10 个请求完成（`hist.Record` 一次）；带宽按请求字节累计（= 批数 × 80MB / elapsed）。
+- 数据 offset 循环复用：`off = (group_seq % 窗口请求数) × 8MB`（窗口请求数 = req_group ? 10×N : N），客户端数据区每线程 = 窗口 × 8MB。
 
 ### 6.2 缓冲布局
 
@@ -200,7 +200,7 @@ client                                  server
 ```
 while (!stop && !fatal && now < deadline):
   收完成（ProbeEvent 扫描在飞槽 → 记账/记时延/归还 jetty）
-  发送（有请求一直发 8M 组；池空则等；新请求受并发度 ≤ N 限制）
+  发送（有请求一直发 8M 请求；池空则等；请求边界受并发度 ≤ N 限制）
 ```
 
 ### 6.5 QPS 节流
@@ -235,7 +235,7 @@ while (!stop && !fatal && now < deadline):
 
 | 模式 | 源侧 | 目的侧 | 分片 chip 分配 |
 | --- | --- | --- | --- |
-| `affinity` | 线程固定绑定 `--source-cpus` | 固定绑定 `--destination-cpus` | **`src == dst`**：分片请求内序号 `j` → `chip = j%2 ? 2 : 1`（交替打散，20 分片 = 10+10） |
+| `affinity` | 线程固定绑定 `--source-cpus` | 固定绑定 `--destination-cpus` | **`src == dst`**：请求在批内序号 `g` → `chip = g%2 ? 2 : 1`（交替打散，10 请求 = 5+5） |
 | `anti` | 线程不绑定，源随机 | 固定绑定 destination-cpus | `src` 全池随机；`dst` 固定（服务器握手通告 `peer.dstChip`） |
 | `none` | 不绑定，源随机 | 不绑定，目的随机 | `src`/`dst` 每分片全随机（全部 CPU） |
 
@@ -272,7 +272,7 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
          [--destination-cpus <list>]    # server CPU（主线程/mbind 目标）
          [--cacheable]                  # 注册/导入 cacheable 段
          [--threads <n>]                # client 打流线程数，默认 1
-         [--concurrency <1..10>]        # write 请求并发度（默认 1；在飞组 = 10×N）
+         [--concurrency <1..10>]        # write 并发（默认 1；req_group=批数 / req=请求数）
          [--single-chip <1|2>]          # 单 chip 场景：全部组固定该 chip + mbind 到其 NUMA
          [--op <write|get|mixed>]       # 默认 write
          [--mixed-ratio <pct>]          # mixed 中 write 占比，默认 50

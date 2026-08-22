@@ -49,12 +49,12 @@
   4 /* 客户端 data_len = threads * 4 * value_size（get/mixed 用） */
 #define SERVER_DATA_WINDOW 4
 
-/* write 分片流水线模型（精简 yuanrong）：一次请求 = 80MB = 10 个 8MB 组，
- * 每组 1 条 jetty、拆 2 条 4MB WR（同一 chip），组间 chip 交替 */
+/* write 流水线模型（精简 yuanrong）：一个 KV 请求 = 8MB = 2 条 4MB WR（同一
+ * jetty、同一 chip）；一次并发发 10 个请求（一批 = 80MB），请求间 chip 交替 */
 #define KV_CHUNK_SIZE (4UL * 1024 * 1024)  /* 单条 WR 4MB */
-#define KV_WR_PER_GROUP 2                  /* 8M 组 = 2 条 4M WR */
+#define KV_WR_PER_GROUP 2                  /* 8M 请求 = 2 条 4M WR */
 #define KV_GROUP_SIZE (KV_CHUNK_SIZE * KV_WR_PER_GROUP)  /* 8MB */
-#define KV_GROUPS_PER_REQ 10               /* 80MB / 8MB */
+#define KV_GROUPS_PER_REQ 10               /* 一批 = 10 个 8M 请求 = 80MB */
 #define KV_REQ_SIZE (KV_GROUP_SIZE * KV_GROUPS_PER_REQ)  /* 80MB */
 #define KV_MAX_CONCURRENCY 10              /* --concurrency 上限：在飞请求数 */
 #define KV_MAX_WR_SLOTS (KV_GROUPS_PER_REQ * KV_MAX_CONCURRENCY) /* 100 组在飞 */
@@ -108,12 +108,12 @@ typedef struct argument {
 
 typedef struct context context_t;
 
-/* write 流水线：一个在飞单元 = 8M 组（1 条 jetty + 2 条 4M WR，同一 chip） */
+/* write 流水线：一个在飞单元 = 8M 请求（1 条 jetty + 2 条 4M WR，同一 chip） */
 typedef struct wr_slot {
-  std::shared_ptr<kv_bench::UrmaJetty> jetty; /* 组专用 lane，2 条 WR 完成才归还 */
+  std::shared_ptr<kv_bench::UrmaJetty> jetty; /* 请求专用 lane，2 条 WR 完成才归还 */
   uint64_t seq_a;                             /* WR-A 事件 seq */
   uint64_t seq_b;                             /* WR-B 事件 seq */
-  uint64_t group_seq;                         /* 8M 组全局序号（请求 id = /10） */
+  uint64_t group_seq;                         /* 8M 请求全局序号（批次 id = /10） */
   bool done_a;                                /* WR-A 已完成（槽已复位，持久） */
   bool done_b;                                /* WR-B 已完成 */
   bool active;
@@ -578,8 +578,8 @@ static void pick_round_chips(const argument_t *args, bool is_client,
 /* write 分片 chip 分配：每分片一对 (src, dst)。
  * affinity：源==目的==chip，分片在请求内序号 j → chip = j%2 ? 2 : 1（20 分片
  * 交替打散 = 10+10 均匀分两 chip）；anti：源随机、目的固定；none：全随机。 */
-/* write 8M 组 chip 分配：组内 2 条 4M WR 同一 chip（src==dst）。
- * affinity：8M 组间交替 — 第一个 8M chip1、第二个 8M chip2（10 组 = 5+5）；
+/* write 8M 请求 chip 分配：请求内 2 条 4M WR 同一 chip（src==dst）。
+ * affinity：请求间交替 — 第 1 个 8M chip1、第 2 个 8M chip2（一批 10 个 = 5+5）；
  * anti：src 随机、dst 固定；none：全随机。 */
 static void pick_group_chip(const argument_t *args, worker_t *w,
                             uint32_t group_in_req, int *src, int *dst) {
@@ -675,9 +675,9 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   return (ok_a && ok_b) ? 0 : -1;
 }
 
-/* ---------------- write 流水线（80MB 请求 = 10 × 8MB 组 = 20 × 4MB WR） ---- */
+/* ---------------- write 流水线（8M 请求，一批 10 个 = 80MB） ---------------- */
 
-/* post 一个 8M 组到指定槽（jetty 已由调用方取到）：组内 2 条 4M WR 用同一
+/* post 一个 8M 请求到指定槽（jetty 已由调用方取到）：请求内 2 条 4M WR 用同一
  * jetty、同一 chip（src==dst），事件槽 ×2 + PostWrite ×2 + 登记 */
 static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
                           const std::shared_ptr<kv_bench::UrmaJetty> &jetty,
@@ -731,11 +731,11 @@ static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
 }
 
 /* write 流水线主循环（jetty 池驱动，精简 yuanrong pipeline）：
- * 有请求就一直发 8M 组（每组 1 条 jetty、2 条 4M WR），取不到可用 jetty（池空）
- * 就等待在飞组完成释放 jetty 后继续；--concurrency 按单位生效：
- *   unit=req（默认）: 在飞请求数 ≤ N（窗口 = 10×N 组，80M 并行）
- *   unit=group      : 在飞 8M 组数 ≤ N（窗口 = N 组，8M 并行）
- * 时延按请求（10 组全完成）记录。 */
+ * 有请求就一直发 8M 请求（每个 1 条 jetty、2 条 4M WR），取不到可用 jetty（池空）
+ * 就等待在飞请求完成释放 jetty 后继续；--concurrency 按单位生效：
+ *   unit=req_group（默认）: 在飞批次（10 个请求）数 ≤ N（窗口 = 10×N 请求）
+ *   unit=req             : 在飞请求（8M）数 ≤ N（窗口 = N 请求）
+ * 时延按批次（10 请求全完成）记录。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;
@@ -1083,16 +1083,16 @@ static void print_client_summary(context_t *ctx, double seconds) {
   double bw_mb_s =
       seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
   double bw_mbps = bw_mb_s * 8.0;                        /* 小 b: Mb/s */
-  /* wr_rate：write = 请求 × 20 条 4M WR（WR/秒）；get/mixed = 请求 × 1 */
+  /* wr_rate：write = 批 × 20 条 4M WR（10 请求/批 × 2 WR/请求）；get/mixed = ×1 */
   double wr_rate =
       iops * (args->op == OP_WRITE
                   ? (double)(KV_WR_PER_GROUP * KV_GROUPS_PER_REQ)
                   : 1.0);
-  printf("requests=%" PRIu64
+  printf("batches=%" PRIu64
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
          ops, iops, wr_rate, bw_mb_s, bw_mbps, bytes, errors);
-  print_latency_line_us("request", &merged);
+  print_latency_line_us("batch", &merged);
   kv_hist_destroy(&merged);
 }
 
@@ -1566,8 +1566,8 @@ static void usage(void) {
   printf("      --threads <n>          client load threads (default 1)\n");
   printf("      --concurrency <n>      write concurrency: 1..10 (unit=req_group) "
          "or 1..100 (unit=req), default 1\n");
-  printf("      --concurrency-unit <u> req|req_group: req = inflight 8M groups; "
-         "req_group = inflight 80M requests (window=10*n groups)\n");
+  printf("      --concurrency-unit <u> req|req_group: req = inflight 8M requests; "
+         "req_group = inflight batches (10 x 8M requests)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
@@ -1872,8 +1872,8 @@ static int run_chip_query(const argument_t *args) {
       }
       printf("  worker %u: src_a=%d src_b=%d dst=%d\n", i, sa, sb, dst);
     }
-    printf("== write 8M 组 chip 分配 (mode=%s, 每请求 %d 组, 每组 2 条 4M WR "
-           "同 chip) ==\n",
+    printf("== write 8M 请求 chip 分配 (mode=%s, 每批 %d 个请求, 每请求 2 条 4M "
+           "WR 同 chip) ==\n",
            mode_names[m], KV_GROUPS_PER_REQ);
     for (uint32_t i = 0; i < workers; i++) {
       worker_t w{};
