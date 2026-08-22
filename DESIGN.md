@@ -14,9 +14,9 @@
 | 带宽测试 | 全速打流（`--qps 0`），统计吞吐（MB/s 大 B 与 Mb/s 小 b 双单位）与 IOPS |
 | 时延测试 | 固定 QPS 节流打流，统计 avg / p50 / p90 / p99 / p999 / p9999 / pmax（us） |
 | 操作类型 | `write`（KV Put：客户端分片流水线直写服务器内存）、`get`（KV Get：**客户端直接 READ 服务器数据区**，`URMA_OPC_READ`，见 §6）、`mixed`（按 `--mixed-ratio` 混合） |
-| 分片流水线 | **write：一次请求 = 80MB（固定）= 20 × 4MB 分片**，每分片独立 WR + 独立新 jetty，**分片按请求内序号交替 chip1/chip2（10+10 均匀打散）**；请求并发度 `--concurrency` 1~10，**jetty 池驱动发送**（有请求一直发，取不到可用 jetty 就等待释放后再继续），见 §6.1 |
+| 分片流水线 | **write：一次请求 = 80MB（固定）= 10 个 8MB 组**，每组 1 条 jetty、拆 2 条 4MB WR（同一 chip），**组间交替 chip1/chip2（第 1 个 8M chip1、第 2 个 8M chip2，5+5 均匀打散）**；`--concurrency` 1~100 = **在飞 8M 组数**，`--single-chip 1\|2` 单 chip + 内存亲和场景；**jetty 池驱动发送**（有请求一直发，取不到可用 jetty 就等待释放后再继续），见 §6.1 |
 | bonding 亲和 | `affinity`（**分片源==目的==同一 chip**，交替打散双 chip）、`anti`（源随机 & 目的固定）、`none`（源/目的全随机），见 §8 |
-| 可配置 | 线程数 `--threads`、时长 `--duration`、目标 QPS `--qps`（请求/秒）、请求并发度 `--concurrency`、jetty 池大小 `--jetty-count` 等 |
+| 可配置 | 线程数 `--threads`、时长 `--duration`、目标 QPS `--qps`（请求/秒）、在飞组数 `--concurrency`、单 chip `--single-chip`、jetty 池大小 `--jetty-count` 等 |
 | 依赖 | 仅 liburma + pthread；无 bthread/brpc/protobuf/TBB/gflags |
 
 ---
@@ -154,12 +154,11 @@ client                                  server
 
 ### 6.1 write 分片流水线（核心模型）
 
-**一次请求 = 80MB（固定）= 20 × 4MB 分片**（固定，`KV_CHUNK_SIZE=4MB`、`KV_CHUNKS_PER_REQ=20`、`KV_REQ_SIZE=80MB`）。每个分片：
+**一次请求 = 80MB（固定）= 10 个 8MB 组**（`KV_GROUP_SIZE=8MB`（2×4MB WR）、`KV_GROUPS_PER_REQ=10`、`KV_REQ_SIZE=80MB`）。每个组：
+- 一条 jetty（lane），拆 **2 条 4MB WR**（同一 jetty、同一 chip，`src==dst`）；
+- **亲和（`--affinity-mode affinity`）= 组源与目的在同一 chip**：组在请求内序号 `g`（0..9）→ `chip = g % 2 ? 2 : 1`（第 1 个 8M chip1、第 2 个 8M chip2，10 组 = 5+5 交替打散）；`--single-chip 1|2` 时全部组固定单 chip。
 
-- 一条独立 WR（`PostWrite`，长度 4MB），**独立取一条新 jetty**（SendJettyPool 游标轮转，每分片"新的"）；
-- **亲和（`--affinity-mode affinity`）= 分片源与目的在同一 chip**：分片在请求内的序号 `j`（0..19）→ `chip = j % 2 ? 2 : 1`，`src == dst == chip`，20 分片 = chip1/chip2 各 10，**交替均匀打散**，两个 chip 的物理口同时满负荷。
-
-**请求并发度 `--concurrency N`（1~10）**：同时在飞请求数 ≤ N（在飞分片 ≤ 20×N）。
+**`--concurrency N`（1~100）**：**在飞 8M 组数 ≤ N**（每组 1 条 jetty；不是请求数）。
 
 **jetty 池驱动流水线**（发送节奏由 jetty 池容量决定）：
 
@@ -179,8 +178,8 @@ client                                  server
 ### 6.2 缓冲布局
 
 ```
-客户端: [ ReqArea: threads*32B（get 用）] [ DataArea: threads × (20×concurrency) × 4MB，循环复用 ] [ FlagArea: threads*16B（get 用）]
-服务器: [ RequestRing: 4096*32B ] [ DataArea: 最大窗口 800MB（10 并发 × 80MB，固定，客户端任意并发度不越界）]
+客户端: [ DataArea: threads × concurrency × 8MB，循环复用 ]
+服务器: [ DataArea: 最大窗口 800MB（100 组 × 8MB，固定，客户端任意并发度不越界）]
 ```
 
 ### 6.3 get（Get）—— 客户端直接 READ
@@ -201,7 +200,7 @@ client                                  server
 ```
 while (!stop && !fatal && now < deadline):
   收完成（ProbeEvent 扫描在飞槽 → 记账/记时延/归还 jetty）
-  发送（有请求一直发分片；池空则等；新请求受并发度 ≤ N 限制）
+  发送（有请求一直发 8M 组；池空则等；在飞组受 --concurrency ≤ N 限制）
 ```
 
 ### 6.5 QPS 节流
@@ -273,7 +272,8 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
          [--destination-cpus <list>]    # server CPU（主线程/mbind 目标）
          [--cacheable]                  # 注册/导入 cacheable 段
          [--threads <n>]                # client 打流线程数，默认 1
-         [--concurrency <1..10>]        # write 请求并发度（默认 1；在飞分片 = 20×N）
+         [--concurrency <1..100>]       # write 在飞 8M 组数（默认 1）
+         [--single-chip <1|2>]          # 单 chip 场景：全部组固定该 chip + mbind 到其 NUMA
          [--op <write|get|mixed>]       # 默认 write
          [--mixed-ratio <pct>]          # mixed 中 write 占比，默认 50
          [--report-interval <s>]        # 默认 1
@@ -287,7 +287,7 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
 ```
 
 - cpulist 语法：`0,2,4-7`（区间+列表）。
-- 参数校验：bonding 设备仅支持 `--trans-mode` 0（RM，自动 multi-path，jfs 固定 `multi_path=1`）或 1（RC）；`--concurrency` 1~10。
+- 参数校验：bonding 设备仅支持 `--trans-mode` 0（RM，自动 multi-path，jfs 固定 `multi_path=1`）或 1（RC）；`--concurrency` 1~100；`--single-chip` 0/1/2。
 - 已删除历史死参数：`--tp-type`（传输类型实际由 `--import-rtp` 决定，固定 CTP/RTP）、`--multi-path`（jfs 无条件 multi_path=1）、`--src-chip-a/b/--dst-chip`（chip 覆盖，布局敏感崩溃诱因，已移除）、`--dual-mode`/`--server-workers`/`--get-fence`（get 回写模型已移除，get 改为客户端直接 READ）。
 
 ---

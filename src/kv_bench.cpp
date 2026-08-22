@@ -56,13 +56,13 @@
 #define KV_GROUP_SIZE (KV_CHUNK_SIZE * KV_WR_PER_GROUP)  /* 8MB */
 #define KV_GROUPS_PER_REQ 10               /* 80MB / 8MB */
 #define KV_REQ_SIZE (KV_GROUP_SIZE * KV_GROUPS_PER_REQ)  /* 80MB */
-#define KV_MAX_CONCURRENCY 10
-#define KV_MAX_WR_SLOTS (KV_GROUPS_PER_REQ * KV_MAX_CONCURRENCY) /* 100 组在飞 */
+#define KV_MAX_INFLIGHT_GROUPS 100         /* --concurrency 上限：在飞 8M 组数 */
+#define KV_MAX_WR_SLOTS KV_MAX_INFLIGHT_GROUPS /* 槽数组 = 在飞组上限 */
+#define KV_MAX_INFLIGHT_REQS (KV_MAX_WR_SLOTS / KV_GROUPS_PER_REQ) /* 10 */
 
-/* 服务器数据区：容纳最大窗口（10 并发 × 80MB = 800MB），固定 */
+/* 服务器数据区：容纳最大窗口（100 组 × 8MB = 800MB），固定 */
 #define SERVER_PIPE_BYTES                                                      \
-  ((uint64_t)KV_WR_PER_GROUP * KV_GROUPS_PER_REQ * KV_MAX_CONCURRENCY *        \
-   KV_CHUNK_SIZE)
+  ((uint64_t)KV_WR_PER_GROUP * KV_MAX_INFLIGHT_GROUPS * KV_CHUNK_SIZE)
 
 #define DEFAULT_TIMEOUT_MS 5000
 #define MAX_CPUS 1024
@@ -88,7 +88,8 @@ typedef struct argument {
   const char *destination_cpus;
   bool cacheable;
   uint32_t threads;
-  int concurrency; /* write 请求并发度 1..10，默认 1（在飞分片 = 20×N） */
+  int concurrency; /* write 在飞 8M 组数 1..100，默认 1 */
+  int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst） */
   int op;
   uint32_t mixed_ratio;
   uint32_t report_interval;
@@ -131,8 +132,8 @@ typedef struct worker {
   void *run_arg;
   /* write 分片流水线状态 */
   wr_slot_t wr_slots[KV_MAX_WR_SLOTS];
-  uint64_t req_start[KV_MAX_CONCURRENCY]; /* 每在飞请求的开始时间（请求 id % N） */
-  uint64_t req_done[KV_MAX_CONCURRENCY];  /* 每在飞请求已完成分片数 */
+  uint64_t req_start[KV_MAX_INFLIGHT_REQS]; /* 每在飞请求开始时间（请求 id % 10） */
+  uint64_t req_done[KV_MAX_INFLIGHT_REQS];  /* 每在飞请求已完成组数 */
 } worker_t;
 
 typedef struct conn {
@@ -267,6 +268,17 @@ static int numa_to_chip(int numa) {
   return numa < first_half ? 1 : 2;
 }
 
+/* chip → 第一个匹配的 NUMA 节点（numa_to_chip 反查；单 chip 内存亲和用） */
+static int chip_to_first_numa(int chip) {
+  int numa_count = get_num_numa_nodes();
+  for (int n = 0; n < numa_count; n++) {
+    if (numa_to_chip(n) == chip) {
+      return n;
+    }
+  }
+  return -1;
+}
+
 static int cpu_to_chip(int cpu) { return numa_to_chip(read_cpu_numa(cpu)); }
 
 static int pin_thread_to_cpu(int cpu) {
@@ -391,11 +403,10 @@ static int mbind_to_node(void *addr, size_t len, int node) {
  * 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
-  /* write（8M 组流水线）：每线程数据区 = 窗口组数（10×并发度）× 8MB，循环复用；
-   * get/mixed：沿用 value_size 窗口 */
+  /* write（8M 组流水线）：每线程数据区 = 在飞组窗口（--concurrency）× 8MB，
+   * 循环复用；get/mixed：沿用 value_size 窗口 */
   uint64_t pipe_groups =
-      (uint64_t)KV_GROUPS_PER_REQ *
-      (args->concurrency > 0 ? (uint64_t)args->concurrency : 1);
+      args->concurrency > 0 ? (uint64_t)args->concurrency : 1;
   uint64_t data_len = (args->op == OP_WRITE)
                           ? (uint64_t)args->threads * pipe_groups *
                                 KV_GROUP_SIZE
@@ -440,21 +451,27 @@ static int setup_buffer(context_t *ctx, bool is_server) {
     return -1;
   }
   if (args->mbind && args->affinity_mode == AFF_AFFINITY) {
-    int dst_cpus[MAX_CPUS];
-    int n = parse_cpu_list(args->destination_cpus, dst_cpus, MAX_CPUS);
-    if (n > 0) {
-      int node = read_cpu_numa(dst_cpus[0]);
-      if (node >= 0) {
-        /* 整缓冲绑定（va 由 memalign 页对齐），保证数据区落在目的 NUMA */
-        if (mbind_to_node(ctx->va, ctx->buf_len, node) != 0) {
-          fprintf(stderr,
-                  "Warning: mbind to node %d failed, continue without NUMA "
-                  "binding\n",
-                  node);
-        } else {
-          printf("mbind buffer (%" PRIu64 "B) to node %d\n", ctx->buf_len,
-                 node);
-        }
+    int node = -1;
+    if (args->single_chip >= 1 && args->single_chip <= 2) {
+      /* 单 chip 内存亲和：绑到该 chip 对应的 NUMA 节点 */
+      node = chip_to_first_numa(args->single_chip);
+    } else {
+      int dst_cpus[MAX_CPUS];
+      int n = parse_cpu_list(args->destination_cpus, dst_cpus, MAX_CPUS);
+      if (n > 0) {
+        node = read_cpu_numa(dst_cpus[0]);
+      }
+    }
+    if (node >= 0) {
+      /* 整缓冲绑定（va 由 memalign 页对齐），保证数据区落在目的 NUMA */
+      if (mbind_to_node(ctx->va, ctx->buf_len, node) != 0) {
+        fprintf(stderr,
+                "Warning: mbind to node %d failed, continue without NUMA "
+                "binding\n",
+                node);
+      } else {
+        printf("mbind buffer (%" PRIu64 "B) to node %d\n", ctx->buf_len,
+               node);
       }
     }
   }
@@ -566,7 +583,11 @@ static void pick_group_chip(const argument_t *args, worker_t *w,
     dst_chip = (int)(w->id % 2) + 1;
   }
   if (args->affinity_mode == AFF_AFFINITY) {
-    *src = *dst = (group_in_req % 2 == 0) ? 1 : 2;
+    /* --single-chip：全部组固定单 chip（src==dst），内存亲和场景；
+     * 否则 8M 组间交替 — 第一个 8M chip1、第二个 8M chip2 */
+    *src = *dst = (args->single_chip >= 1 && args->single_chip <= 2)
+                      ? args->single_chip
+                      : ((group_in_req % 2 == 0) ? 1 : 2);
   } else if (args->affinity_mode == AFF_ANTI) {
     int all_cpus[MAX_CPUS];
     int n_all = enumerate_all_cpus(all_cpus, MAX_CPUS);
@@ -660,8 +681,7 @@ static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
   uint32_t window_groups =
-      (uint32_t)(KV_GROUPS_PER_REQ *
-                 (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
+      (uint32_t)(args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
   uint64_t base_off = (group_seq % window_groups) * KV_GROUP_SIZE;
   uint64_t remote_base = conn.RemoteSegVa() + (base_off % SERVER_PIPE_BYTES);
 
@@ -703,14 +723,15 @@ static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
 
 /* write 流水线主循环（jetty 池驱动，精简 yuanrong pipeline）：
  * 有请求就一直发 8M 组（每组 1 条 jetty、2 条 4M WR），取不到可用 jetty（池空）
- * 就等待在飞组完成释放 jetty 后继续；--concurrency 限制同时在飞请求数 ≤ N；
+ * 就等待在飞组完成释放 jetty 后继续；--concurrency 限制在飞 8M 组数 ≤ N；
  * 时延按请求（10 组全完成）记录。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   uint32_t concurrency =
-      (args->concurrency >= 1 && args->concurrency <= KV_MAX_CONCURRENCY)
+      (args->concurrency >= 1 &&
+       args->concurrency <= KV_MAX_INFLIGHT_GROUPS)
           ? (uint32_t)args->concurrency
           : 1;
   uint64_t interval_ns = 0;
@@ -723,7 +744,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   uint64_t next_req_ns = now_ns();
 
   uint64_t group_seq = 0; /* 本线程全局 8M 组序号（请求 id = group_seq/10） */
-  uint32_t req_active = 0; /* 同时在飞请求数（≤ concurrency） */
+  uint32_t inflight_groups = 0; /* 在飞 8M 组数（≤ concurrency） */
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
@@ -769,24 +790,25 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       mgr->ReleaseSendLane(s->jetty);
       s->jetty.reset();
       s->active = false;
+      if (inflight_groups > 0)
+        inflight_groups--;
       /* 请求级完成判定（该请求 10 组全部完成） */
       uint64_t req_id = s->group_seq / KV_GROUPS_PER_REQ;
-      uint32_t ri = (uint32_t)(req_id % concurrency);
+      uint32_t ri = (uint32_t)(req_id % KV_MAX_INFLIGHT_REQS);
       w->req_done[ri]++;
       if (s->group_seq % KV_GROUPS_PER_REQ == KV_GROUPS_PER_REQ - 1) {
         kv_hist_record(&w->hist, now_ns() - w->req_start[ri]);
         __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
-        if (req_active > 0)
-          req_active--;
       }
     }
 
-    /* 2. 发送：有请求就一直发，直到取不到可用 jetty（池空）或达到并发度上限 */
+    /* 2. 发送：有请求就一直发，直到在飞组达上限（concurrency）或取不到
+     * 可用 jetty（池空） */
     while (now_ns() < deadline && !ctx->fatal) {
+      if (inflight_groups >= concurrency)
+        break; /* 在飞组数达上限，等组完成腾窗口 */
       if (group_seq % KV_GROUPS_PER_REQ == 0) {
-        /* 新请求边界：qps 节流 + 并发度上限检查 */
-        if (req_active >= concurrency)
-          break; /* 并发度满，等请求完成腾名额 */
+        /* 新请求边界：qps 节流 */
         if (interval_ns > 0) {
           if (now_ns() < next_req_ns) {
             uint64_t left = next_req_ns - now_ns();
@@ -798,9 +820,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           next_req_ns = now_ns() + interval_ns;
         }
         uint64_t rid = group_seq / KV_GROUPS_PER_REQ;
-        w->req_start[rid % concurrency] = now_ns();
-        w->req_done[rid % concurrency] = 0;
-        req_active++;
+        w->req_start[rid % KV_MAX_INFLIGHT_REQS] = now_ns();
+        w->req_done[rid % KV_MAX_INFLIGHT_REQS] = 0;
       }
       /* 找空槽 */
       uint32_t slot = KV_MAX_WR_SLOTS;
@@ -811,7 +832,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         }
       }
       if (slot == KV_MAX_WR_SLOTS)
-        break; /* 槽满（池 ≤ 100，理论不会） */
+        break; /* 槽满（≤ 100，理论不会） */
       std::shared_ptr<kv_bench::UrmaJetty> jetty;
       if (!mgr->AcquireSendLane(jetty))
         break; /* 池空：等待在飞组完成释放 */
@@ -820,6 +841,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         return -1;
       }
       progressed = true;
+      inflight_groups++;
       group_seq++;
     }
 
@@ -1189,12 +1211,11 @@ static int run_client(const argument_t *args) {
   int sockfd = -1;
   pthread_t sampler_thread = 0;
 
-  /* jetty 池 ≥ max(线程数, write 8M 组流水线窗口 10×并发度) */
+  /* jetty 池 ≥ max(线程数, write 在飞 8M 组数 concurrency) */
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
     uint32_t pipe =
-        (uint32_t)(KV_GROUPS_PER_REQ *
-                   (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
+        (uint32_t)(args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
     if (pipe > min_lanes)
       min_lanes = pipe;
   }
@@ -1486,6 +1507,7 @@ static struct option g_long_options[] = {
     {"timeout-ms", required_argument, NULL, 1018},
     {"query-chips", no_argument, NULL, 1024},
     {"concurrency", required_argument, NULL, 1025},
+    {"single-chip", required_argument, NULL, 1026},
     {NULL, 0, NULL, 0}};
 
 static void usage(void) {
@@ -1514,8 +1536,10 @@ static void usage(void) {
   printf("      --destination-cpus <list> server CPU list, e.g. 8,9\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
-  printf("      --concurrency <n>      write request concurrency 1..10 "
-         "(default 1; in-flight chunks = 20*n)\n");
+  printf("      --concurrency <n>      write inflight 8M groups 1..100 "
+         "(default 1)\n");
+  printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
+         "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
   printf("      --mixed-ratio <pct>    write percentage in mixed mode (default "
          "50)\n");
@@ -1546,9 +1570,14 @@ static int validate_input_params(argument_t *args) {
     fprintf(stderr, "Invalid thread count %u\n", args->threads);
     return -1;
   }
-  if (args->concurrency < 1 || args->concurrency > KV_MAX_CONCURRENCY) {
+  if (args->concurrency < 1 || args->concurrency > KV_MAX_INFLIGHT_GROUPS) {
     fprintf(stderr, "Invalid concurrency %d (1..%d)\n", args->concurrency,
-            KV_MAX_CONCURRENCY);
+            KV_MAX_INFLIGHT_GROUPS);
+    return -1;
+  }
+  if (args->single_chip < 0 || args->single_chip > 2) {
+    fprintf(stderr, "Invalid single-chip %d (0=dual chip, 1|2)\n",
+            args->single_chip);
     return -1;
   }
   if (args->op < OP_WRITE || args->op > OP_MIXED) {
@@ -1592,6 +1621,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->affinity_mode = AFF_NONE;
   args->threads = 1;
   args->concurrency = 1;
+  args->single_chip = 0;
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
   args->report_interval = 1;
@@ -1705,6 +1735,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       break;
     case 1025:
       args->concurrency = (int)strtol(optarg, NULL, 0);
+      break;
+    case 1026:
+      args->single_chip = (int)strtol(optarg, NULL, 0);
       break;
     default:
       usage();

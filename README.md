@@ -87,17 +87,20 @@ kv_bench 打流线程
 `--server-ip` 存在时进程是 client；没有该参数时是 server。两端的 `--dev-name`
 应使用同一类 URMA/bonding 设备；`--destination-cpus` 两端保持一致（客户端用它计算目的 chip）。
 
-## 打流模型（write：80MB 请求分片流水线）
+## 打流模型（write：80MB 请求 = 10 × 8MB 组，精简 yuanrong pipeline）
 
-**一次请求 = 80MB（固定）= 20 × 4MB 分片**，每个分片独立 WRITE、**独立取一条新 jetty**。
-亲和模式下**每个分片源与目的在同一 chip**，分片按请求内序号交替 chip1/chip2
-（20 分片 = 10+10 均匀打散），两个 chip 的物理口同时满负荷：
+**一次请求 = 80MB（固定）= 10 个 8MB 组**，每组 1 条 jetty、拆 **2 条 4MB WR**（同一
+jetty、同一 chip）。亲和模式下**组源==目的==同一 chip**，组按请求内序号交替
+chip1/chip2（第 1 个 8M chip1、第 2 个 8M chip2，10 组 = 5+5 均匀打散），两个
+chip 的物理口同时满负荷：
 
-- **请求并发度 `--concurrency N`（1~10）**：同时在飞请求数 ≤ N（在飞分片 ≤ 20×N）。
-- **jetty 池驱动流水线**：有请求就一直发分片（每分片取一条新 jetty）；**取不到可用
-  jetty（池空）就等待在飞分片完成释放后再继续**——jetty 池容量即分片并发上限；
-  时延按**请求**记录（该请求 20 个分片全部完成）。
-- 分片字节 = 4MB 固定；带宽 = 请求数 × 80MB / elapsed；WR 速率 = 请求 IOPS × 20。
+- **`--concurrency N`（1~100）**：**在飞 8M 组数 ≤ N**（不是请求数；每组占 1 条 jetty）。
+- **jetty 池驱动流水线**：有请求就一直发 8M 组（每组取一条新 jetty）；**取不到可用
+  jetty（池空）就等待在飞组完成释放后再继续**；组内 2 条 WR 都完成才归还 jetty。
+  时延按**请求**记录（该请求 10 组全部完成）。
+- 组字节 = 8MB 固定；带宽 = 请求数 × 80MB / elapsed；WR 速率 = 请求 IOPS × 20。
+- **`--single-chip 1|2`**：单 chip 场景——所有组固定走该 chip（src==dst），
+  `--mbind` 时缓冲绑到该 chip 对应的 NUMA 节点（测单 chip 极限 + 内存亲和）。
 
 ## 操作类型
 
@@ -108,10 +111,10 @@ kv_bench 打流线程
 
 ## 亲和（bonding）
 
-- `affinity`：**分片源==目的==同一 chip**（分片序号 `%2` 交替 chip1/chip2）、
-  源线程绑定 `--source-cpus`、目的固定 `--destination-cpus`。
-- `anti`/`anti-affinity`：源随机（每分片随机 chip），目的固定。
-- `none`：两端都不绑定，源/目的 chip 每分片随机。
+- `affinity`：**组源==目的==同一 chip**（组序号 `%2` 交替 chip1/chip2；`--single-chip`
+  时全部组固定单 chip）、源线程绑定 `--source-cpus`、目的固定 `--destination-cpus`。
+- `anti`/`anti-affinity`：源随机（每组随机 chip），目的固定。
+- `none`：两端都不绑定，源/目的 chip 每组随机。
 
 CPU 亲和（线程绑定 + mbind）恒生效；**bonding chip 路由（WR 的 `has_drv_ext` +
 `src/dst_chip_id`）默认关闭**（对齐参考默认路径，部分平台 post 时会报
@@ -135,9 +138,9 @@ request latency(us): avg=5333.33 min=1624.00 p50=5000.00 p90=6100.00 p99=8025.00
 
 ## Jetty 线性度扫描
 
-**每个 4MB 分片从 send Jetty 池取一条新的 jetty**（对齐 yuanrong `AcquireSendLane` 模型）：
-池按游标轮转 + in-use 标记分配，用后归还。**jetty 池容量 = 同时在飞分片上限**
-（池越大分片并发越高，带宽/时延随之变化），用于观察 Jetty 数量对带宽/时延的线性度：
+**每个 8MB 组从 send Jetty 池取一条新的 jetty**（对齐 yuanrong `AcquireSendLane` 模型）：
+池按游标轮转 + in-use 标记分配，用后归还。**jetty 池容量 = 同时在飞组上限**
+（池越大组并发越高，带宽/时延随之变化），用于观察 Jetty 数量对带宽/时延的线性度：
 用于观察 Jetty 数量对带宽/时延的线性度：
 
 ```bash
@@ -149,7 +152,7 @@ for n in 1 2 4 8 16 32 64 128 200; do
 done
 ```
 
-池大小自动取 `max(jetty_count, threads, 20×并发度)`（保证并发度内的在飞分片都有 jetty 可取）。
+池大小自动取 `max(jetty_count, threads, 并发度)`（保证在飞组都有 jetty 可取）。
 
 ## 其它参数
 
