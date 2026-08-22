@@ -101,9 +101,8 @@ chip2，10 个请求 = 5+5 均匀打散），两个 chip 的物理口同时满�
   jetty（池空）就等待在飞请求完成释放后再继续**；请求内 2 条 WR 都完成才归还 jetty。
   时延按**批次**记录（该批 10 个请求全部完成）。
 - 请求字节 = 8MB 固定；带宽 = 批数 × 80MB / elapsed；WR 速率 = 批 IOPS × 20。
-- **`--batch-sync`**：一批（10 个请求）全部完成才发下一批（默认跨批流水线：完成一个
-  请求补发一个，批时延含流水线排队 ≈ 2~3×传输时间；batch-sync 下批时延 ≈ 80M/带宽，
-  分布集中，吞吐不变）。
+- **`--batch-sync`（默认开，`--no-batch-sync` 关闭）**：一批（10 个请求）全部完成才发
+  下一批；关闭时跨批流水线（完成一个请求补发一个），批时延含流水线排队 ≈ 2~3×传输时间。
 - **`--single-chip 1|2`**：单 chip 场景——所有请求固定走该 chip（src==dst），
   `--mbind` 时缓冲绑到该 chip 对应的 NUMA 节点（测单 chip 极限 + 内存亲和）。
 
@@ -116,17 +115,18 @@ chip2，10 个请求 = 5+5 均匀打散），两个 chip 的物理口同时满�
 
 ## 亲和（bonding）
 
-- `affinity`：**请求源==目的==同一 chip**（请求序号 `%2` 交替 chip1/chip2；`--single-chip`
-  时全部请求固定单 chip）、源线程绑定 `--source-cpus`、目的固定 `--destination-cpus`。
+- `affinity`（**默认**）：**请求源==目的==同一 chip**（请求序号 `%2` 交替 chip1/chip2；
+  `--single-chip` 时全部请求固定单 chip）、源线程绑定 `--source-cpus`、目的固定
+  `--destination-cpus`。**不传 `--source-cpus`/`--destination-cpus` 时自动选择**：
+  亲和模式下从 chip1/chip2 各取一半 CPU（客户端按线程数，服务器 ≤8）。
 - `anti`/`anti-affinity`：源随机（每请求随机 chip），目的固定。
 - `none`：两端都不绑定，源/目的 chip 每请求随机。
 
 CPU 亲和（线程绑定 + mbind）恒生效；**bonding chip 路由（WR 的 `has_drv_ext` +
-`src/dst_chip_id`）默认关闭**（对齐参考默认路径，部分平台 post 时会报
-`URMA_CR_LOC_ACCESS_ERR`），显式 `--drv-ext` 开启。
-`--seed` 控制随机；`--mbind` 显式开启 NUMA 绑定（默认关，部分平台/Kunpeng 不支持
-mbind 会报 EINVAL，非必要）；`--fixed-offset` 恒压同一地址（热缓存测试）。
-`--drv-ext` 开启 bonding chip 路由（自动值参考 `NumaIdToChipId`）。
+`src/dst_chip_id`）默认开启**（`--no-drv-ext` 关闭，对齐参考默认路径）；
+**NUMA mbind 默认开启**（`--no-mbind` 关闭；部分平台/Kunpeng 不支持 mbind 会报
+EINVAL 警告后继续）。
+`--seed` 控制随机；`--fixed-offset` 恒压同一地址（热缓存测试）。
 
 ## 统计输出
 

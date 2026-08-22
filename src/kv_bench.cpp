@@ -463,7 +463,7 @@ static int setup_buffer(context_t *ctx, bool is_server) {
       node = chip_to_first_numa(args->single_chip);
     } else {
       int dst_cpus[MAX_CPUS];
-      int n = parse_cpu_list(args->destination_cpus, dst_cpus, MAX_CPUS);
+      int n = my_cpu_list(args, false, dst_cpus, MAX_CPUS); /* 含自动选择 */
       if (n > 0) {
         node = read_cpu_numa(dst_cpus[0]);
       }
@@ -486,6 +486,41 @@ static int setup_buffer(context_t *ctx, bool is_server) {
 
 /* ---------------- 亲和: 每轮取源/目的 chip ---------------- */
 
+/* 未指定 cpus 时按亲和模式自动选择：
+ * affinity：从 chip1/chip2 各取 max(1, 目标数/2) 个 CPU（双 chip 均匀，保证
+ * 双口打满；目标数 = 客户端线程数，服务器上限 8）；其它模式：全部 CPU。 */
+static int auto_select_cpus(const argument_t *args, bool is_client, int *out,
+                            int max_out) {
+  if (args->affinity_mode != AFF_AFFINITY) {
+    return enumerate_all_cpus(out, max_out);
+  }
+  int all[MAX_CPUS];
+  int n_all = enumerate_all_cpus(all, MAX_CPUS);
+  int c1[MAX_CPUS], c2[MAX_CPUS];
+  int n1 = 0, n2 = 0;
+  for (int i = 0; i < n_all; i++) {
+    int chip = cpu_to_chip(all[i]);
+    if (chip == 1)
+      c1[n1++] = all[i];
+    else if (chip == 2)
+      c2[n2++] = all[i];
+  }
+  uint32_t target = args->threads > 0 ? (uint32_t)args->threads : 1;
+  if (!is_client && target > 8)
+    target = 8; /* 服务器：mbind 目标 node / first_dst_chip 用，够用即可 */
+  uint32_t per = (target + 1) / 2;
+  if (per < 1)
+    per = 1;
+  int n = 0;
+  for (int i = 0; i < n1 && (uint32_t)i < per && n < max_out; i++)
+    out[n++] = c1[i];
+  for (int i = 0; i < n2 && (uint32_t)i < per && n < max_out; i++)
+    out[n++] = c2[i];
+  if (n == 0)
+    return enumerate_all_cpus(out, max_out); /* 单 chip 兜底 */
+  return n;
+}
+
 static int my_cpu_list(const argument_t *args, bool is_client, int *out,
                        int max_out) {
   const char *list = is_client ? args->source_cpus : args->destination_cpus;
@@ -493,15 +528,12 @@ static int my_cpu_list(const argument_t *args, bool is_client, int *out,
   if (n > 0) {
     return n;
   }
-  return enumerate_all_cpus(out, max_out);
+  return auto_select_cpus(args, is_client, out, max_out);
 }
 
 static int first_dst_chip(const argument_t *args) {
   int dst_cpus[MAX_CPUS];
-  int n = parse_cpu_list(args->destination_cpus, dst_cpus, MAX_CPUS);
-  if (n == 0) {
-    n = enumerate_all_cpus(dst_cpus, MAX_CPUS);
-  }
+  int n = my_cpu_list(args, false, dst_cpus, MAX_CPUS); /* 含自动选择 */
   for (int i = 0; i < n; i++) {
     int chip = cpu_to_chip(dst_cpus[i]);
     if (chip > 0)
@@ -1533,7 +1565,9 @@ static struct option g_long_options[] = {
     {"mixed-ratio", required_argument, NULL, 1010},
     {"report-interval", required_argument, NULL, 1012},
     {"mbind", no_argument, NULL, 1015},
+    {"no-mbind", no_argument, NULL, 1031},
     {"drv-ext", no_argument, NULL, 1019},
+    {"no-drv-ext", no_argument, NULL, 1030},
     {"import-rtp", no_argument, NULL, 1023},
     {"seed", required_argument, NULL, 1016},
     {"fixed-offset", no_argument, NULL, 1017},
@@ -1542,6 +1576,7 @@ static struct option g_long_options[] = {
     {"concurrency", required_argument, NULL, 1025},
     {"concurrency-unit", required_argument, NULL, 1027},
     {"batch-sync", no_argument, NULL, 1028},
+    {"no-batch-sync", no_argument, NULL, 1029},
     {"single-chip", required_argument, NULL, 1026},
     {NULL, 0, NULL, 0}};
 
@@ -1566,9 +1601,11 @@ static void usage(void) {
   printf("      --jetty-count <n>      min send Jetty count, 1..200 (default "
          "1; threads may raise it)\n");
   printf(
-      "      --affinity-mode <m>    affinity | anti | none (default none)\n");
-  printf("      --source-cpus <list>   client CPU list, e.g. 4,5\n");
-  printf("      --destination-cpus <list> server CPU list, e.g. 8,9\n");
+      "      --affinity-mode <m>    affinity | anti | none (default affinity)\n");
+  printf("      --source-cpus <list>   client CPU list, e.g. 4,5 (default: auto "
+         "per chip)\n");
+  printf("      --destination-cpus <list> server CPU list, e.g. 8,9 (default: "
+         "auto per chip)\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
   printf("      --concurrency <n>      write concurrency: 1..10 (unit=req_group) "
@@ -1576,17 +1613,17 @@ static void usage(void) {
   printf("      --concurrency-unit <u> req|req_group: req = inflight 8M requests; "
          "req_group = inflight batches (10 x 8M requests)\n");
   printf("      --batch-sync          one batch (10 x 8M) completes before next "
-         "starts; clean batch latency\n");
+         "starts; clean batch latency (default on; --no-batch-sync to disable)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
   printf("      --mixed-ratio <pct>    write percentage in mixed mode (default "
          "50)\n");
   printf("      --report-interval <s>  periodic report interval (default 1)\n");
-  printf("      --mbind                enable NUMA mbind of the buffer "
-         "(default off; unsupported on some platforms)\n");
+  printf("      --mbind                enable NUMA mbind of the buffer (default "
+         "on; --no-mbind to disable)\n");
   printf("      --drv-ext              enable bonding chip routing "
-         "(has_drv_ext + src/dst chip, default off)\n");
+         "(has_drv_ext + src/dst chip, default on; --no-drv-ext to disable)\n");
   printf("      --import-rtp           import remote jetty via plain RTP (skip "
          "bondp/CTP, workaround for driver crash)\n");
   printf("      --seed <n>             random seed for anti/none affinity "
@@ -1667,17 +1704,19 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->qps = 0;
   args->duration_sec = 10;
   args->jetty_count = 1;
-  args->affinity_mode = AFF_NONE;
+  args->affinity_mode = AFF_AFFINITY; /* 默认亲和 */
   args->threads = 1;
   args->concurrency = 1;
   args->concurrency_unit = 0; /* 默认 req_group：在飞批次数 */
-  args->batch_sync = false;
+  args->batch_sync = true;    /* 默认批同步（一批完成才发下一批） */
   args->single_chip = 0;
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
   args->report_interval = 1;
   args->seed = 42;
   args->timeout_ms = DEFAULT_TIMEOUT_MS;
+  args->drv_ext = true;  /* 默认开 chip 路由，--no-drv-ext 关闭 */
+  args->mbind = true;    /* 默认 NUMA 绑定，--no-mbind 关闭 */
 
   while (1) {
     int c = getopt_long(argc, argv, "m:d:i:p:e", g_long_options, NULL);
@@ -1766,8 +1805,14 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
     case 1015:
       args->mbind = true;
       break;
+    case 1031:
+      args->mbind = false;
+      break;
     case 1019:
       args->drv_ext = true;
+      break;
+    case 1030:
+      args->drv_ext = false;
       break;
     case 1023:
       args->import_rtp = true;
@@ -1806,6 +1851,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       break;
     case 1028:
       args->batch_sync = true;
+      break;
+    case 1029:
+      args->batch_sync = false;
       break;
     default:
       usage();

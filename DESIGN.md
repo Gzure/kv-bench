@@ -73,14 +73,14 @@ urma_init
   → urma_create_jfce / urma_create_jfc(depth)
   → （可选，编译期）bonding balance 模式：
       #ifdef KV_BENCH_BONDP_CTL  urma_user_ctl(URMA_USER_CTL_BONDP_BONDING_MODE,
-                                   BONDP_BONDING_MODE_BALANCE)   ← 默认关
+                                   BONDP_BONDING_MODE_BALANCE)   ← 默认开
   → 创建 send jetty 池：max(--jetty-count, threadsMin) 条 send jetty
       （共享 JFR；jfsCfg：depth=256、max_sge=2、multi_path=1、order_type(RS)）
   → 首个打流线程注册时 EnsurePollThread() 启动轮询线程
 ```
 
 - `UrmaResource::Init` 返回后业务层 `RegisterBuffer(va, len)` 注册单个本地段（`localSeg_`），供握手发布与数据面使用。
-- **balance 编译选项**：`urma_ubagg.h` 已引入（类型可用），但 `urma_user_ctl` 调 balance 在部分平台不可用/驱动崩溃，默认 `OFF`；需要时 `-DKV_BENCH_BONDP_CTL=ON`。
+- **balance 编译选项**：`urma_ubagg.h` 已引入（类型可用），`urma_user_ctl` 调 balance **默认开**（`KV_BENCH_BONDP_CTL=ON`）；部分平台/UMDK 版本不可用或驱动崩溃时 `-DKV_BENCH_BONDP_CTL=OFF`。
 
 ---
 
@@ -241,7 +241,7 @@ while (!stop && !fatal && now < deadline):
 
 - 随机性：每线程私有 `rng`（xorshift32，`--seed` 控制，`--seed + i*2654435761u` 每线程不同），可复现。
 - **CPU 绑定**：`sched_setaffinity`。client 打流线程 `source_cpus[i % n]`（仅 affinity）；server 主线程 `destination_cpus`（`affinity` 与 `anti` 都绑，`!=none` 即绑）。
-- `--drv-ext` 开时 WR 带 `has_drv_ext=1 + src_chip_id/dst_chip_id`（chip 路由）；默认关（`INVALID_CHIP=0xFF` → `drv=0`，WR 不带 chip 字段）。
+- `--drv-ext` 开时 WR 带 `has_drv_ext=1 + src_chip_id/dst_chip_id`（chip 路由）；**默认开**（`--no-drv-ext` 关闭 → `INVALID_CHIP=0xFF` → `drv=0`，WR 不带 chip 字段）。
 - `dst` 覆盖顺序：分片 chip 算出 → `--drv-ext` 且对端通告有效时用 `peer.dstChip` → `--drv-ext` 关时全部 `INVALID_CHIP`。
 
 ### 8.3 `--query-chips`（路由选择自检）
@@ -267,7 +267,7 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
          [--qps <n>]                    # 请求/秒；0 = 全速
          [--duration <sec>]             # 默认 10
          [--jetty-count <n>]            # 1..200，默认 1；池 = max(count, threads)
-         [--affinity-mode <affinity|anti|none>]   # 默认 none
+         [--affinity-mode <affinity|anti|none>]   # 默认 affinity（cpu 未指定自动选双 chip）
          [--source-cpus <list>]         # client 打流 CPU（"4,5" 或 "4,6-8"）
          [--destination-cpus <list>]    # server CPU（主线程/mbind 目标）
          [--cacheable]                  # 注册/导入 cacheable 段
@@ -277,7 +277,7 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
          [--op <write|get|mixed>]       # 默认 write
          [--mixed-ratio <pct>]          # mixed 中 write 占比，默认 50
          [--report-interval <s>]        # 默认 1
-         [--mbind]                      # NUMA 绑定（默认关；MPOL_PREFERRED 实现）
+         [--mbind]                      # NUMA 绑定（默认开；--no-mbind 关闭；MPOL_PREFERRED 实现）
          [--drv-ext]                    # bonding chip 路由（has_drv_ext + chip）
          [--import-rtp]                 # import 走普通 RTP（跳过 bondp/CTP）
          [--seed <n>]                   # 随机种子，默认 42
@@ -308,7 +308,7 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
 
 - CMake ≥ 3.16，C++20，默认 `Release`；`-pthread`。
 - 查找 URMA：`URMA_ROOT`（或环境变量）→ 系统路径，`urma_api.h`（`urma_ubagg.h` 单独查找）与 `liburma`。
-- 编译选项：`-DKV_BENCH_BONDP_CTL=ON` 启用 bonding balance `urma_user_ctl`（**默认 OFF**）。
+- 编译选项：`-DKV_BENCH_BONDP_CTL=OFF` 关闭 bonding balance `urma_user_ctl`（**默认 ON**）。
 - **UMDK 头库必须同源（同版本）**：`bondp_rjetty_t` 跨版本布局不同（26.06 含 `urma_bond_jetty_ext_t`，25.12 不含）。编译头与运行 `liburma_ubagg.so` 不匹配时 `bondp_import_jetty` 按错误布局解析 → 段错误（见 §12）。必须在目标机器上编译，或 `-DUMDK_ROOT` 指向与运行库同版本的头。
 
 ---
@@ -321,7 +321,7 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
 | 分片流水线待验证 | 新模型（80M 请求 = 20×4M 分片，双 chip 交替打散，`--concurrency` 滑动窗口）实测带宽/请求时延待测；每个 UB 口规格 ~50GB/s，亲和双 chip 同时发应 ≥50GB——**待端口感测**（`sar -n DEV` / 成员口 `tx_bytes`）确认是设备聚合上限还是单口路由问题 |
 | UMDK 头库不匹配崩溃 | 编译机 26.06 + 运行机 25.12.0-B105 → `bondp_import_jetty` 段错误，且表现为"进程内存布局敏感"（加 3 个无用 int 字段即崩，去掉可能又不崩），gdb 栈 `bondp_import_jetty` ← `urma_import_jetty`。修复：头库同源（目标机编译或统一版本）；临时绕行 `--import-rtp`（RTP 路径用普通 `urma_rjetty_t`，跨版本稳定） |
 | bondp.jetty | 必须传 `nullptr`（传本地 RECV jetty 指针在部分固件 import 时崩溃；worker2 实测） |
-| mbind | Kunpeng 4 节点上 `MPOL_BIND` 多 maxnode 候选 EINVAL；改 `MPOL_PREFERRED + maxnode=32 + 1GB 分块 + 逐页 touch` 成功；默认关（`--mbind` 开启） |
-| balance 模式 | 编译期默认关；开启时 `urma_user_ctl` 需在 create_context 后、建队列前调用（rc=0 成功，worker2 实测） |
+| mbind | Kunpeng 4 节点上 `MPOL_BIND` 多 maxnode 候选 EINVAL；改 `MPOL_PREFERRED + maxnode=32 + 1GB 分块 + 逐页 touch` 成功；默认开（`--no-mbind` 关闭） |
+| balance 模式 | 编译期默认开；`urma_user_ctl` 需在 create_context 后、建队列前调用（rc=0 成功，worker2 实测） |
 | 错误码经验 | `URMA_CR_LOC_ACCESS_ERR=4`（多为 SGE 地址/段错误）；`URMA_CR_GENERAL_ERR=9`；`EAGAIN=11`（驱动返回，真实错误看 /var/log/messages）；lib 包装值 `URMA_FAIL=0x1000` |
 | get 数据验证 | get 为客户端 READ 服务器数据区（预置 0 数据），验证 READ 通路正确性 |
