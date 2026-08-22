@@ -435,6 +435,10 @@ static int layout_server_buffer(context_t *ctx) {
   return 0;
 }
 
+/* 前向声明：定义在下方"亲和"区 */
+static int my_cpu_list(const argument_t *args, bool is_client, int *out,
+                       int max_out);
+
 /* 分配 + 注册缓冲，并按亲和 mbind 数据区 */
 static int setup_buffer(context_t *ctx, bool is_server) {
   const argument_t *args = &ctx->args;
