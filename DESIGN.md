@@ -158,7 +158,7 @@ client                                  server
 - 一条 jetty（lane），拆 **2 条 4MB WR**（同一 jetty、同一 chip，`src==dst`）；
 - **亲和（`--affinity-mode affinity`）= 组源与目的在同一 chip**：组在请求内序号 `g`（0..9）→ `chip = g % 2 ? 2 : 1`（第 1 个 8M chip1、第 2 个 8M chip2，10 组 = 5+5 交替打散）；`--single-chip 1|2` 时全部组固定单 chip。
 
-**请求并发度 `--concurrency N`（1~10）**：同时在飞请求数 ≤ N（每请求 10 组 → 在飞组 ≤ 10×N）。
+**`--concurrency N` + `--concurrency-unit <req|group>`**：`req`（默认）= 在飞请求数 ≤ N（1~10，窗口 10×N 组）；`group` = 在飞 8M 组数 ≤ N（1~100，窗口 N 组）。
 
 **jetty 池驱动流水线**（发送节奏由 jetty 池容量决定）：
 
