@@ -49,16 +49,20 @@
   4 /* 客户端 data_len = threads * 4 * value_size（get/mixed 用） */
 #define SERVER_DATA_WINDOW 4
 
-/* write 分片流水线模型（固定）：一次请求 = 80MB = 20 × 4MB 分片 */
-#define KV_CHUNK_SIZE (4UL * 1024 * 1024)
-#define KV_CHUNKS_PER_REQ 20
-#define KV_REQ_SIZE (KV_CHUNK_SIZE * KV_CHUNKS_PER_REQ) /* 80MB */
+/* write 分片流水线模型（精简 yuanrong）：一次请求 = 80MB = 10 个 8MB 组，
+ * 每组 1 条 jetty、拆 2 条 4MB WR（同一 chip），组间 chip 交替 */
+#define KV_CHUNK_SIZE (4UL * 1024 * 1024)  /* 单条 WR 4MB */
+#define KV_WR_PER_GROUP 2                  /* 8M 组 = 2 条 4M WR */
+#define KV_GROUP_SIZE (KV_CHUNK_SIZE * KV_WR_PER_GROUP)  /* 8MB */
+#define KV_GROUPS_PER_REQ 10               /* 80MB / 8MB */
+#define KV_REQ_SIZE (KV_GROUP_SIZE * KV_GROUPS_PER_REQ)  /* 80MB */
 #define KV_MAX_CONCURRENCY 10
-#define KV_MAX_WR_SLOTS (KV_CHUNKS_PER_REQ * KV_MAX_CONCURRENCY) /* 200 */
+#define KV_MAX_WR_SLOTS (KV_GROUPS_PER_REQ * KV_MAX_CONCURRENCY) /* 100 组在飞 */
 
 /* 服务器数据区：容纳最大窗口（10 并发 × 80MB = 800MB），固定 */
 #define SERVER_PIPE_BYTES                                                      \
-  ((uint64_t)KV_CHUNKS_PER_REQ * KV_MAX_CONCURRENCY * KV_CHUNK_SIZE)
+  ((uint64_t)KV_WR_PER_GROUP * KV_GROUPS_PER_REQ * KV_MAX_CONCURRENCY *        \
+   KV_CHUNK_SIZE)
 
 #define DEFAULT_TIMEOUT_MS 5000
 #define MAX_CPUS 1024
@@ -101,12 +105,12 @@ typedef struct argument {
 
 typedef struct context context_t;
 
-/* write 分片流水线：一个在飞分片 = 一条 WR + 持活的 jetty（完成前不释放） */
+/* write 流水线：一个在飞单元 = 8M 组（1 条 jetty + 2 条 4M WR，同一 chip） */
 typedef struct wr_slot {
-  uint64_t ue;                                   /* user_ctx */
-  uint64_t seq;                                  /* 事件 seq */
-  std::shared_ptr<kv_bench::UrmaJetty> jetty;    /* 分片专用 lane，完成时归还 */
-  uint64_t chunk_seq;                            /* 全局分片序号（请求 id = /20） */
+  std::shared_ptr<kv_bench::UrmaJetty> jetty; /* 组专用 lane，2 条 WR 完成才归还 */
+  uint64_t seq_a;                             /* WR-A 事件 seq */
+  uint64_t seq_b;                             /* WR-B 事件 seq */
+  uint64_t group_seq;                         /* 8M 组全局序号（请求 id = /10） */
   bool active;
 } wr_slot_t;
 
@@ -385,13 +389,14 @@ static int mbind_to_node(void *addr, size_t len, int node) {
  * 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
-  /* write（分片流水线）：每线程数据区 = 窗口分片数（20×并发度）× 4MB，循环复用；
+  /* write（8M 组流水线）：每线程数据区 = 窗口组数（10×并发度）× 8MB，循环复用；
    * get/mixed：沿用 value_size 窗口 */
-  uint64_t pipe_chunks =
-      (uint64_t)KV_CHUNKS_PER_REQ *
+  uint64_t pipe_groups =
+      (uint64_t)KV_GROUPS_PER_REQ *
       (args->concurrency > 0 ? (uint64_t)args->concurrency : 1);
   uint64_t data_len = (args->op == OP_WRITE)
-                          ? (uint64_t)args->threads * pipe_chunks * KV_CHUNK_SIZE
+                          ? (uint64_t)args->threads * pipe_groups *
+                                KV_GROUP_SIZE
                           : (uint64_t)args->threads * DATA_WINDOW_PER_THREAD *
                                 args->value_size;
   ctx->data_len = data_len;
@@ -549,15 +554,17 @@ static void pick_round_chips(const argument_t *args, bool is_client,
 /* write 分片 chip 分配：每分片一对 (src, dst)。
  * affinity：源==目的==chip，分片在请求内序号 j → chip = j%2 ? 2 : 1（20 分片
  * 交替打散 = 10+10 均匀分两 chip）；anti：源随机、目的固定；none：全随机。 */
-static void pick_chunk_chip(const argument_t *args, worker_t *w,
-                            uint32_t chunk_in_req, int *src, int *dst) {
+/* write 8M 组 chip 分配：组内 2 条 4M WR 同一 chip（src==dst）。
+ * affinity：8M 组间交替 — 第一个 8M chip1、第二个 8M chip2（10 组 = 5+5）；
+ * anti：src 随机、dst 固定；none：全随机。 */
+static void pick_group_chip(const argument_t *args, worker_t *w,
+                            uint32_t group_in_req, int *src, int *dst) {
   int dst_chip = first_dst_chip(args);
   if (dst_chip < 0) {
     dst_chip = (int)(w->id % 2) + 1;
   }
   if (args->affinity_mode == AFF_AFFINITY) {
-    /* 每 chip 连续发 2 个分片再换：1,1,2,2,1,1,2,2,...（20 分片 = 10+10） */
-    *src = *dst = ((chunk_in_req / 2) % 2 == 0) ? 1 : 2;
+    *src = *dst = (group_in_req % 2 == 0) ? 1 : 2;
   } else if (args->affinity_mode == AFF_ANTI) {
     int all_cpus[MAX_CPUS];
     int n_all = enumerate_all_cpus(all_cpus, MAX_CPUS);
@@ -640,48 +647,60 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   return (ok_a && ok_b) ? 0 : -1;
 }
 
-/* ---------------- write 分片流水线（80MB 请求 = 20 × 4MB 分片） ------------- */
+/* ---------------- write 流水线（80MB 请求 = 10 × 8MB 组 = 20 × 4MB WR） ---- */
 
-/* post 一个分片到指定槽（jetty 已由调用方取到）：事件槽 + PostWrite + 登记 */
-static int post_one_chunk(context_t *ctx, worker_t *w, uint32_t slot_idx,
+/* post 一个 8M 组到指定槽（jetty 已由调用方取到）：组内 2 条 4M WR 用同一
+ * jetty、同一 chip（src==dst），事件槽 ×2 + PostWrite ×2 + 登记 */
+static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
                           const std::shared_ptr<kv_bench::UrmaJetty> &jetty,
-                          uint64_t chunk_seq) {
+                          uint64_t group_seq) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
-  uint32_t window_chunks =
-      (uint32_t)(KV_CHUNKS_PER_REQ *
+  uint32_t window_groups =
+      (uint32_t)(KV_GROUPS_PER_REQ *
                  (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
-  uint64_t off = (chunk_seq % window_chunks) * KV_CHUNK_SIZE;
-  uint64_t remote = conn.RemoteSegVa() + (off % SERVER_PIPE_BYTES);
+  uint64_t base_off = (group_seq % window_groups) * KV_GROUP_SIZE;
+  uint64_t remote_base = conn.RemoteSegVa() + (base_off % SERVER_PIPE_BYTES);
 
   int src, dst;
-  pick_chunk_chip(args, w, (uint32_t)(chunk_seq % KV_CHUNKS_PER_REQ), &src,
+  pick_group_chip(args, w, (uint32_t)(group_seq % KV_GROUPS_PER_REQ), &src,
                   &dst);
 
-  uint64_t seq = 0;
-  uint64_t ue = mgr->PostEvent(w->id, seq);
-  if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off, remote,
-                      (uint32_t)KV_CHUNK_SIZE, (uint32_t)src, (uint32_t)dst,
-                      ue)) {
-    fprintf(stderr, "[pipe] post chunk %llu failed (src=%d dst=%d)\n",
-            (unsigned long long)chunk_seq, src, dst);
-    mgr->AbortEvent(w->id, seq);
+  uint64_t seq_a = 0, seq_b = 0;
+  uint64_t ua = mgr->PostEvent(w->id, seq_a);
+  uint64_t ub = mgr->PostEvent(w->id, seq_b);
+  if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + base_off,
+                      remote_base, (uint32_t)KV_CHUNK_SIZE, (uint32_t)src,
+                      (uint32_t)dst, ua)) {
+    fprintf(stderr, "[pipe] post group %llu WR-A failed (src=%d dst=%d)\n",
+            (unsigned long long)group_seq, src, dst);
+    mgr->AbortEvent(w->id, seq_a);
+    return -1;
+  }
+  if (!mgr->PostWrite(jetty, conn,
+                      (uint64_t)ctx->client_data + base_off + KV_CHUNK_SIZE,
+                      remote_base + KV_CHUNK_SIZE, (uint32_t)KV_CHUNK_SIZE,
+                      (uint32_t)src, (uint32_t)dst, ub)) {
+    fprintf(stderr, "[pipe] post group %llu WR-B failed (src=%d dst=%d)\n",
+            (unsigned long long)group_seq, src, dst);
+    mgr->AbortEvent(w->id, seq_b);
+    (void)mgr->WaitEvent(w->id, seq_a, args->timeout_ms); /* 等 A 完成避免残留 */
     return -1;
   }
   wr_slot_t *s = &w->wr_slots[slot_idx];
-  s->ue = ue;
-  s->seq = seq;
+  s->seq_a = seq_a;
+  s->seq_b = seq_b;
   s->jetty = jetty;
-  s->chunk_seq = chunk_seq;
+  s->group_seq = group_seq;
   s->active = true;
   return 0;
 }
 
-/* write 分片流水线主循环（jetty 池驱动）：
- * 有请求就一直发分片（每分片取一条新 jetty），取不到可用 jetty（池空）就
- * 等待在飞分片完成释放 jetty 后继续；--concurrency 限制同时在飞请求数 ≤ N；
- * 时延按请求（20 分片全完成）记录。 */
+/* write 流水线主循环（jetty 池驱动，精简 yuanrong pipeline）：
+ * 有请求就一直发 8M 组（每组 1 条 jetty、2 条 4M WR），取不到可用 jetty（池空）
+ * 就等待在飞组完成释放 jetty 后继续；--concurrency 限制同时在飞请求数 ≤ N；
+ * 时延按请求（10 组全完成）记录。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;
@@ -699,36 +718,39 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   }
   uint64_t next_req_ns = now_ns();
 
-  uint64_t chunk_seq = 0; /* 本线程全局分片序号（请求 id = chunk_seq/20） */
+  uint64_t group_seq = 0; /* 本线程全局 8M 组序号（请求 id = group_seq/10） */
   uint32_t req_active = 0; /* 同时在飞请求数（≤ concurrency） */
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
 
-    /* 1. 收完成：扫描全部在飞槽，完成的记账并归还 jetty（腾出池容量） */
+    /* 1. 收完成：扫描全部在飞槽，组内 2 条 WR 都完成才释放 jetty */
     for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
       wr_slot_t *s = &w->wr_slots[i];
       if (!s->active)
         continue;
-      int r = mgr->ProbeEvent(w->id, s->seq);
-      if (r == 0)
-        continue;
-      progressed = true;
-      if (r < 0) {
-        fprintf(stderr, "[pipe] chunk %llu failed (seq=%llu), aborting\n",
-                (unsigned long long)s->chunk_seq,
-                (unsigned long long)s->seq);
+      int ra = mgr->ProbeEvent(w->id, s->seq_a);
+      int rb = mgr->ProbeEvent(w->id, s->seq_b);
+      if (ra == -1 || rb == -1) {
+        fprintf(stderr,
+                "[pipe] group %llu WR failed (seq_a=%llu seq_b=%llu), "
+                "aborting\n",
+                (unsigned long long)s->group_seq,
+                (unsigned long long)s->seq_a, (unsigned long long)s->seq_b);
         return -1;
       }
-      __atomic_add_fetch(&w->bytes, KV_CHUNK_SIZE, __ATOMIC_RELAXED);
+      if (ra == 0 || rb == 0)
+        continue; /* 未全部完成 */
+      progressed = true;
+      __atomic_add_fetch(&w->bytes, KV_GROUP_SIZE, __ATOMIC_RELAXED);
       mgr->ReleaseSendLane(s->jetty);
       s->jetty.reset();
       s->active = false;
-      /* 请求级完成判定（该请求 20 分片全部完成） */
-      uint64_t req_id = s->chunk_seq / KV_CHUNKS_PER_REQ;
+      /* 请求级完成判定（该请求 10 组全部完成） */
+      uint64_t req_id = s->group_seq / KV_GROUPS_PER_REQ;
       uint32_t ri = (uint32_t)(req_id % concurrency);
       w->req_done[ri]++;
-      if (s->chunk_seq % KV_CHUNKS_PER_REQ == KV_CHUNKS_PER_REQ - 1) {
+      if (s->group_seq % KV_GROUPS_PER_REQ == KV_GROUPS_PER_REQ - 1) {
         kv_hist_record(&w->hist, now_ns() - w->req_start[ri]);
         __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
         if (req_active > 0)
@@ -738,7 +760,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
     /* 2. 发送：有请求就一直发，直到取不到可用 jetty（池空）或达到并发度上限 */
     while (now_ns() < deadline && !ctx->fatal) {
-      if (chunk_seq % KV_CHUNKS_PER_REQ == 0) {
+      if (group_seq % KV_GROUPS_PER_REQ == 0) {
         /* 新请求边界：qps 节流 + 并发度上限检查 */
         if (req_active >= concurrency)
           break; /* 并发度满，等请求完成腾名额 */
@@ -752,7 +774,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           }
           next_req_ns = now_ns() + interval_ns;
         }
-        uint64_t rid = chunk_seq / KV_CHUNKS_PER_REQ;
+        uint64_t rid = group_seq / KV_GROUPS_PER_REQ;
         w->req_start[rid % concurrency] = now_ns();
         w->req_done[rid % concurrency] = 0;
         req_active++;
@@ -766,28 +788,29 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         }
       }
       if (slot == KV_MAX_WR_SLOTS)
-        break; /* 槽满（池 ≤ 200，理论不会） */
+        break; /* 槽满（池 ≤ 100，理论不会） */
       std::shared_ptr<kv_bench::UrmaJetty> jetty;
       if (!mgr->AcquireSendLane(jetty))
-        break; /* 池空：等待在飞分片完成释放 */
-      if (post_one_chunk(ctx, w, slot, jetty, chunk_seq) != 0) {
+        break; /* 池空：等待在飞组完成释放 */
+      if (post_one_group(ctx, w, slot, jetty, group_seq) != 0) {
         mgr->ReleaseSendLane(jetty);
         return -1;
       }
       progressed = true;
-      chunk_seq++;
+      group_seq++;
     }
 
     if (!progressed)
       sleep_ns(POLL_SLEEP_NS);
   }
 
-  /* 收尾：等剩余在飞分片完成（或超时）并归还 jetty，避免退出时在飞
+  /* 收尾：等剩余在飞组完成（或超时）并归还 jetty，避免退出时在飞
    * WR / 未归还 lane 残留 */
   for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
     wr_slot_t *s = &w->wr_slots[i];
     if (s->active) {
-      (void)mgr->WaitEvent(w->id, s->seq, args->timeout_ms);
+      (void)mgr->WaitEvent(w->id, s->seq_a, args->timeout_ms);
+      (void)mgr->WaitEvent(w->id, s->seq_b, args->timeout_ms);
       mgr->ReleaseSendLane(s->jetty);
       s->jetty.reset();
       s->active = false;
@@ -985,16 +1008,18 @@ static void print_client_summary(context_t *ctx, double seconds) {
          " concurrency=%d affinity=%s "
          "jetty_count=%u duration=%.1fs ====\n",
          op_name(args->op), args->threads,
-         args->op == OP_WRITE ? KV_CHUNK_SIZE : args->value_size,
+         args->op == OP_WRITE ? KV_GROUP_SIZE : args->value_size,
          args->concurrency, aff_name(args->affinity_mode),
          ctx->mgr->Resource().SendJettyCount(), seconds);
   double iops = seconds > 0 ? (double)ops / seconds : 0.0;
   double bw_mb_s =
       seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
   double bw_mbps = bw_mb_s * 8.0;                        /* 小 b: Mb/s */
-  /* wr_rate：write = 请求 × 20 分片（分片 WR/秒）；get/mixed = 请求 × 1 READ/WR */
-  double wr_rate = iops * (args->op == OP_WRITE ? (double)KV_CHUNKS_PER_REQ
-                                                : 1.0);
+  /* wr_rate：write = 请求 × 20 条 4M WR（WR/秒）；get/mixed = 请求 × 1 */
+  double wr_rate =
+      iops * (args->op == OP_WRITE
+                  ? (double)(KV_WR_PER_GROUP * KV_GROUPS_PER_REQ)
+                  : 1.0);
   printf("requests=%" PRIu64
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
@@ -1139,11 +1164,11 @@ static int run_client(const argument_t *args) {
   int sockfd = -1;
   pthread_t sampler_thread = 0;
 
-  /* jetty 池 ≥ max(线程数, write 分片流水线窗口 20×并发度) */
+  /* jetty 池 ≥ max(线程数, write 8M 组流水线窗口 10×并发度) */
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
     uint32_t pipe =
-        (uint32_t)(KV_CHUNKS_PER_REQ *
+        (uint32_t)(KV_GROUPS_PER_REQ *
                    (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1));
     if (pipe > min_lanes)
       min_lanes = pipe;
@@ -1734,19 +1759,20 @@ static int run_chip_query(const argument_t *args) {
       }
       printf("  worker %u: src_a=%d src_b=%d dst=%d\n", i, sa, sb, dst);
     }
-    printf("== write 分片 chip 分配 (mode=%s, 每请求 %d 分片) ==\n",
-           mode_names[m], KV_CHUNKS_PER_REQ);
+    printf("== write 8M 组 chip 分配 (mode=%s, 每请求 %d 组, 每组 2 条 4M WR "
+           "同 chip) ==\n",
+           mode_names[m], KV_GROUPS_PER_REQ);
     for (uint32_t i = 0; i < workers; i++) {
       worker_t w{};
       w.id = i;
       w.rng = tmp.seed + i * 2654435761u;
       printf("  worker %u: ", i);
-      for (uint32_t j = 0; j < KV_CHUNKS_PER_REQ; j++) {
+      for (uint32_t j = 0; j < KV_GROUPS_PER_REQ; j++) {
         int src, dst;
-        pick_chunk_chip(&tmp, &w, j, &src, &dst);
-        printf("%d%s", src, (j + 1 < KV_CHUNKS_PER_REQ) ? "," : "");
+        pick_group_chip(&tmp, &w, j, &src, &dst);
+        printf("%d%s", src, (j + 1 < KV_GROUPS_PER_REQ) ? "," : "");
       }
-      printf(" (src==dst)\n");
+      printf(" (组 chip, src==dst)\n");
     }
   }
   return 0;
