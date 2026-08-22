@@ -90,7 +90,8 @@ typedef struct argument {
   bool cacheable;
   uint32_t threads;
   int concurrency; /* write 并发度 1..10（req）/ 1..100（group），默认 1 */
-  int concurrency_unit; /* 0=req_group：在飞请求数（窗口=10×N 组）；1=req：在飞 8M 组数 */
+  int concurrency_unit; /* 0=req_group：在飞批次数（窗口=10×N 请求）；1=req：在飞请求数 */
+  bool batch_sync; /* 批同步：一批 10 请求发完→等全部完成→下一批（批时延干净） */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst） */
   int op;
   uint32_t mixed_ratio;
@@ -823,6 +824,11 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
     /* 2. 发送：有请求就一直发，直到在飞组达上限（unit 决定）或池空 */
     while (now_ns() < deadline && !ctx->fatal) {
+      /* 批同步：上一批未全部完成（req_active > 0）不开始新批，
+       * 批时延 = 一批 10 请求独占传输 ≈ 890us @90GB/s，分布集中 */
+      if (args->batch_sync && group_seq % KV_GROUPS_PER_REQ == 0 &&
+          req_active > 0)
+        break;
       if (inflight_groups >= max_inflight_groups)
         break; /* 在飞组数达上限，等组完成腾窗口 */
       if (group_seq % KV_GROUPS_PER_REQ == 0) {
@@ -1535,6 +1541,7 @@ static struct option g_long_options[] = {
     {"query-chips", no_argument, NULL, 1024},
     {"concurrency", required_argument, NULL, 1025},
     {"concurrency-unit", required_argument, NULL, 1027},
+    {"batch-sync", no_argument, NULL, 1028},
     {"single-chip", required_argument, NULL, 1026},
     {NULL, 0, NULL, 0}};
 
@@ -1568,6 +1575,8 @@ static void usage(void) {
          "or 1..100 (unit=req), default 1\n");
   printf("      --concurrency-unit <u> req|req_group: req = inflight 8M requests; "
          "req_group = inflight batches (10 x 8M requests)\n");
+  printf("      --batch-sync          one batch (10 x 8M) completes before next "
+         "starts; clean batch latency\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
@@ -1661,7 +1670,8 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->affinity_mode = AFF_NONE;
   args->threads = 1;
   args->concurrency = 1;
-  args->concurrency_unit = 0; /* 默认 req_group：在飞请求数 */
+  args->concurrency_unit = 0; /* 默认 req_group：在飞批次数 */
+  args->batch_sync = false;
   args->single_chip = 0;
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
@@ -1793,6 +1803,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       break;
     case 1026:
       args->single_chip = (int)strtol(optarg, NULL, 0);
+      break;
+    case 1028:
+      args->batch_sync = true;
       break;
     default:
       usage();
