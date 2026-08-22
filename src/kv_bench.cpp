@@ -111,6 +111,8 @@ typedef struct wr_slot {
   uint64_t seq_a;                             /* WR-A 事件 seq */
   uint64_t seq_b;                             /* WR-B 事件 seq */
   uint64_t group_seq;                         /* 8M 组全局序号（请求 id = /10） */
+  bool done_a;                                /* WR-A 已完成（槽已复位，持久） */
+  bool done_b;                                /* WR-B 已完成 */
   bool active;
 } wr_slot_t;
 
@@ -693,6 +695,8 @@ static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
   s->seq_b = seq_b;
   s->jetty = jetty;
   s->group_seq = group_seq;
+  s->done_a = false;
+  s->done_b = false;
   s->active = true;
   return 0;
 }
@@ -724,24 +728,43 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
 
-    /* 1. 收完成：扫描全部在飞槽，组内 2 条 WR 都完成才释放 jetty */
+    /* 1. 收完成：扫描全部在飞槽，组内 2 条 WR 都完成才释放 jetty。
+     * 完成状态持久化（done_a/done_b）：ProbeEvent 成功即复位槽，不能依赖
+     * 单轮探测结果，否则 A/B 完成不同步时组永不判定完成 */
     for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
       wr_slot_t *s = &w->wr_slots[i];
       if (!s->active)
         continue;
-      int ra = mgr->ProbeEvent(w->id, s->seq_a);
-      int rb = mgr->ProbeEvent(w->id, s->seq_b);
-      if (ra == -1 || rb == -1) {
-        fprintf(stderr,
-                "[pipe] group %llu WR failed (seq_a=%llu seq_b=%llu), "
-                "aborting\n",
-                (unsigned long long)s->group_seq,
-                (unsigned long long)s->seq_a, (unsigned long long)s->seq_b);
-        return -1;
+      if (!s->done_a) {
+        int ra = mgr->ProbeEvent(w->id, s->seq_a);
+        if (ra == -1) {
+          fprintf(stderr,
+                  "[pipe] group %llu WR-A failed (seq=%llu), aborting\n",
+                  (unsigned long long)s->group_seq,
+                  (unsigned long long)s->seq_a);
+          return -1;
+        }
+        if (ra == 1) {
+          s->done_a = true;
+          progressed = true;
+        }
       }
-      if (ra == 0 || rb == 0)
+      if (!s->done_b) {
+        int rb = mgr->ProbeEvent(w->id, s->seq_b);
+        if (rb == -1) {
+          fprintf(stderr,
+                  "[pipe] group %llu WR-B failed (seq=%llu), aborting\n",
+                  (unsigned long long)s->group_seq,
+                  (unsigned long long)s->seq_b);
+          return -1;
+        }
+        if (rb == 1) {
+          s->done_b = true;
+          progressed = true;
+        }
+      }
+      if (!s->done_a || !s->done_b)
         continue; /* 未全部完成 */
-      progressed = true;
       __atomic_add_fetch(&w->bytes, KV_GROUP_SIZE, __ATOMIC_RELAXED);
       mgr->ReleaseSendLane(s->jetty);
       s->jetty.reset();
