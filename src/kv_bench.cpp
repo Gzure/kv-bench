@@ -1881,36 +1881,22 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
  * CPU->NUMA->chip 拓扑、source/destination 列表的 chip，以及三种亲和模式下
  * pick_round_chips 会选出的 src_a/src_b/dst，便于核对配置。 */
 static int run_chip_query(const argument_t *args) {
-  printf("== CPU -> NUMA -> chip (system topology) ==\n");
+  /* 只打印结果：实际选中的 source/destination CPU（含自动选择）+ chip 路由结果 */
+  printf("== source-cpus (client, %s) ==\n",
+         args->source_cpus ? "explicit" : "auto-selected");
   {
     int cpus[MAX_CPUS];
-    int n = enumerate_all_cpus(cpus, MAX_CPUS);
+    int n = my_cpu_list(args, true, cpus, MAX_CPUS); /* 含自动选择 */
     for (int i = 0; i < n; i++) {
       printf("  cpu %4d -> numa %2d -> chip %d\n", cpus[i],
              read_cpu_numa(cpus[i]), cpu_to_chip(cpus[i]));
     }
   }
-  printf("== source-cpus (client side) ==\n");
+  printf("== destination-cpus (server, %s) ==\n",
+         args->destination_cpus ? "explicit" : "auto-selected");
   {
     int cpus[MAX_CPUS];
-    int n = parse_cpu_list(args->source_cpus, cpus, MAX_CPUS);
-    if (n == 0) {
-      n = enumerate_all_cpus(cpus, MAX_CPUS);
-      printf("  (--source-cpus not set; using all cpus)\n");
-    }
-    for (int i = 0; i < n; i++) {
-      printf("  cpu %4d -> numa %2d -> chip %d\n", cpus[i],
-             read_cpu_numa(cpus[i]), cpu_to_chip(cpus[i]));
-    }
-  }
-  printf("== destination-cpus (server side) ==\n");
-  {
-    int cpus[MAX_CPUS];
-    int n = parse_cpu_list(args->destination_cpus, cpus, MAX_CPUS);
-    if (n == 0) {
-      n = enumerate_all_cpus(cpus, MAX_CPUS);
-      printf("  (--destination-cpus not set; using all cpus)\n");
-    }
+    int n = my_cpu_list(args, false, cpus, MAX_CPUS); /* 含自动选择 */
     for (int i = 0; i < n; i++) {
       printf("  cpu %4d -> numa %2d -> chip %d\n", cpus[i],
              read_cpu_numa(cpus[i]), cpu_to_chip(cpus[i]));
