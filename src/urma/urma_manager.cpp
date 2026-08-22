@@ -428,12 +428,11 @@ void UrmaManager::PollThreadMain() {
         }
         CompleteEvent(wid, userCtx, crs[i].status == URMA_CR_SUCCESS);
       }
-    } else if (cnt == 0) {
-      SleepNs(kPollSleepNs);
-    } else {
+    } else if (cnt < 0) {
       fprintf(stderr, "Failed to poll jfc, ret=%d\n", cnt);
       SleepNs(1000 * kPollSleepNs);
     }
+    /* cnt == 0：无事件，忙轮询不退避，CQE 处理更及时（占 1 核） */
   }
 }
 
