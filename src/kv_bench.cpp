@@ -414,18 +414,10 @@ static int mbind_to_node(void *addr, size_t len, int node) {
  * 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
-  /* write：每线程数据区 = 在飞请求窗口 × 8MB（每请求同一 8M buffer 复用）；
-   * 窗口请求数 = req_group ? 并发度 : ceil(并发度/10)；
+  /* write：每线程数据区 = 在飞 1 请求的 8M buffer（同一块循环复用）；
    * get/mixed：value_size 窗口 */
-  uint64_t pipe_reqs =
-      (args->concurrency_unit == 1)
-          ? (uint64_t)((args->concurrency + KV_SENDS_PER_REQ - 1) /
-                       KV_SENDS_PER_REQ)
-          : (args->concurrency > 0 ? (uint64_t)args->concurrency : 1);
-  if (pipe_reqs < 1)
-    pipe_reqs = 1;
   uint64_t data_len = (args->op == OP_WRITE)
-                          ? (uint64_t)args->threads * pipe_reqs * KV_SEND_SIZE
+                          ? (uint64_t)args->threads * KV_SEND_SIZE
                           : (uint64_t)args->threads * DATA_WINDOW_PER_THREAD *
                                 args->value_size;
   ctx->data_len = data_len;
@@ -772,17 +764,8 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
-  /* 请求窗口（数据区复用）：req_group = 并发请求数；req = ceil(发送数/10) */
-  uint32_t window_reqs =
-      (args->concurrency_unit == 1)
-          ? (uint32_t)((args->concurrency + KV_SENDS_PER_REQ - 1) /
-                       KV_SENDS_PER_REQ)
-          : (uint32_t)(args->concurrency >= 1 ? (uint32_t)args->concurrency
-                                              : 1);
-  if (window_reqs < 1)
-    window_reqs = 1;
-  /* 同一 8M buffer（local 同一块；remote 10 次递增 8M 槽） */
-  uint64_t base_off = (req_seq % window_reqs) * KV_SEND_SIZE;
+  /* 在飞恒 1 请求：数据区窗口 = 1（同一 8M buffer 复用） */
+  uint64_t base_off = 0; /* (req_seq % 1) * KV_SEND_SIZE */
   uint64_t remote_base = conn.RemoteSegVa() + (base_off % SERVER_PIPE_BYTES);
 
   wr_slot_t *s = &w->wr_slots[slot_idx];
@@ -837,25 +820,18 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   return 0;
 }
 
-/* write 流水线主循环（jetty 池驱动）：
- * 请求 = 同一 8M buffer 发 10 次（chip 交替 1,2,1,2...，每次一条 8M WR，同 lane）。
- * 有请求就一直发，取不到 jetty（池空）等释放后继续；--concurrency 限制在飞
- * 请求数（req_group：≤N，每请求 10 次发送在飞；req：在飞发送数 ≤N）；
- * batch_sync（默认）：一个请求 10 次全完成才开始下一个请求（请求串行）；
- * 时延 = 请求第 1 次 post → 第 10 次 CQE 完成。 */
+/* write 流水线主循环：
+ * 请求 = 同一 8M buffer 发 10 次（chip 交替 1,2,1,2...），每次发送拆 2 条 4M WR
+ * （每条独立 jetty，20 条 WR/请求）。【真正在飞恒 1 个请求（20 条 4M WR）】，
+ * 一个请求 20 条全完成才开始下一个；--concurrency 只是排队请求数（背压/统计，
+ * 不改变在飞）；时延 = 请求第 1 条 WR post → 最后一条 CQE。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
-  bool unit_send = (args->concurrency_unit == 1);
-  uint32_t concurrency =
-      (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
-  /* 在飞请求数上限：req_group = N；req（发送数单位）= ceil(N/10) */
-  uint32_t max_inflight_reqs =
-      unit_send ? (concurrency + KV_SENDS_PER_REQ - 1) / KV_SENDS_PER_REQ
-                : concurrency;
-  if (max_inflight_reqs < 1)
-    max_inflight_reqs = 1;
+  (void)args->concurrency; /* 排队请求数，数据面恒 1 请求在飞 */
+  /* 在飞请求数上限：恒 1（真正在飞只有 20 条 4M WR） */
+  const uint32_t max_inflight_reqs = 1;
   uint64_t interval_ns = 0;
   if (args->qps > 0) {
     uint64_t per_thread = args->qps / args->threads;
@@ -866,7 +842,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   uint64_t next_req_ns = now_ns();
 
   uint64_t req_seq = 0;  /* 请求全局序号 */
-  uint32_t req_active = 0; /* 在飞请求数（≤ max_inflight_reqs） */
+  uint32_t req_active = 0; /* 在飞请求数（恒 ≤1） */
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
@@ -1336,17 +1312,8 @@ static int run_client(const argument_t *args) {
   /* jetty 池 ≥ max(线程数, write 在飞组窗口：req=10×并发度 / group=并发度) */
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
-    /* 池 ≥ 在飞请求数 × 20（每请求 20 条 4M WR，每条独立 jetty）：
-     * req_group = 并发度；req（发送数单位）= ceil(并发度/10) */
-    uint32_t reqs = (args->concurrency_unit == 1)
-                        ? (uint32_t)((args->concurrency + KV_SENDS_PER_REQ - 1) /
-                                     KV_SENDS_PER_REQ)
-                        : (uint32_t)(args->concurrency >= 1
-                                         ? (uint32_t)args->concurrency
-                                         : 1);
-    if (reqs < 1)
-      reqs = 1;
-    uint32_t pipe = reqs * KV_WR_PER_REQ;
+    /* 池 ≥ 20（在飞恒 1 请求 = 20 条 4M WR，每条独立 jetty） */
+    uint32_t pipe = KV_WR_PER_REQ;
     if (pipe > min_lanes)
       min_lanes = pipe;
   }
