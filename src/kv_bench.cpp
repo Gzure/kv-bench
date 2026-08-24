@@ -138,6 +138,10 @@ typedef struct worker {
   void *run_arg;
   /* write 分片流水线状态 */
   wr_slot_t wr_slots[KV_MAX_WR_SLOTS];
+  uint32_t active_slots[KV_MAX_WR_SLOTS]; /* 在飞槽下标（收完成只遍历这些） */
+  uint32_t active_count;                  /* 在飞槽数 */
+  uint32_t free_slots[KV_MAX_WR_SLOTS];   /* 空闲槽栈（发送 O(1) 取槽） */
+  uint32_t free_count;                    /* 空闲槽数 */
   uint64_t req_start[KV_MAX_CONCURRENCY]; /* 每在飞请求的开始时间（请求 id % N） */
   uint64_t req_done[KV_MAX_CONCURRENCY];  /* 每在飞请求已完成组数 */
 } worker_t;
@@ -808,6 +812,7 @@ static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
   s->done_a = false;
   s->done_b = false;
   s->active = true;
+  w->active_slots[w->active_count++] = slot_idx; /* 登记在飞槽 */
   return 0;
 }
 
@@ -846,13 +851,13 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
 
-    /* 1. 收完成：扫描全部在飞槽，组内 2 条 WR 都完成才释放 jetty。
-     * 完成状态持久化（done_a/done_b）：ProbeEvent 成功即复位槽，不能依赖
-     * 单轮探测结果，否则 A/B 完成不同步时组永不判定完成 */
-    for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
-      wr_slot_t *s = &w->wr_slots[i];
-      if (!s->active)
-        continue;
+    /* 1. 收完成：只遍历在飞槽列表（active_slots），组内 2 条 WR 都完成才
+     * 释放 jetty。完成状态持久化（done_a/done_b）：ProbeEvent 成功即复位槽，
+     * 不能依赖单轮探测结果，否则 A/B 完成不同步时组永不判定完成 */
+    uint32_t k = 0;
+    while (k < w->active_count) {
+      uint32_t idx = w->active_slots[k];
+      wr_slot_t *s = &w->wr_slots[idx];
       if (!s->done_a) {
         int ra = mgr->ProbeEvent(w->id, s->seq_a);
         if (ra == -1) {
@@ -881,8 +886,10 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           progressed = true;
         }
       }
-      if (!s->done_a || !s->done_b)
-        continue; /* 未全部完成 */
+      if (!s->done_a || !s->done_b) {
+        k++; /* 未全部完成，处理下一个在飞槽 */
+        continue;
+      }
       __atomic_add_fetch(&w->bytes, KV_GROUP_SIZE, __ATOMIC_RELAXED);
       mgr->ReleaseSendLane(s->jetty);
       s->jetty.reset();
@@ -902,6 +909,11 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         if (req_active > 0)
           req_active--;
       }
+      /* 完成槽：从在飞列表移除（末尾交换）+ 归还空闲栈 */
+      w->free_slots[w->free_count++] = idx;
+      w->active_slots[k] = w->active_slots[w->active_count - 1];
+      w->active_count--;
+      /* 不 k++：换进来的槽仍需处理 */
     }
 
     /* 2. 发送：有请求就一直发，直到在飞组达上限（unit 决定）或池空 */
@@ -932,21 +944,16 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         w->req_done[rid % KV_MAX_INFLIGHT_REQS] = 0;
         req_active++;
       }
-      /* 找空槽 */
-      uint32_t slot = KV_MAX_WR_SLOTS;
-      for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
-        if (!w->wr_slots[i].active) {
-          slot = i;
-          break;
-        }
-      }
-      if (slot == KV_MAX_WR_SLOTS)
+      /* 取空闲槽（O(1) 栈） */
+      if (w->free_count == 0)
         break; /* 槽满（≤ 100，理论不会） */
+      uint32_t slot = w->free_slots[--w->free_count];
       std::shared_ptr<kv_bench::UrmaJetty> jetty;
       if (!mgr->AcquireSendLane(jetty))
         break; /* 池空：等待在飞组完成释放 */
       if (post_one_group(ctx, w, slot, jetty, group_seq) != 0) {
         mgr->ReleaseSendLane(jetty);
+        w->free_slots[w->free_count++] = slot; /* 归还槽 */
         return -1;
       }
       progressed = true;
@@ -958,12 +965,11 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       sleep_ns(POLL_SLEEP_NS);
   }
 
-  /* 收尾：只等未完成的 WR（done_a/done_b 为 false 的）；已完成的槽已被
-   * ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty 避免残留 */
-  for (uint32_t i = 0; i < KV_MAX_WR_SLOTS; i++) {
-    wr_slot_t *s = &w->wr_slots[i];
-    if (!s->active)
-      continue;
+  /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done_a/done_b 为 false 的）；
+   * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty 避免残留 */
+  while (w->active_count > 0) {
+    uint32_t idx = w->active_slots[0];
+    wr_slot_t *s = &w->wr_slots[idx];
     if (!s->done_a)
       (void)mgr->WaitEvent(w->id, s->seq_a, args->timeout_ms);
     if (!s->done_b)
@@ -971,6 +977,9 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     mgr->ReleaseSendLane(s->jetty);
     s->jetty.reset();
     s->active = false;
+    w->free_slots[w->free_count++] = idx;
+    w->active_slots[0] = w->active_slots[w->active_count - 1];
+    w->active_count--;
   }
   return 0;
 }
@@ -1279,6 +1288,11 @@ static int create_workers(context_t *ctx, uint32_t count) {
     w->local_index = i;
     w->run_arg = ctx;
     w->rng = ctx->args.seed + i * 2654435761u;
+    /* 空闲槽栈初始化（write 流水线用） */
+    w->free_count = KV_MAX_WR_SLOTS;
+    for (uint32_t s = 0; s < KV_MAX_WR_SLOTS; s++) {
+      w->free_slots[s] = s;
+    }
     if (kv_hist_init(&w->hist, 1, 60ULL * 1000000000ULL, 3) != 0 ||
         kv_hist_init(&w->hist_req, 1, 60ULL * 1000000000ULL, 3) != 0)
       return -1;
