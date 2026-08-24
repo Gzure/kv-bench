@@ -1310,6 +1310,11 @@ static int run_client(const argument_t *args) {
   int sockfd = -1;
   pthread_t sampler_thread = 0;
 
+  /* 轮询线程绑核必须在 Init 之前（EnsurePollThread 在 Init 内启动）：
+   * --poll-cpu 或自动选空闲核（与打流 worker 区分开） */
+  ctx->mgr->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
+                                           : auto_poll_cpu(args, true));
+
   /* jetty 池 ≥ max(线程数, write 在飞组窗口：req=10×并发度 / group=并发度) */
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
@@ -1330,9 +1335,6 @@ static int run_client(const argument_t *args) {
     destroy_context(ctx, sockfd);
     return -1;
   }
-  /* 轮询线程绑核：--poll-cpu 或自动选空闲核（与打流 worker 区分开） */
-  ctx->mgr->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
-                                           : auto_poll_cpu(args, true));
   if (setup_buffer(ctx, false) != 0) {
     destroy_context(ctx, sockfd);
     return -1;
@@ -1544,15 +1546,16 @@ static int run_server(const argument_t *args) {
   ctx->stop = false;
   ctx->mgr = new kv_bench::UrmaManager();
 
+  /* 轮询线程绑核必须在 Init 之前（EnsurePollThread 在 Init 内启动） */
+  ctx->mgr->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
+                                           : auto_poll_cpu(args, false));
+
   if (!ctx->mgr->Init(args->dev_name, args->cacheable, args->jetty_count, 1,
                       args->event_mode, args->trans_mode)) {
     fprintf(stderr, "failed to init URMA manager\n");
     destroy_context(ctx, -1);
     return -1;
   }
-  /* 轮询线程绑核（服务器侧 worker 用 destination-cpus 选择） */
-  ctx->mgr->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
-                                           : auto_poll_cpu(args, false));
   if (setup_buffer(ctx, true) != 0) {
     destroy_context(ctx, -1);
     return -1;
