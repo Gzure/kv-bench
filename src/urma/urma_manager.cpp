@@ -90,13 +90,11 @@ int SockSyncData(int sockfd, int size, char *localData, char *remoteData) {
 // Build a BONDP work request. For WRITE, src SGEs describe local memory and dst
 // SGEs describe the remote (imported) memory; for READ (URMA_OPC_READ) the
 // caller passes src=dst-direction swapped SGEs (matching YuanRong PostJettyRw).
-static urma_jfs_wr_t *BuildBondpWr(bondp_jfs_wr_t *bondpWr,
-                                   urma_target_jetty_t *targetJetty,
-                                   urma_sge_t *srcSges, uint32_t numSges,
-                                   urma_sge_t *dstSges, uint64_t userContext,
-                                   uint32_t useDriverExt, uint32_t srcChipId,
-                                   uint32_t dstChipId, uint32_t fence,
-                                   urma_opcode_t opcode) {
+static urma_jfs_wr_t *
+BuildBondpWr(bondp_jfs_wr_t *bondpWr, urma_target_jetty_t *targetJetty,
+             urma_sge_t *srcSges, uint32_t numSges, urma_sge_t *dstSges,
+             uint64_t userContext, uint32_t useDriverExt, uint32_t srcChipId,
+             uint32_t dstChipId, uint32_t fence, urma_opcode_t opcode) {
   auto *wr = &bondpWr->base;
   wr->opcode = opcode;
   wr->flag.bs.complete_enable = 1;
@@ -160,9 +158,9 @@ PostJettyRd(urma_jetty_t *jetty, urma_target_jetty_t *targetJetty,
                           .tseg = remoteSeg,
                           .user_tseg = nullptr};
   bondp_jfs_wr_t bondpWr{};
-  urma_jfs_wr_t *wr = BuildBondpWr(
-      &bondpWr, targetJetty, &remoteSge, 1, &localSge, userContext,
-      useDriverExt, srcChipId, dstChipId, 0, URMA_OPC_READ);
+  urma_jfs_wr_t *wr =
+      BuildBondpWr(&bondpWr, targetJetty, &remoteSge, 1, &localSge, userContext,
+                   useDriverExt, srcChipId, dstChipId, 0, URMA_OPC_READ);
   return urma_post_jetty_send_wr(jetty, wr, badWr);
 }
 
@@ -520,9 +518,10 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
 
   /* import 对端 jetty（legacy handshake，对齐 yuanrong BuildRemoteJetty +
    * ImportTargetJetty）。
-   * 默认路径1（bonding/datasystem）: bondp_rjetty + tp_type=CTP + has_drv_ext=1；
-   * preferRtp 时直接走路径2（SDK 示例）: 普通 urma_rjetty + tp_type=RTP。
-   * bondp.jetty 传 nullptr（对齐参考 ImportRemoteJetty/FinalizeOutboundConnection）。 */
+   * 默认路径1（bonding/datasystem）: bondp_rjetty + tp_type=CTP +
+   * has_drv_ext=1； preferRtp 时直接走路径2（SDK 示例）: 普通 urma_rjetty +
+   * tp_type=RTP。 bondp.jetty 传 nullptr（对齐参考
+   * ImportRemoteJetty/FinalizeOutboundConnection）。 */
   bool okImport = false;
   if (preferRtp) {
     urma_rjetty_t rjetty;
@@ -568,8 +567,7 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   if (!okImport) {
     fprintf(stderr,
             "import remote jetty failed: id=%u eid=" EID_FMT " uasid=0x%x\n",
-            remoteWire.jetty_id.id, EID_ARGS(remoteWire.eid),
-            remoteWire.uasid);
+            remoteWire.jetty_id.id, EID_ARGS(remoteWire.eid), remoteWire.uasid);
     return false;
   }
   if (!resource_.ImportSegment(newConn->peer.seg, newConn->remoteSeg)) {
@@ -617,9 +615,9 @@ bool UrmaManager::PostWrite(const std::shared_ptr<UrmaJetty> &jetty,
     return false;
   }
   {
-    /* 前 2 条 WR 打印 sge/tseg 详情，便于定位 status=LOC_ACCESS_ERR 等失败 */
+    /* 前 4 条 WR 打印 sge/tseg 详情，便于定位 status=LOC_ACCESS_ERR 等失败 */
     static std::atomic<int> diagCnt{0};
-    if (diagCnt.fetch_add(1) < 2) {
+    if (diagCnt.fetch_add(1) < 4) {
       urma_seg_t *ls = &localSeg_->Raw()->seg;
       urma_seg_t *rs = &conn.remoteSeg->Raw()->seg;
       fprintf(stderr,
@@ -627,9 +625,9 @@ bool UrmaManager::PostWrite(const std::shared_ptr<UrmaJetty> &jetty,
               "local_tseg_va=0x%lx local_len=%llu remote_tseg_va=0x%lx "
               "remote_len=%llu jetty=%u target_jetty=0x%lx\n",
               (unsigned long)localAddr, (unsigned long)remoteAddr, len, srcChip,
-              dstChip, (unsigned long)ls->ubva.va,
-              (unsigned long long)ls->len, (unsigned long)rs->ubva.va,
-              (unsigned long long)rs->len, jetty->Raw()->jetty_id.id,
+              dstChip, (unsigned long)ls->ubva.va, (unsigned long long)ls->len,
+              (unsigned long)rs->ubva.va, (unsigned long long)rs->len,
+              jetty->Raw()->jetty_id.id,
               (unsigned long)conn.targetJetty->Raw());
     }
   }
