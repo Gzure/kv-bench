@@ -518,6 +518,21 @@ static int auto_select_cpus(const argument_t *args, bool is_client, int *out,
   uint32_t per = (target + 1) / 2;
   if (per < 1)
     per = 1;
+  /* 从每个 chip 的 CPU 池随机选（seed 驱动，同 seed 可复现），
+   * 避免固定选到最小 CPU（如 cpu 0）导致热点 */
+  uint32_t rng = args->seed ^ 0x9e3779b9u;
+  for (int i = 0; i < n1 && (uint32_t)i < per; i++) {
+    int j = i + (int)(rng_next(&rng) % (uint32_t)(n1 - i));
+    int tmp = c1[i];
+    c1[i] = c1[j];
+    c1[j] = tmp;
+  }
+  for (int i = 0; i < n2 && (uint32_t)i < per; i++) {
+    int j = i + (int)(rng_next(&rng) % (uint32_t)(n2 - i));
+    int tmp = c2[i];
+    c2[i] = c2[j];
+    c2[j] = tmp;
+  }
   int n = 0;
   for (int i = 0; i < n1 && (uint32_t)i < per && n < max_out; i++)
     out[n++] = c1[i];
@@ -549,10 +564,12 @@ static int first_dst_chip(const argument_t *args) {
   return -1;
 }
 
-/* 选一个不在 worker CPU 列表中的核（轮询线程用，避免与打流线程争抢） */
+/* 从不在 worker CPU 列表中的核里随机选一个（轮询线程用，seed 驱动可复现） */
 static int auto_poll_cpu(const argument_t *args, bool is_client) {
   int used[MAX_CPUS];
   int n_used = my_cpu_list(args, is_client, used, MAX_CPUS);
+  int free_cpus[MAX_CPUS];
+  int n_free = 0;
   int all[MAX_CPUS];
   int n_all = enumerate_all_cpus(all, MAX_CPUS);
   for (int i = 0; i < n_all; i++) {
@@ -564,9 +581,12 @@ static int auto_poll_cpu(const argument_t *args, bool is_client) {
       }
     }
     if (!in_used)
-      return all[i];
+      free_cpus[n_free++] = all[i];
   }
-  return -1;
+  if (n_free == 0)
+    return -1;
+  uint32_t rng = args->seed ^ 0x51ed270bu;
+  return free_cpus[rng_next(&rng) % (uint32_t)n_free];
 }
 
 static void pick_round_chips(const argument_t *args, bool is_client,
