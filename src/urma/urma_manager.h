@@ -102,6 +102,10 @@ public:
                         std::shared_ptr<UrmaConnection> &conn,
                         bool preferRtp = false);
 
+  /* 轮询线程绑核（-1 = 不绑，默认）。应与打流 worker 线程区分开，
+   * 避免忙轮询与打流线程争抢核 */
+  void SetPollCpu(int cpu) { pollCpu_ = cpu; }
+
   /* send lane：每轮（一次业务请求）从池取一条 jetty，用后归还（对齐 yuanrong
    * AcquireSendLane） */
   bool AcquireSendLane(std::shared_ptr<UrmaJetty> &jetty);
@@ -142,6 +146,8 @@ private:
   void *buf_{nullptr};
   uint64_t bufLen_{0};
   std::shared_ptr<UrmaLocalSegment> localSeg_;
+
+  int pollCpu_{-1}; /* 轮询线程绑核，-1 = 不绑 */
 
   std::vector<std::unique_ptr<EventSlots>> workerSlots_;
   mutable std::mutex workerMutex_;

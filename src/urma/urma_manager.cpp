@@ -397,6 +397,18 @@ bool UrmaManager::EnsurePollThread() {
 }
 
 void UrmaManager::PollThreadMain() {
+  /* 轮询线程绑核（与打流 worker 区分开），并打印所在 CPU */
+  if (pollCpu_ >= 0) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(pollCpu_, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+      fprintf(stderr, "Failed to pin poll thread to cpu %d: %s\n", pollCpu_,
+              strerror(errno));
+    } else {
+      printf("[poll] poll thread pinned to cpu %d\n", pollCpu_);
+    }
+  }
   urma_cr_t crs[kMaxPollCr];
   while (!stop_) {
     int cnt;

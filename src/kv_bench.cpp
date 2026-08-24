@@ -93,6 +93,7 @@ typedef struct argument {
   int concurrency_unit; /* 0=req_group：在飞批次数（窗口=10×N 请求）；1=req：在飞请求数 */
   bool batch_sync; /* 批同步：一批 10 请求发完→等全部完成→下一批（批时延干净） */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst） */
+  int poll_cpu;    /* 轮询线程绑核；-1 = 自动选空闲核 */
   int op;
   uint32_t mixed_ratio;
   uint32_t report_interval;
@@ -115,6 +116,7 @@ typedef struct wr_slot {
   uint64_t seq_a;                             /* WR-A 事件 seq */
   uint64_t seq_b;                             /* WR-B 事件 seq */
   uint64_t group_seq;                         /* 8M 请求全局序号（批次 id = /10） */
+  uint64_t post_ns;                           /* 请求发出时间（请求级时延起点） */
   bool done_a;                                /* WR-A 已完成（槽已复位，持久） */
   bool done_b;                                /* WR-B 已完成 */
   bool active;
@@ -123,7 +125,8 @@ typedef struct wr_slot {
 typedef struct worker {
   uint32_t id;          /* UrmaManager workerId（进程级全局） */
   uint32_t local_index; /* 本连接/本进程内序号 */
-  kv_hist_t hist;
+  kv_hist_t hist;       /* 批时延直方图（10 请求全完成记一次） */
+  kv_hist_t hist_req;   /* 请求级时延直方图（单个 8M 请求完成记一次） */
   volatile uint64_t ops;
   volatile uint64_t bytes;
   volatile uint64_t errors;
@@ -546,6 +549,26 @@ static int first_dst_chip(const argument_t *args) {
   return -1;
 }
 
+/* 选一个不在 worker CPU 列表中的核（轮询线程用，避免与打流线程争抢） */
+static int auto_poll_cpu(const argument_t *args, bool is_client) {
+  int used[MAX_CPUS];
+  int n_used = my_cpu_list(args, is_client, used, MAX_CPUS);
+  int all[MAX_CPUS];
+  int n_all = enumerate_all_cpus(all, MAX_CPUS);
+  for (int i = 0; i < n_all; i++) {
+    bool in_used = false;
+    for (int j = 0; j < n_used; j++) {
+      if (all[i] == used[j]) {
+        in_used = true;
+        break;
+      }
+    }
+    if (!in_used)
+      return all[i];
+  }
+  return -1;
+}
+
 static void pick_round_chips(const argument_t *args, bool is_client,
                              worker_t *w, int *src_a, int *src_b, int *dst) {
   int all_cpus[MAX_CPUS];
@@ -761,6 +784,7 @@ static int post_one_group(context_t *ctx, worker_t *w, uint32_t slot_idx,
   s->seq_b = seq_b;
   s->jetty = jetty;
   s->group_seq = group_seq;
+  s->post_ns = now_ns(); /* 请求级时延起点（2 条 WR post 完） */
   s->done_a = false;
   s->done_b = false;
   s->active = true;
@@ -843,6 +867,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       mgr->ReleaseSendLane(s->jetty);
       s->jetty.reset();
       s->active = false;
+      /* 请求级时延：单个 8M 请求发出 → 完成 */
+      kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
       if (inflight_groups > 0)
         inflight_groups--;
       /* 请求级完成判定：该请求 10 组【全部完成】才记时延（组完成乱序，
@@ -1103,13 +1129,15 @@ static const char *aff_name(int m) {
 
 static void print_client_summary(context_t *ctx, double seconds) {
   const argument_t *args = &ctx->args;
-  kv_hist_t merged;
-  if (kv_hist_init(&merged, 1, 60ULL * 1000000000ULL, 3) != 0) {
+  kv_hist_t merged, merged_req;
+  if (kv_hist_init(&merged, 1, 60ULL * 1000000000ULL, 3) != 0 ||
+      kv_hist_init(&merged_req, 1, 60ULL * 1000000000ULL, 3) != 0) {
     return;
   }
   uint64_t ops = 0, bytes = 0, errors = 0;
   for (uint32_t i = 0; i < ctx->worker_count; i++) {
     kv_hist_merge(&merged, &ctx->workers[i].hist);
+    kv_hist_merge(&merged_req, &ctx->workers[i].hist_req);
     ops += __atomic_load_n(&ctx->workers[i].ops, __ATOMIC_RELAXED);
     bytes += __atomic_load_n(&ctx->workers[i].bytes, __ATOMIC_RELAXED);
     errors += __atomic_load_n(&ctx->workers[i].errors, __ATOMIC_RELAXED);
@@ -1134,8 +1162,14 @@ static void print_client_summary(context_t *ctx, double seconds) {
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
          ops, iops, wr_rate, bw_mb_s, bw_mbps, bytes, errors);
-  print_latency_line_us("batch", &merged);
+  if (args->op == OP_WRITE) {
+    print_latency_line_us("batch", &merged);
+    print_latency_line_us("request", &merged_req);
+  } else {
+    print_latency_line_us("request", &merged);
+  }
   kv_hist_destroy(&merged);
+  kv_hist_destroy(&merged_req);
 }
 
 static void *client_sampler_main(void *arg) {
@@ -1225,7 +1259,8 @@ static int create_workers(context_t *ctx, uint32_t count) {
     w->local_index = i;
     w->run_arg = ctx;
     w->rng = ctx->args.seed + i * 2654435761u;
-    if (kv_hist_init(&w->hist, 1, 60ULL * 1000000000ULL, 3) != 0)
+    if (kv_hist_init(&w->hist, 1, 60ULL * 1000000000ULL, 3) != 0 ||
+        kv_hist_init(&w->hist_req, 1, 60ULL * 1000000000ULL, 3) != 0)
       return -1;
   }
   return 0;
@@ -1235,6 +1270,7 @@ static void free_bench_workers(context_t *ctx) {
   if (ctx->workers != NULL) {
     for (uint32_t i = 0; i < ctx->worker_count; i++) {
       kv_hist_destroy(&ctx->workers[i].hist);
+      kv_hist_destroy(&ctx->workers[i].hist_req);
     }
     delete[] ctx->workers;
     ctx->workers = NULL;
@@ -1294,6 +1330,9 @@ static int run_client(const argument_t *args) {
     destroy_context(ctx, sockfd);
     return -1;
   }
+  /* 轮询线程绑核：--poll-cpu 或自动选空闲核（与打流 worker 区分开） */
+  ctx->mgr->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
+                                           : auto_poll_cpu(args, true));
   if (setup_buffer(ctx, false) != 0) {
     destroy_context(ctx, sockfd);
     return -1;
@@ -1511,6 +1550,9 @@ static int run_server(const argument_t *args) {
     destroy_context(ctx, -1);
     return -1;
   }
+  /* 轮询线程绑核（服务器侧 worker 用 destination-cpus 选择） */
+  ctx->mgr->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
+                                           : auto_poll_cpu(args, false));
   if (setup_buffer(ctx, true) != 0) {
     destroy_context(ctx, -1);
     return -1;
@@ -1581,6 +1623,7 @@ static struct option g_long_options[] = {
     {"concurrency-unit", required_argument, NULL, 1027},
     {"batch-sync", no_argument, NULL, 1028},
     {"no-batch-sync", no_argument, NULL, 1029},
+    {"poll-cpu", required_argument, NULL, 1032},
     {"single-chip", required_argument, NULL, 1026},
     {NULL, 0, NULL, 0}};
 
@@ -1620,6 +1663,8 @@ static void usage(void) {
          "starts; clean batch latency (default on; --no-batch-sync to disable)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
+  printf("      --poll-cpu <n>         pin URMA poll thread to cpu (default: "
+         "auto pick a non-worker cpu)\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
   printf("      --mixed-ratio <pct>    write percentage in mixed mode (default "
          "50)\n");
@@ -1714,6 +1759,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->concurrency_unit = 0; /* 默认 req_group：在飞批次数 */
   args->batch_sync = true;    /* 默认批同步（一批完成才发下一批） */
   args->single_chip = 0;
+  args->poll_cpu = -1;        /* 默认自动选空闲核给轮询线程 */
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
   args->report_interval = 1;
@@ -1858,6 +1904,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       break;
     case 1029:
       args->batch_sync = false;
+      break;
+    case 1032:
+      args->poll_cpu = (int)strtol(optarg, NULL, 0);
       break;
     default:
       usage();

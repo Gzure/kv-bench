@@ -131,7 +131,11 @@ EINVAL 警告后继续）。
 ## 统计输出
 
 - 每线程 HdrHistogram-lite（ns 精度，3 位有效数字），汇总输出
-  `avg/min/p50/p90/p99/p999/p9999/pmax`（us）。
+  `avg/min/p50/p90/p99/p999/p9999/pmax`（us）。**write 输出两级时延**：
+  `batch`（一批 10 请求全完成）与 `request`（单个 8M 请求发出→完成），用于区分
+  批时延的 max 极值放大 vs 单请求底层抖动。
+- `--poll-cpu <n>`：URMA 轮询线程绑核（默认自动选一个非 worker 核，避免与
+  打流线程争抢）。
 - `--report-interval <s>` 周期打印瞬时 IOPS/带宽。
 - 汇总行含 requests/IOPS/WR 速率（write = 20×IOPS，get = 1×IOPS）/带宽（MB/s）/errors。
 
