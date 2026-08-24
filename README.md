@@ -89,21 +89,18 @@ kv_bench 打流线程
 
 ## 打流模型（write：请求 8MB，一次并发 10 个请求 = 80MB，精简 yuanrong pipeline）
 
-**一个 KV 请求 = 8MB（固定）**，每个请求 1 条 jetty、拆 **2 条 4MB WR**（同一
-jetty、同一 chip）。**一次并发发 10 个请求（共 80MB）**。亲和模式下**请求源==目的==
-同一 chip**，请求按批次内序号交替 chip1/chip2（第 1 个 8M chip1、第 2 个 8M
-chip2，10 个请求 = 5+5 均匀打散），两个 chip 的物理口同时满负荷：
+**一个 KV 请求 = 同一 8MB buffer 发 10 次**（chip 交替：第 1 次 chip1、第 2 次
+chip2、第 3 次 chip1...，5+5），**每次发送拆 2 条 4MB WR，每条 4MB WR 独立取一个
+jetty**（20 条 WR/请求）。10 次全部完成（20 条 CQE）才计一次请求：
 
-- **`--concurrency N` + `--concurrency-unit <req|req_group>`**：
-  - `req_group`（默认）：**在飞批次（10 个 8M 请求）数 ≤ N**（1~10；窗口 = 10×N 个请求）
-  - `req`：**在飞请求（8M）数 ≤ N**（1~100；窗口 = N 个请求）
-- **jetty 池驱动流水线**：有请求就一直发 8M 请求（每个取一条新 jetty）；**取不到可用
-  jetty（池空）就等待在飞请求完成释放后再继续**；请求内 2 条 WR 都完成才归还 jetty。
-  时延按**批次**记录（该批 10 个请求全部完成）。
-- 请求字节 = 8MB 固定；带宽 = 批数 × 80MB / elapsed；WR 速率 = 批 IOPS × 20。
-- **`--batch-sync`（默认开，`--no-batch-sync` 关闭）**：一批（10 个请求）全部完成才发
-  下一批；关闭时跨批流水线（完成一个请求补发一个），批时延含流水线排队 ≈ 2~3×传输时间。
-- **`--single-chip 1|2`**：单 chip 场景——所有请求固定走该 chip（src==dst），
+- 时延 = **第 1 条 WR post → 最后一条 CQE**（`request latency`）。
+- 带宽 = **8MB 数据/请求**（同一 8M 数据发 10 次，统计按 8M，与 80M 传输字节分开）。
+- **`--concurrency`**：在飞请求数（req_group 1..10）或在飞 4M WR 数（req 1..200）；
+  **`--batch-sync`（默认）**：一个请求 20 条全完成才开始下一个（请求串行）。
+- 池大小 ≥ `max(threads, 在飞请求 × 20)`（20 条 WR 各占一条 jetty）。
+- **`--concurrency-unit <req|req_group>`**：`req_group`（默认）= 在飞**请求**数（1~10）；
+  `req` = 在飞 **4M WR** 数（1~200，窗口 = ceil(N/20) 请求）。
+- **`--single-chip 1|2`**：单 chip 场景——所有发送固定走该 chip（src==dst），
   `--mbind` 时缓冲绑到该 chip 对应的 NUMA 节点（测单 chip 极限 + 内存亲和）。
 
 ## 操作类型

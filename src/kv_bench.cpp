@@ -49,13 +49,17 @@
   4 /* 客户端 data_len = threads * 4 * value_size（get/mixed 用） */
 #define SERVER_DATA_WINDOW 4
 
-/* write 流水线模型：一个请求 = 同一个 8MB buffer 发 10 次（chip 交替
- * 1,2,1,2...），每次一条 8MB WR（同一条 lane），10 次全完成 = 请求完成 */
-#define KV_SEND_SIZE (8UL * 1024 * 1024)  /* 每次发送 8MB（同一 buffer） */
-#define KV_SENDS_PER_REQ 10               /* 每请求发 10 次（chip 交替） */
+/* write 流水线模型：一个请求 = 同一 8MB buffer 发 10 次（chip 交替
+ * 1,2,1,2...），每次发送拆 2 条 4MB WR，【每条 4MB WR 一个独立 jetty】；
+ * 10 次全完成（20 条 WR）= 请求完成；带宽按 8MB 数据/请求统计 */
+#define KV_WR_SIZE (4UL * 1024 * 1024)   /* 单条 WR 4MB */
+#define KV_WR_PER_SEND 2                 /* 每次发送 8M = 2 条 4M WR */
+#define KV_SEND_SIZE (KV_WR_SIZE * KV_WR_PER_SEND)  /* 8MB（同一 buffer） */
+#define KV_SENDS_PER_REQ 10              /* 每请求发 10 次（chip 交替） */
+#define KV_WR_PER_REQ (KV_SENDS_PER_REQ * KV_WR_PER_SEND) /* 20 条 WR/请求 */
 #define KV_REQ_BYTES (KV_SEND_SIZE * KV_SENDS_PER_REQ) /* 80MB 传输字节 */
-#define KV_MAX_CONCURRENCY 10             /* --concurrency 上限：在飞请求数 */
-#define KV_MAX_WR_SLOTS KV_MAX_CONCURRENCY /* 槽 = 一个请求（10 次发送） */
+#define KV_MAX_CONCURRENCY 10            /* --concurrency 上限：在飞请求数 */
+#define KV_MAX_WR_SLOTS KV_MAX_CONCURRENCY /* 槽 = 一个请求（20 条 WR） */
 #define KV_MAX_INFLIGHT_REQS KV_MAX_CONCURRENCY
 
 /* 服务器数据区：容纳最大窗口（10 请求 × 10 次 × 8MB = 800MB），固定 */
@@ -107,14 +111,15 @@ typedef struct argument {
 
 typedef struct context context_t;
 
-/* write 流水线：一个在飞单元 = 一个请求（同一 8M buffer 发 10 次，chip 交替） */
+/* write 流水线：一个在飞单元 = 一个请求（同一 8M buffer 发 10 次 =
+ * 20 条 4M WR，每条 4M WR 独立 jetty，chip 按发送次数交替） */
 typedef struct wr_slot {
-  std::shared_ptr<kv_bench::UrmaJetty> jetty; /* 请求 lane（10 次发送共用） */
-  uint64_t seq[KV_SENDS_PER_REQ];             /* 10 次发送的事件 seq */
-  bool done[KV_SENDS_PER_REQ];                /* 各次发送完成标志（持久） */
-  uint8_t done_cnt;                           /* 已完成发送数（=10 请求完成） */
-  uint64_t req_seq;                           /* 请求全局序号 */
-  uint64_t post_ns;                           /* 第 1 次 post 时间（时延起点） */
+  std::shared_ptr<kv_bench::UrmaJetty> jetty[KV_WR_PER_REQ]; /* 每条 WR 独立 lane */
+  uint64_t seq[KV_WR_PER_REQ];            /* 20 条 WR 的事件 seq */
+  bool done[KV_WR_PER_REQ];               /* 各 WR 完成标志（持久） */
+  uint8_t done_cnt;                       /* 已完成 WR 数（=20 请求完成） */
+  uint64_t req_seq;                       /* 请求全局序号 */
+  uint64_t post_ns;                       /* 第 1 条 WR post 时间（时延起点） */
   bool active;
 } wr_slot_t;
 
@@ -760,10 +765,9 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
 
 /* ---------------- write 流水线（请求 = 同一 8M buffer 发 10 次） ------------ */
 
-/* post 一个请求到指定槽（jetty 已由调用方取到）：同一 8M buffer 发 10 次
- * （每次一条 8M WR，chip 交替，remote 递增），事件槽 ×10 + PostWrite ×10 + 登记 */
+/* post 一个请求到指定槽：同一 8M buffer 发 10 次（chip 交替），每次发送拆
+ * 2 条 4M WR、【每条 4M WR 独立取一个 jetty】；20 条 WR 全 post 后登记 */
 static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
-                        const std::shared_ptr<kv_bench::UrmaJetty> &jetty,
                         uint64_t req_seq) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
@@ -782,34 +786,53 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   uint64_t remote_base = conn.RemoteSegVa() + (base_off % SERVER_PIPE_BYTES);
 
   wr_slot_t *s = &w->wr_slots[slot_idx];
-  s->jetty = jetty;
   s->req_seq = req_seq;
   s->done_cnt = 0;
   s->active = true;
-  /* 10 次发送：chip 交替（第 1 次 chip1、第 2 次 chip2...） */
-  for (uint32_t i = 0; i < KV_SENDS_PER_REQ; i++) {
+  uint64_t first_post = now_ns(); /* 时延起点：第 1 条 WR post 前 */
+  /* 20 条 4M WR：send_idx = 第几次发送（chip 交替），half = 8M 前半/后半 */
+  for (uint32_t wr = 0; wr < KV_WR_PER_REQ; wr++) {
+    uint32_t send_idx = wr / KV_WR_PER_SEND;
+    uint32_t half = wr % KV_WR_PER_SEND;
     int src, dst;
-    pick_send_chip(args, w, i, &src, &dst);
-    uint64_t seq = 0;
-    uint64_t ue = mgr->PostEvent(w->id, seq);
-    if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + base_off,
-                        remote_base + (uint64_t)i * KV_SEND_SIZE,
-                        (uint32_t)KV_SEND_SIZE, (uint32_t)src, (uint32_t)dst,
-                        ue)) {
-      fprintf(stderr,
-              "[pipe] req %llu send %u failed (src=%d dst=%d), aborting\n",
-              (unsigned long long)req_seq, i, src, dst);
-      mgr->AbortEvent(w->id, seq);
-      for (uint32_t j = 0; j < i; j++) {
+    pick_send_chip(args, w, send_idx, &src, &dst);
+    std::shared_ptr<kv_bench::UrmaJetty> jetty;
+    if (!mgr->AcquireSendLane(jetty)) {
+      fprintf(stderr, "[pipe] req %llu lane exhausted at WR %u\n",
+              (unsigned long long)req_seq, wr);
+      /* 回滚已 post 的 WR */
+      for (uint32_t j = 0; j < wr; j++) {
         (void)mgr->WaitEvent(w->id, s->seq[j], args->timeout_ms);
+        mgr->ReleaseSendLane(s->jetty[j]);
       }
       s->active = false;
       return -1;
     }
-    s->seq[i] = seq;
-    s->done[i] = false;
+    uint64_t seq = 0;
+    uint64_t ue = mgr->PostEvent(w->id, seq);
+    if (!mgr->PostWrite(
+            jetty, conn,
+            (uint64_t)ctx->client_data + base_off + (uint64_t)half * KV_WR_SIZE,
+            remote_base + (uint64_t)send_idx * KV_SEND_SIZE +
+                (uint64_t)half * KV_WR_SIZE,
+            (uint32_t)KV_WR_SIZE, (uint32_t)src, (uint32_t)dst, ue)) {
+      fprintf(stderr,
+              "[pipe] req %llu WR %u (send %u) post failed, aborting\n",
+              (unsigned long long)req_seq, wr, send_idx);
+      mgr->AbortEvent(w->id, seq);
+      mgr->ReleaseSendLane(jetty);
+      for (uint32_t j = 0; j < wr; j++) {
+        (void)mgr->WaitEvent(w->id, s->seq[j], args->timeout_ms);
+        mgr->ReleaseSendLane(s->jetty[j]);
+      }
+      s->active = false;
+      return -1;
+    }
+    s->jetty[wr] = jetty;
+    s->seq[wr] = seq;
+    s->done[wr] = false;
   }
-  s->post_ns = now_ns(); /* 时延起点：第 1 次 post */
+  s->post_ns = first_post;
   w->active_slots[w->active_count++] = slot_idx; /* 登记在飞槽 */
   return 0;
 }
@@ -848,19 +871,19 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
 
-    /* 1. 收完成：只遍历在飞槽列表；每槽探测 10 次发送（done[i] 持久化，
-     * ProbeEvent 成功即复位槽不能依赖单轮结果），10 次全完成 = 请求完成 */
+    /* 1. 收完成：只遍历在飞槽列表；每槽探测 20 条 WR（done[i] 持久化，
+     * ProbeEvent 成功即复位槽不能依赖单轮结果），20 条全完成 = 请求完成 */
     uint32_t k = 0;
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
-      for (uint32_t i = 0; i < KV_SENDS_PER_REQ; i++) {
+      for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
         if (s->done[i])
           continue;
         int r = mgr->ProbeEvent(w->id, s->seq[i]);
         if (r == -1) {
           fprintf(stderr,
-                  "[pipe] req %llu send %u failed (seq=%llu), aborting\n",
+                  "[pipe] req %llu WR %u failed (seq=%llu), aborting\n",
                   (unsigned long long)s->req_seq, i,
                   (unsigned long long)s->seq[i]);
           return -1;
@@ -871,16 +894,19 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           progressed = true;
         }
       }
-      if (s->done_cnt < KV_SENDS_PER_REQ) {
+      if (s->done_cnt < KV_WR_PER_REQ) {
         k++; /* 请求未完成，处理下一个在飞槽 */
         continue;
       }
-      /* 请求完成：10 次发送全部完成 */
-      __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
-      mgr->ReleaseSendLane(s->jetty);
-      s->jetty.reset();
+      /* 请求完成：20 条 WR 全部完成；带宽按 8M 数据/请求统计（与 80M 传输
+       * 字节分开，时延见 hist_req） */
+      __atomic_add_fetch(&w->bytes, KV_SEND_SIZE, __ATOMIC_RELAXED);
+      for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
+        mgr->ReleaseSendLane(s->jetty[i]);
+        s->jetty[i].reset();
+      }
       s->active = false;
-      /* 请求级时延：第 1 次 post → 第 10 次 CQE */
+      /* 请求级时延：第 1 条 WR post → 最后一条 CQE */
       kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
       __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
       if (req_active > 0)
@@ -894,7 +920,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
     /* 2. 发送：有请求就一直发，直到在飞请求达上限或池空 */
     while (now_ns() < deadline && !ctx->fatal) {
-      /* batch_sync：一个请求 10 次全完成（req_active==0）才开始下一个 */
+      /* batch_sync：一个请求 20 条全完成（req_active==0）才开始下一个 */
       if (args->batch_sync && req_active > 0)
         break;
       if (req_active >= max_inflight_reqs)
@@ -913,11 +939,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       if (w->free_count == 0)
         break; /* 槽满（≤ 10，理论不会） */
       uint32_t slot = w->free_slots[--w->free_count];
-      std::shared_ptr<kv_bench::UrmaJetty> jetty;
-      if (!mgr->AcquireSendLane(jetty))
-        break; /* 池空：等待在飞请求完成释放 */
-      if (post_one_req(ctx, w, slot, jetty, req_seq) != 0) {
-        mgr->ReleaseSendLane(jetty);
+      if (post_one_req(ctx, w, slot, req_seq) != 0) {
         w->free_slots[w->free_count++] = slot; /* 归还槽 */
         return -1;
       }
@@ -930,17 +952,17 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       sleep_ns(POLL_SLEEP_NS);
   }
 
-  /* 收尾：只遍历在飞槽列表；只等未完成的发送（done[i] 为 false 的）；
+  /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
    * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty 避免残留 */
   while (w->active_count > 0) {
     uint32_t idx = w->active_slots[0];
     wr_slot_t *s = &w->wr_slots[idx];
-    for (uint32_t i = 0; i < KV_SENDS_PER_REQ; i++) {
+    for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
       if (!s->done[i])
         (void)mgr->WaitEvent(w->id, s->seq[i], args->timeout_ms);
+      mgr->ReleaseSendLane(s->jetty[i]);
+      s->jetty[i].reset();
     }
-    mgr->ReleaseSendLane(s->jetty);
-    s->jetty.reset();
     s->active = false;
     w->free_slots[w->free_count++] = idx;
     w->active_slots[0] = w->active_slots[w->active_count - 1];
@@ -1147,9 +1169,9 @@ static void print_client_summary(context_t *ctx, double seconds) {
   double bw_mb_s =
       seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
   double bw_mbps = bw_mb_s * 8.0;                        /* 小 b: Mb/s */
-  /* wr_rate：write = 请求 × 10 条 8M WR（10 次发送/请求）；get/mixed = ×1 */
+  /* wr_rate：write = 请求 × 20 条 4M WR；带宽按 8M 数据/请求统计 */
   double wr_rate =
-      iops * (args->op == OP_WRITE ? (double)KV_SENDS_PER_REQ : 1.0);
+      iops * (args->op == OP_WRITE ? (double)KV_WR_PER_REQ : 1.0);
   printf("requests=%" PRIu64
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
@@ -1314,16 +1336,17 @@ static int run_client(const argument_t *args) {
   /* jetty 池 ≥ max(线程数, write 在飞组窗口：req=10×并发度 / group=并发度) */
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
-    /* 池 ≥ 在飞请求数（每请求 1 条 lane）：
+    /* 池 ≥ 在飞请求数 × 20（每请求 20 条 4M WR，每条独立 jetty）：
      * req_group = 并发度；req（发送数单位）= ceil(并发度/10) */
-    uint32_t pipe = (args->concurrency_unit == 1)
+    uint32_t reqs = (args->concurrency_unit == 1)
                         ? (uint32_t)((args->concurrency + KV_SENDS_PER_REQ - 1) /
                                      KV_SENDS_PER_REQ)
                         : (uint32_t)(args->concurrency >= 1
                                          ? (uint32_t)args->concurrency
                                          : 1);
-    if (pipe < 1)
-      pipe = 1;
+    if (reqs < 1)
+      reqs = 1;
+    uint32_t pipe = reqs * KV_WR_PER_REQ;
     if (pipe > min_lanes)
       min_lanes = pipe;
   }
