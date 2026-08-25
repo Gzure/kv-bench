@@ -17,17 +17,19 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <vector>
 
+#include "event_slot_pool.h"
 #include "urma_api.h"
 #include "urma_resource.h"
 
 namespace kv_bench {
 
-constexpr uint32_t kEventSlotsPerWorker = 256;
+constexpr uint32_t kEventSlotsPerWorker = EventSlotPool::kSlotCount;
 constexpr uint32_t kMaxRegisteredWorkers = 1024;
 constexpr uint32_t kRidShift = 40;
 constexpr uint64_t kRidMask = (1ULL << kRidShift) - 1;
+static_assert(EventSlotPool::kSlotBits + 32 <= kRidShift,
+              "event token must fit below the worker-id bits");
 
 /* 握手参数（业务层传入，随控制面消息交换） */
 struct HandshakeParams {
@@ -44,8 +46,8 @@ struct UrmaPeerInfo {
   uint32_t uasid = 0;
   uint32_t jettyId = 0;
   uint32_t dstChip = kInvalidChip;
-  uint32_t threads = 1;  /* 对端打流线程数 */
-  uint32_t opCode = 0;   /* 对端 op（write/get/mixed） */
+  uint32_t threads = 1; /* 对端打流线程数 */
+  uint32_t opCode = 0;  /* 对端 op（write/get/mixed） */
   uint32_t valueSize = 0;
   urma_seg_t seg{};
 };
@@ -71,8 +73,8 @@ public:
   /* urma_init -> 设备发现(eid) -> UrmaResource::Init ->
    * (首个打流线程注册时起轮询线程) */
   bool Init(const std::string &devName, bool cacheable, uint32_t jettyCount,
-            uint32_t threadsMin, bool eventMode = false,
-            uint32_t transMode = 0, int eidIndex = -1); /* eidIndex<0 = 自动 */
+            uint32_t threadsMin, bool eventMode = false, uint32_t transMode = 0,
+            int eidIndex = -1); /* eidIndex<0 = 自动 */
   void Stop(); /* 停轮询线程 + 资源清理 + urma_uninit */
 
   UrmaResource &Resource() { return resource_; }
@@ -88,11 +90,12 @@ public:
   bool RegisterWorker(uint32_t &workerId);
   void UnregisterWorker(uint32_t workerId);
   uint32_t WorkerCount() const;
-  uint64_t PostEvent(uint32_t workerId, uint64_t &seq); /* 返回 user_ctx */
-  bool WaitEvent(uint32_t workerId, uint64_t seq, int timeoutMs);
+  uint64_t PostEvent(uint32_t workerId,
+                     uint64_t &eventToken); /* 返回 user_ctx */
+  bool WaitEvent(uint32_t workerId, uint64_t eventToken, int timeoutMs);
   /* 非阻塞探测事件槽：1=成功完成（槽已复位），-1=失败完成，0=未完成 */
-  int ProbeEvent(uint32_t workerId, uint64_t seq);
-  void AbortEvent(uint32_t workerId, uint64_t seq);
+  int ProbeEvent(uint32_t workerId, uint64_t eventToken);
+  void AbortEvent(uint32_t workerId, uint64_t eventToken);
 
   /* TCP 控制面握手：交换元信息 + import 对端 jetty/segment。
    * preferRtp=true 时用普通 RTP import（SDK 示例），跳过 bondp/CTP
@@ -123,11 +126,7 @@ public:
                 uint32_t srcChip, uint32_t dstChip, uint64_t userCtx);
 
 private:
-  struct EventSlots {
-    std::vector<uint64_t> slots;
-    std::atomic<uint64_t> localSeq{0};
-    explicit EventSlots(uint32_t count) : slots(count, 0) {}
-  };
+  using EventSlots = EventSlotPool;
 
   bool InitUrmaLib();
   bool EnsurePollThread();
@@ -135,8 +134,7 @@ private:
   EventSlots *GetEventSlots(uint32_t workerId) const;
   void CompleteEvent(uint32_t workerId, uint64_t userCtx, bool ok);
   bool Exchange(int sockfd, const HandshakeParams &params,
-                std::shared_ptr<UrmaConnection> &conn,
-                bool preferRtp = false);
+                std::shared_ptr<UrmaConnection> &conn, bool preferRtp = false);
   static int GetEidIndex(urma_device_t *dev);
 
   UrmaResource resource_;

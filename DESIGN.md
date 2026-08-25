@@ -133,17 +133,18 @@ client                                  server
 
 ```
 常量：kEventSlotsPerWorker = 256，kRidShift = 40，kRidMask = 2^40-1
-事件槽编码：user_ctx = (workerId << 40) | seq
-槽状态：seq<<2        （已登记，等待完成）
-        seq<<2 | 1    （成功完成）
-        seq<<2 | 2    （失败完成）
+事件 token：token = generation<<8 | slotIndex
+事件槽编码：user_ctx = (workerId << 40) | token
+槽状态：token<<2        （已登记，等待完成）
+        token<<2 | 1    （成功完成）
+        token<<2 | 2    （失败完成）
         0             （空闲/复位）
 ```
 
-- `PostEvent(workerId, seq)`：取本地 `localSeq++`，槽写 `seq<<2`（RELEASE），返回 `user_ctx`。
-- **轮询线程**（进程级单线程）：`urma_poll_jfc(jfc, 32, crs)` 循环，无事件 `SleepNs(1us)` 退避；`--event-mode` 时改 `urma_wait_jfc(1,100ms) + poll + ack + rearm`。每个 CQE 按 `user_ctx` 拆 `workerId/seq`，CAS 槽 `seq<<2 → seq<<2|1(成功)/|2(失败)`；失败 CQE 打日志。
-- `WaitEvent(workerId, seq, timeoutMs)`：轮询槽（ACQUIRE）至 doneOk/doneFail/超时，随后槽复位 0（允许复用）。
-- `AbortEvent`：post 失败时槽复位 0。
+- `PostEvent(workerId, token)`：从该 worker 的空闲槽栈取槽，递增槽 generation，登记 `token<<2`（RELEASE）；槽满时返回失败形成背压，绝不覆盖未消费事件。最大在飞 200 WR，小于 256 槽，并由 `static_assert` 约束。
+- **轮询线程**（进程级单线程）：`urma_poll_jfc(jfc, 32, crs)` 循环；每个 CQE 按 `user_ctx` 拆 `workerId/token`，仅在 generation 完全匹配时 CAS 到成功/失败完成态。迟到 CQE 无法命中新一代事件。
+- `ProbeEvent` / `WaitEvent`：消费完成态后才把槽归还空闲栈；`WaitEvent` 超时只取消同一代 token，并不取消已经提交给硬件的 WR。调用方不会把对应 lane 放回池中，而是隔离到连接销毁，避免迟到 WR 与新 WR 共用 lane。
+- `AbortEvent`：post 失败时仅取消完全匹配的 token，旧 token 不会清掉复用后的新事件。
 - 数据面（write 分片流水线）：每个分片 `PostWrite`（事件 ue）→ `ProbeEvent` 轮询完成 → 完成一个补发一个（见 §6.1）；get 为 `PostRead` 直接 READ（见 §6.3）。
 
 **send lane（每请求取新 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从 FIFO 空闲队列头部取下标，`Release` 从尾部归还——**每个请求都取到"新的" jetty**，多线程下天然分散。池大小 = `max(--jetty-count, threads, 在飞请求窗口)`。
@@ -295,7 +296,7 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
 ## 10. 错误处理与清理
 
 - **首错即中断**：客户端打流 / get READ 遇到第一个失败即置 `fatal` 标志并中止。
-- **超时**：`WaitEvent` 等待超时（`--timeout-ms`）→ 计 error、释放 lane。
+- **超时**：`WaitEvent` 等待超时（`--timeout-ms`）→ 计 error；对应 lane 不再复用，保留到连接销毁。
 - **TCP 无超时**：`connect()` 阻塞等待内核握手（SYN 重试约 2 分钟）；握手 `read()` 无限等待，对端关闭连接时报 `peer closed` 快速失败。
 - **清理顺序**（`destroy_context`）：
   1. `conn.reset()`（先 unimport 对端 target jetty/segment）；

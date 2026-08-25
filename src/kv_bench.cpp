@@ -37,7 +37,6 @@
 #include <time.h>
 #include <unistd.h>
 
-
 #define PAGE_SHIFT 12
 #define PAGE_SIZE (0x1 << PAGE_SHIFT) /* 4KB */
 #define DEFAULT_VALUE_SIZE (4UL * 1024 * 1024)
@@ -50,18 +49,25 @@
 #define SERVER_DATA_WINDOW 4
 
 /* write 流水线模型：一个请求 = 同一 local 8MB buffer 写入 remote 80MB 区域
+ *
  * 的 10 个连续 8MB 槽（chip 交替
- * 1,2,1,2...），每次发送拆 2 条 4MB WR，【每条 4MB WR 一个独立 jetty】；
- * 10 次全完成（20 条 WR）= 请求完成；带宽按 80MB 传输字节/请求统计 */
-#define KV_WR_SIZE (4UL * 1024 * 1024)   /* 单条 WR 4MB */
-#define KV_WR_PER_SEND 2                 /* 每次发送 8M = 2 条 4M WR */
-#define KV_SEND_SIZE (KV_WR_SIZE * KV_WR_PER_SEND)  /* 8MB（同一 buffer） */
-#define KV_SENDS_PER_REQ 10              /* 每请求发 10 次（chip 交替） */
+ * 1,2,1,2...），每次发送拆 2 条 4MB
+ * WR，【每条 4MB WR 一个独立 jetty】；
+ * 10 次全完成（20 条 WR）=
+ * 请求完成；带宽按 80MB 传输字节/请求统计 */
+#define KV_WR_SIZE (4UL * 1024 * 1024) /* 单条 WR 4MB */
+#define KV_WR_PER_SEND 2               /* 每次发送 8M = 2 条 4M WR */
+#define KV_SEND_SIZE (KV_WR_SIZE * KV_WR_PER_SEND) /* 8MB（同一 buffer） */
+#define KV_SENDS_PER_REQ 10 /* 每请求发 10 次（chip 交替） */
 #define KV_WR_PER_REQ (KV_SENDS_PER_REQ * KV_WR_PER_SEND) /* 20 条 WR/请求 */
 #define KV_REQ_BYTES (KV_SEND_SIZE * KV_SENDS_PER_REQ) /* 80MB 传输字节 */
-#define KV_MAX_CONCURRENCY 10            /* --concurrency 上限：在飞请求数 */
+#define KV_MAX_CONCURRENCY 10 /* --concurrency 上限：在飞请求数 */
 #define KV_MAX_WR_SLOTS KV_MAX_CONCURRENCY /* 槽 = 一个请求（20 条 WR） */
 #define KV_MAX_INFLIGHT_REQS KV_MAX_CONCURRENCY
+
+static_assert(KV_MAX_CONCURRENCY * KV_WR_PER_REQ <=
+                  kv_bench::kEventSlotsPerWorker,
+              "event slots must cover the maximum in-flight WR count");
 
 /* 服务器数据区：容纳最大窗口（10 请求 × 10 次 × 8MB = 800MB），固定 */
 #define SERVER_PIPE_BYTES                                                      \
@@ -79,7 +85,7 @@ enum { AFF_AFFINITY = 0, AFF_ANTI = 1, AFF_NONE = 2 };
 typedef struct argument {
   char *dev_name;
   char *dev_name2; /* 双设备模式：第二个物理设备名 */
-  bool dual_dev;   /* 双设备模式：2 设备 × 2 eid = 4 端口，4 条 4M 分发 */
+  bool dual_dev; /* 双设备模式：2 设备 × 2 eid = 4 端口，4 条 4M 分发 */
   char *server_ip;
   unsigned int server_port;
   unsigned int trans_mode; /* 0=RM 1=RC 2=UM 3=RS */
@@ -94,8 +100,9 @@ typedef struct argument {
   bool cacheable;
   uint32_t threads;
   int concurrency; /* write 在飞请求数 1..10，默认 1 */
-  int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst） */
-  int poll_cpu;    /* 轮询线程绑核；-1 = 自动选空闲核 */
+  int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst）
+                    */
+  int poll_cpu; /* 轮询线程绑核；-1 = 自动选空闲核 */
   int op;
   uint32_t mixed_ratio;
   uint32_t report_interval;
@@ -113,22 +120,24 @@ typedef struct argument {
 typedef struct context context_t;
 
 /* write 流水线：一个在飞单元 = 一个请求（local 8M 写 remote 80M =
- * 20 条 4M WR，每条 4M WR 独立 jetty，chip 按发送次数交替） */
+ * 20 条 4M
+ * WR，每条 4M WR 独立 jetty，chip 按发送次数交替） */
 typedef struct wr_slot {
-  std::shared_ptr<kv_bench::UrmaJetty> jetty[KV_WR_PER_REQ]; /* 每条 WR 独立 lane */
-  uint64_t seq[KV_WR_PER_REQ];            /* 20 条 WR 的事件 seq */
-  bool done[KV_WR_PER_REQ];               /* 各 WR 完成标志（持久） */
-  uint8_t done_cnt;                       /* 已完成 WR 数（=20 请求完成） */
-  uint64_t req_seq;                       /* 请求全局序号 */
-  uint64_t post_ns;                       /* 第 1 条 WR post 时间（时延起点） */
+  std::shared_ptr<kv_bench::UrmaJetty>
+      jetty[KV_WR_PER_REQ];            /* 每条 WR 独立 lane */
+  uint64_t event_token[KV_WR_PER_REQ]; /* 20 条 WR 的完成事件 token */
+  bool done[KV_WR_PER_REQ];            /* 各 WR 完成标志（持久） */
+  uint8_t done_cnt; /* 已完成 WR 数（=20 请求完成） */
+  uint64_t req_seq; /* 请求全局序号 */
+  uint64_t post_ns; /* 第 1 条 WR post 时间（时延起点） */
   bool active;
 } wr_slot_t;
 
 typedef struct worker {
   uint32_t id;          /* UrmaManager workerId（进程级全局） */
   uint32_t local_index; /* 本连接/本进程内序号 */
-  kv_hist_t hist;       /* 批时延直方图（10 请求全完成记一次） */
-  kv_hist_t hist_req;   /* 请求级时延直方图（单个 8M 请求完成记一次） */
+  kv_hist_t hist; /* 批时延直方图（10 请求全完成记一次） */
+  kv_hist_t hist_req; /* 请求级时延直方图（单个 8M 请求完成记一次） */
   volatile uint64_t ops;
   volatile uint64_t bytes;
   volatile uint64_t errors;
@@ -142,10 +151,11 @@ typedef struct worker {
   wr_slot_t wr_slots[KV_MAX_WR_SLOTS];
   uint32_t active_slots[KV_MAX_WR_SLOTS]; /* 在飞槽下标（收完成只遍历这些） */
   uint32_t active_count;                  /* 在飞槽数 */
-  uint32_t free_slots[KV_MAX_WR_SLOTS];   /* 空闲槽栈（发送 O(1) 取槽） */
-  uint32_t free_count;                    /* 空闲槽数 */
-  uint64_t req_start[KV_MAX_CONCURRENCY]; /* 每在飞请求的开始时间（请求 id % N） */
-  uint64_t req_done[KV_MAX_CONCURRENCY];  /* 每在飞请求已完成组数 */
+  uint32_t free_slots[KV_MAX_WR_SLOTS]; /* 空闲槽栈（发送 O(1) 取槽） */
+  uint32_t free_count;                  /* 空闲槽数 */
+  uint64_t
+      req_start[KV_MAX_CONCURRENCY]; /* 每在飞请求的开始时间（请求 id % N） */
+  uint64_t req_done[KV_MAX_CONCURRENCY]; /* 每在飞请求已完成组数 */
 } worker_t;
 
 typedef struct conn {
@@ -163,8 +173,8 @@ struct context {
 
   void *va; /* 整个注册缓冲 */
   uint64_t buf_len;
-  uint64_t data_len;     /* 客户端: 每线程数据窗口; 服务器: 数据区 */
-  uint8_t *client_data;  /* 数据区起始（客户端读缓冲/写源；服务器数据源） */
+  uint64_t data_len; /* 客户端: 每线程数据窗口; 服务器: 数据区 */
+  uint8_t *client_data; /* 数据区起始（客户端读缓冲/写源；服务器数据源） */
 
   worker_t *workers;
   uint32_t worker_count;
@@ -424,10 +434,10 @@ static int layout_client_buffer(context_t *ctx) {
   uint64_t window_reqs = (args->op == OP_WRITE && args->concurrency > 0)
                              ? (uint64_t)args->concurrency
                              : 1;
-  uint64_t data_len = (args->op == OP_WRITE)
-                          ? (uint64_t)args->threads * window_reqs * KV_SEND_SIZE
-                          : (uint64_t)args->threads * DATA_WINDOW_PER_THREAD *
-                                args->value_size;
+  uint64_t data_len =
+      (args->op == OP_WRITE)
+          ? (uint64_t)args->threads * window_reqs * KV_SEND_SIZE
+          : (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
   ctx->data_len = data_len;
   ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
   return 0;
@@ -438,9 +448,8 @@ static int layout_server_buffer(context_t *ctx) {
   uint64_t size = args->value_size;
   /* 服务器数据区：容纳 write 分片流水线最大窗口（10 并发 × 80MB = 800MB）；
    * get 为数据源（客户端 READ） */
-  ctx->data_len =
-      (args->op == OP_WRITE) ? SERVER_PIPE_BYTES
-                             : (uint64_t)SERVER_DATA_WINDOW * size;
+  ctx->data_len = (args->op == OP_WRITE) ? SERVER_PIPE_BYTES
+                                         : (uint64_t)SERVER_DATA_WINDOW * size;
   ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
   return 0;
 }
@@ -490,8 +499,7 @@ static int setup_buffer(context_t *ctx, bool is_server) {
                 "binding\n",
                 node);
       } else {
-        printf("mbind buffer (%" PRIu64 "B) to node %d\n", ctx->buf_len,
-               node);
+        printf("mbind buffer (%" PRIu64 "B) to node %d\n", ctx->buf_len, node);
       }
     }
   }
@@ -666,8 +674,8 @@ static void pick_round_chips(const argument_t *args, bool is_client,
  * affinity：源==目的==chip，分片在请求内序号 j → chip = j%2 ? 2 : 1（20 分片
  * 交替打散 = 10+10 均匀分两 chip）；anti：源随机、目的固定；none：全随机。 */
 /* write 8M 请求 chip 分配：请求内 2 条 4M WR 同一 chip（src==dst）。
- * affinity：请求间交替 — 第 1 个 8M chip1、第 2 个 8M chip2（一批 10 个 = 5+5）；
- * anti：src 随机、dst 固定；none：全随机。 */
+ * affinity：请求间交替 — 第 1 个 8M chip1、第 2 个 8M chip2（一批 10 个 =
+ * 5+5）； anti：src 随机、dst 固定；none：全随机。 */
 /* 请求内第 send_idx 次发送的 chip 分配（src==dst）：
  * affinity：10 次交替 — 第 1 次 chip1、第 2 次 chip2、第 3 次 chip1...（5+5）；
  * --single-chip：全部固定单 chip；anti：src 随机、dst 固定；none：全随机。 */
@@ -730,44 +738,67 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
     return -1;
   }
 
-  uint64_t seq_a, seq_b;
-  uint64_t ua = mgr->PostEvent(w->id, seq_a);
-  uint64_t ub = mgr->PostEvent(w->id, seq_b);
+  uint64_t token_a = 0, token_b = 0;
+  uint64_t ua = mgr->PostEvent(w->id, token_a);
+  if (ua == 0) {
+    fprintf(stderr, "[wr] event slots exhausted for A\n");
+    mgr->ReleaseSendLane(jetty);
+    return -1;
+  }
+  uint64_t ub = mgr->PostEvent(w->id, token_b);
+  if (ub == 0) {
+    fprintf(stderr, "[wr] event slots exhausted for B\n");
+    mgr->AbortEvent(w->id, token_a);
+    mgr->ReleaseSendLane(jetty);
+    return -1;
+  }
   if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_a, remote_a,
                       wr_len, (uint32_t)src_a, (uint32_t)dst_chip, ua)) {
     fprintf(stderr, "[wr] post A failed\n");
-    mgr->AbortEvent(w->id, seq_a);
+    mgr->AbortEvent(w->id, token_a);
+    mgr->AbortEvent(w->id, token_b);
     mgr->ReleaseSendLane(jetty);
     return -1;
   }
   if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_b, remote_b,
                       wr_len, (uint32_t)src_b, (uint32_t)dst_chip, ub)) {
     fprintf(stderr, "[wr] post B failed\n");
-    mgr->AbortEvent(w->id, seq_b);
-    (void)mgr->WaitEvent(w->id, seq_a,
-                         args->timeout_ms); /* 等 A 完成避免残留 */
-    mgr->ReleaseSendLane(jetty);
+    mgr->AbortEvent(w->id, token_b);
+    bool a_completed = mgr->WaitEvent(w->id, token_a, args->timeout_ms);
+    if (a_completed) {
+      mgr->ReleaseSendLane(jetty);
+    } else {
+      fprintf(stderr, "[wr] A did not complete; send lane quarantined\n");
+    }
     return -1;
   }
-  bool ok_a = mgr->WaitEvent(w->id, seq_a, args->timeout_ms);
-  bool ok_b = mgr->WaitEvent(w->id, seq_b, args->timeout_ms);
+  bool ok_a = mgr->WaitEvent(w->id, token_a, args->timeout_ms);
+  bool ok_b = mgr->WaitEvent(w->id, token_b, args->timeout_ms);
   if (!ok_a) {
-    fprintf(stderr, "[wr] wait A failed (seq=%lu, src_chip=%d, dst_chip=%d)\n",
-            (unsigned long)seq_a, src_a, dst_chip);
+    fprintf(stderr,
+            "[wr] wait A failed (token=%lu, src_chip=%d, dst_chip=%d)\n",
+            (unsigned long)token_a, src_a, dst_chip);
   }
   if (!ok_b) {
-    fprintf(stderr, "[wr] wait B failed (seq=%lu, src_chip=%d, dst_chip=%d)\n",
-            (unsigned long)seq_b, src_b, dst_chip);
+    fprintf(stderr,
+            "[wr] wait B failed (token=%lu, src_chip=%d, dst_chip=%d)\n",
+            (unsigned long)token_b, src_b, dst_chip);
   }
-  mgr->ReleaseSendLane(jetty);
+  if (ok_a && ok_b) {
+    mgr->ReleaseSendLane(jetty);
+  } else {
+    fprintf(stderr, "[wr] incomplete send lane quarantined\n");
+  }
   return (ok_a && ok_b) ? 0 : -1;
 }
 
-/* ---------------- write 流水线（请求 = local 8M 写 remote 80M） ------------ */
+/* ---------------- write 流水线（请求 = local 8M 写 remote 80M） ------------
+ */
 
-/* post 一个请求到指定槽：同一 local 8M 写入 remote 80M（chip 交替），每次发送拆
- * 2 条 4M WR、【每条 4M WR 独立取一个 jetty】；20 条 WR 连续全部 post（不等
- * CQE），post_ns = 第 1 条 WR post 前（时延起点）。 */
+/* post 一个请求到指定槽：同一 local 8M 写入 remote 80M（chip
+ * 交替），每次发送拆
+ * 2 条 4M WR、【每条 4M WR 独立取一个 jetty】；20 条 WR
+ * 连续全部 post（不等 CQE），post_ns = 第 1 条 WR post 前（时延起点）。 */
 static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
                         uint64_t req_seq) {
   const argument_t *args = &ctx->args;
@@ -795,35 +826,54 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
               (unsigned long long)req_seq, wr);
       /* 回滚已 post 的 WR */
       for (uint32_t j = 0; j < wr; j++) {
-        (void)mgr->WaitEvent(w->id, s->seq[j], args->timeout_ms);
-        mgr->ReleaseSendLane(s->jetty[j]);
+        bool completed =
+            mgr->WaitEvent(w->id, s->event_token[j], args->timeout_ms);
+        if (completed)
+          mgr->ReleaseSendLane(s->jetty[j]);
+        s->jetty[j].reset();
       }
       s->active = false;
       return -1;
     }
-    uint64_t seq = 0;
-    uint64_t ue = mgr->PostEvent(w->id, seq);
-    if (!mgr->PostWrite(
-            jetty, conn,
-            (uint64_t)ctx->client_data + local_base_off +
-                (uint64_t)half * KV_WR_SIZE,
-            remote_base + (uint64_t)send_idx * KV_SEND_SIZE +
-                (uint64_t)half * KV_WR_SIZE,
-            (uint32_t)KV_WR_SIZE, (uint32_t)src, (uint32_t)dst, ue)) {
-      fprintf(stderr,
-              "[pipe] req %llu WR %u (send %u) post failed, aborting\n",
-              (unsigned long long)req_seq, wr, send_idx);
-      mgr->AbortEvent(w->id, seq);
+    uint64_t event_token = 0;
+    uint64_t ue = mgr->PostEvent(w->id, event_token);
+    if (ue == 0) {
+      fprintf(stderr, "[pipe] req %llu event slots exhausted at WR %u\n",
+              (unsigned long long)req_seq, wr);
       mgr->ReleaseSendLane(jetty);
       for (uint32_t j = 0; j < wr; j++) {
-        (void)mgr->WaitEvent(w->id, s->seq[j], args->timeout_ms);
-        mgr->ReleaseSendLane(s->jetty[j]);
+        bool completed =
+            mgr->WaitEvent(w->id, s->event_token[j], args->timeout_ms);
+        if (completed)
+          mgr->ReleaseSendLane(s->jetty[j]);
+        s->jetty[j].reset();
+      }
+      s->active = false;
+      return -1;
+    }
+    if (!mgr->PostWrite(jetty, conn,
+                        (uint64_t)ctx->client_data + local_base_off +
+                            (uint64_t)half * KV_WR_SIZE,
+                        remote_base + (uint64_t)send_idx * KV_SEND_SIZE +
+                            (uint64_t)half * KV_WR_SIZE,
+                        (uint32_t)KV_WR_SIZE, (uint32_t)src, (uint32_t)dst,
+                        ue)) {
+      fprintf(stderr, "[pipe] req %llu WR %u (send %u) post failed, aborting\n",
+              (unsigned long long)req_seq, wr, send_idx);
+      mgr->AbortEvent(w->id, event_token);
+      mgr->ReleaseSendLane(jetty);
+      for (uint32_t j = 0; j < wr; j++) {
+        bool completed =
+            mgr->WaitEvent(w->id, s->event_token[j], args->timeout_ms);
+        if (completed)
+          mgr->ReleaseSendLane(s->jetty[j]);
+        s->jetty[j].reset();
       }
       s->active = false;
       return -1;
     }
     s->jetty[wr] = jetty;
-    s->seq[wr] = seq;
+    s->event_token[wr] = event_token;
     s->done[wr] = false;
   }
   w->active_slots[w->active_count++] = slot_idx; /* 登记在飞槽 */
@@ -837,7 +887,9 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
  * 请求 = 同一 8M buffer 发 10 次（chip 交替 1,2,1,2...），每次发送拆 2 条 4M WR
  * （每条独立 jetty，20 条 WR/请求）。20 条 4M WR 连续全部 post（4M 之间不等
  * CQE）；请求之间不等前一个完成（重叠），在飞请求 ≤ --concurrency（各占 local
- * 8M + remote 80M），完成一个补发一个。时延 = 请求第 1 条 WR post → 最后一条 CQE。 */
+
+* 8M + remote 80M），完成一个补发一个。时延 = 请求第 1 条 WR post → 最后一条
+CQE。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;
@@ -857,7 +909,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   }
   uint64_t next_req_ns = now_ns();
 
-  uint64_t req_seq = 0;  /* 请求全局序号 */
+  uint64_t req_seq = 0;    /* 请求全局序号 */
   uint32_t req_active = 0; /* 在飞请求数（≤ concurrency） */
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
@@ -872,12 +924,12 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
         if (s->done[i])
           continue;
-        int r = mgr->ProbeEvent(w->id, s->seq[i]);
+        int r = mgr->ProbeEvent(w->id, s->event_token[i]);
         if (r == -1) {
           fprintf(stderr,
-                  "[pipe] req %llu WR %u failed (seq=%llu), aborting\n",
+                  "[pipe] req %llu WR %u failed (token=%llu), aborting\n",
                   (unsigned long long)s->req_seq, i,
-                  (unsigned long long)s->seq[i]);
+                  (unsigned long long)s->event_token[i]);
           return -1;
         }
         if (r == 1) {
@@ -941,20 +993,43 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   }
 
   /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
-   * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty 避免残留 */
+   * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
+   * 避免残留 */
+  const uint64_t drain_deadline =
+      now_ns() + (uint64_t)args->timeout_ms * 1000000ULL;
+  uint64_t drain_failures = 0;
   while (w->active_count > 0) {
     uint32_t idx = w->active_slots[0];
     wr_slot_t *s = &w->wr_slots[idx];
     for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
-      if (!s->done[i])
-        (void)mgr->WaitEvent(w->id, s->seq[i], args->timeout_ms);
-      mgr->ReleaseSendLane(s->jetty[i]);
+      if (!s->done[i]) {
+        uint64_t now = now_ns();
+        int remaining_ms = 0;
+        if (now < drain_deadline) {
+          remaining_ms = (int)((drain_deadline - now + 999999ULL) / 1000000ULL);
+        }
+        if (!mgr->WaitEvent(w->id, s->event_token[i], remaining_ms)) {
+          fprintf(stderr,
+                  "[pipe] drain timeout: req=%llu WR=%u token=%llu; lane "
+                  "quarantined\n",
+                  (unsigned long long)s->req_seq, i,
+                  (unsigned long long)s->event_token[i]);
+          drain_failures++;
+        } else {
+          mgr->ReleaseSendLane(s->jetty[i]);
+        }
+      } else {
+        mgr->ReleaseSendLane(s->jetty[i]);
+      }
       s->jetty[i].reset();
     }
     s->active = false;
     w->free_slots[w->free_count++] = idx;
     w->active_slots[0] = w->active_slots[w->active_count - 1];
     w->active_count--;
+  }
+  if (drain_failures > 0) {
+    __atomic_add_fetch(&w->errors, drain_failures, __ATOMIC_RELAXED);
   }
   return 0;
 }
@@ -967,24 +1042,34 @@ static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_chip) {
   uint32_t size = (uint32_t)args->value_size;
   uint64_t window = (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * size;
   uint64_t off = w->off % window;
-  uint64_t remote = conn.RemoteSegVa() + (off % ((uint64_t)SERVER_DATA_WINDOW * size));
+  uint64_t remote =
+      conn.RemoteSegVa() + (off % ((uint64_t)SERVER_DATA_WINDOW * size));
 
   std::shared_ptr<kv_bench::UrmaJetty> jetty;
   if (!mgr->AcquireSendLane(jetty)) {
     fprintf(stderr, "[get] send lane pool exhausted\n");
     return -1;
   }
-  uint64_t seq_e;
-  uint64_t ue = mgr->PostEvent(w->id, seq_e);
-  if (!mgr->PostRead(jetty, conn, (uint64_t)ctx->client_data + off, remote,
-                     size, (uint32_t)src_a, (uint32_t)dst_chip, ue)) {
-    fprintf(stderr, "[get] post read failed\n");
-    mgr->AbortEvent(w->id, seq_e);
+  uint64_t event_token = 0;
+  uint64_t ue = mgr->PostEvent(w->id, event_token);
+  if (ue == 0) {
+    fprintf(stderr, "[get] event slots exhausted\n");
     mgr->ReleaseSendLane(jetty);
     return -1;
   }
-  bool ok = mgr->WaitEvent(w->id, seq_e, args->timeout_ms);
-  mgr->ReleaseSendLane(jetty);
+  if (!mgr->PostRead(jetty, conn, (uint64_t)ctx->client_data + off, remote,
+                     size, (uint32_t)src_a, (uint32_t)dst_chip, ue)) {
+    fprintf(stderr, "[get] post read failed\n");
+    mgr->AbortEvent(w->id, event_token);
+    mgr->ReleaseSendLane(jetty);
+    return -1;
+  }
+  bool ok = mgr->WaitEvent(w->id, event_token, args->timeout_ms);
+  if (ok) {
+    mgr->ReleaseSendLane(jetty);
+  } else {
+    fprintf(stderr, "[get] incomplete send lane quarantined\n");
+  }
   return ok ? 0 : -1;
 }
 
@@ -1018,13 +1103,14 @@ static void *client_worker_main(void *arg) {
   uint64_t deadline = now_ns() + args->duration_sec * 1000000000ULL;
   w->next_post_ns = now_ns();
   /* get 每请求读 value-size；mixed 的 write 为 mirror 双 WR（2×size） */
-  uint64_t round_bytes = (args->op == OP_GET) ? args->value_size
-                                              : 2ULL * args->value_size;
+  uint64_t round_bytes =
+      (args->op == OP_GET) ? args->value_size : 2ULL * args->value_size;
   uint64_t window =
       (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
   w->off = (uint64_t)w->id * DATA_WINDOW_PER_THREAD * args->value_size;
 
-  /* write：分片流水线（80MB 请求 = 20×4MB 分片，jetty 池驱动，持续到 deadline） */
+  /* write：分片流水线（80MB 请求 = 20×4MB 分片，jetty 池驱动，持续到 deadline）
+   */
   if (args->op == OP_WRITE) {
     if (client_write_pipeline(ctx, w, deadline) != 0) {
       __atomic_add_fetch(&w->errors, 1, __ATOMIC_RELAXED);
@@ -1158,8 +1244,7 @@ static void print_client_summary(context_t *ctx, double seconds) {
       seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
   double bw_mbps = bw_mb_s * 8.0;                        /* 小 b: Mb/s */
   /* wr_rate：write = 请求 × 20 条 4M WR；带宽按 8M 数据/请求统计 */
-  double wr_rate =
-      iops * (args->op == OP_WRITE ? (double)KV_WR_PER_REQ : 1.0);
+  double wr_rate = iops * (args->op == OP_WRITE ? (double)KV_WR_PER_REQ : 1.0);
   printf("requests=%" PRIu64
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
@@ -1219,8 +1304,8 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args) {
   addr.sin_addr.s_addr = inet_addr(args->server_ip);
   /* 阻塞式连接（无超时，等待内核完成握手） */
   if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-    fprintf(stderr, "Failed to connect %s:%u, errno=%d (%s)\n",
-            args->server_ip, args->server_port, errno, strerror(errno));
+    fprintf(stderr, "Failed to connect %s:%u, errno=%d (%s)\n", args->server_ip,
+            args->server_port, errno, strerror(errno));
     close(sockfd);
     return -1;
   }
@@ -1261,9 +1346,8 @@ static int create_workers(context_t *ctx, uint32_t count) {
     w->run_arg = ctx;
     w->rng = ctx->args.seed + i * 2654435761u;
     /* 只启用已分配本地 buffer 对应的槽：[0, concurrency)。 */
-    uint32_t slot_count = ctx->args.concurrency >= 1
-                              ? (uint32_t)ctx->args.concurrency
-                              : 1;
+    uint32_t slot_count =
+        ctx->args.concurrency >= 1 ? (uint32_t)ctx->args.concurrency : 1;
     if (slot_count > KV_MAX_WR_SLOTS)
       slot_count = KV_MAX_WR_SLOTS;
     w->free_count = slot_count;
@@ -1311,13 +1395,14 @@ static void destroy_context(context_t *ctx, int sockfd) {
   free(ctx);
 }
 
-/* ==================== 双设备模式（2 设备 × 2 eid = 4 端口） ================== */
+/* ==================== 双设备模式（2 设备 × 2 eid = 4 端口） ==================
+ */
 
 #define DUAL_PORTS 4
 
 typedef struct dual_worker {
   uint32_t wid[DUAL_PORTS]; /* 各 manager 的 workerId */
-  uint64_t seq[DUAL_PORTS];
+  uint64_t event_token[DUAL_PORTS];
   std::shared_ptr<kv_bench::UrmaJetty> jetty[DUAL_PORTS];
   kv_hist_t hist_req;
   volatile uint64_t ops;
@@ -1330,7 +1415,8 @@ typedef struct dual_worker {
 } dual_worker_t;
 
 /* 查询设备 eid 列表前 2 个 eid（每个"口"一个 eid） */
-static int dual_query_eids(const char *dev1, const char *dev2, int eids[DUAL_PORTS]) {
+static int dual_query_eids(const char *dev1, const char *dev2,
+                           int eids[DUAL_PORTS]) {
   const char *devs[2] = {dev1, dev2};
   for (int d = 0; d < 2; d++) {
     urma_device_t *dev = urma_get_device_by_name(const_cast<char *>(devs[d]));
@@ -1341,9 +1427,10 @@ static int dual_query_eids(const char *dev1, const char *dev2, int eids[DUAL_POR
     uint32_t cnt = 0;
     urma_eid_info_t *list = urma_get_eid_list(dev, &cnt);
     if (list == nullptr || cnt < 2) {
-      fprintf(stderr, "dual-dev: device %s needs >= 2 eids (got %u)\n",
-              devs[d], cnt);
-      if (list) urma_free_eid_list(list);
+      fprintf(stderr, "dual-dev: device %s needs >= 2 eids (got %u)\n", devs[d],
+              cnt);
+      if (list)
+        urma_free_eid_list(list);
       return -1;
     }
     eids[d * 2] = (int)list[0].eid_index;
@@ -1380,6 +1467,7 @@ static void *dual_worker_main(void *arg) {
     uint64_t t0 = now_ns();
     uint64_t off = dw->off;
     bool ok = true;
+    int posted = 0;
     /* 4 条 4M WR 全部 post（不等 CQE） */
     for (int p = 0; p < DUAL_PORTS; p++) {
       std::shared_ptr<kv_bench::UrmaJetty> jetty;
@@ -1387,25 +1475,35 @@ static void *dual_worker_main(void *arg) {
         ok = false;
         break;
       }
-      uint64_t ue = mgr[p]->PostEvent(dw->wid[p], dw->seq[p]);
-      if (!mgr[p]->PostWrite(jetty, *conn[p],
-                             (uint64_t)ctx->client_data + off + (uint64_t)p * KV_WR_SIZE,
-                             conn[p]->RemoteSegVa() + off + (uint64_t)p * KV_WR_SIZE,
-                             (uint32_t)KV_WR_SIZE, (uint32_t)INVALID_CHIP,
-                             (uint32_t)INVALID_CHIP, ue)) {
-        mgr[p]->AbortEvent(dw->wid[p], dw->seq[p]);
+      uint64_t ue = mgr[p]->PostEvent(dw->wid[p], dw->event_token[p]);
+      if (ue == 0) {
+        mgr[p]->ReleaseSendLane(jetty);
+        ok = false;
+        break;
+      }
+      if (!mgr[p]->PostWrite(
+              jetty, *conn[p],
+              (uint64_t)ctx->client_data + off + (uint64_t)p * KV_WR_SIZE,
+              conn[p]->RemoteSegVa() + off + (uint64_t)p * KV_WR_SIZE,
+              (uint32_t)KV_WR_SIZE, (uint32_t)INVALID_CHIP,
+              (uint32_t)INVALID_CHIP, ue)) {
+        mgr[p]->AbortEvent(dw->wid[p], dw->event_token[p]);
         mgr[p]->ReleaseSendLane(jetty);
         ok = false;
         break;
       }
       dw->jetty[p] = jetty;
+      posted++;
     }
     /* 等 4 条 CQE */
-    for (int p = 0; p < DUAL_PORTS && ok; p++) {
-      if (!mgr[p]->WaitEvent(dw->wid[p], dw->seq[p], args->timeout_ms)) {
+    for (int p = 0; p < posted; p++) {
+      if (!mgr[p]->WaitEvent(dw->wid[p], dw->event_token[p],
+                             args->timeout_ms)) {
         ok = false;
+        fprintf(stderr, "[dual] port %d send lane quarantined\n", p);
+      } else {
+        mgr[p]->ReleaseSendLane(dw->jetty[p]);
       }
-      mgr[p]->ReleaseSendLane(dw->jetty[p]);
       dw->jetty[p].reset();
     }
     if (ok) {
@@ -1440,7 +1538,8 @@ static int run_dual_client(const argument_t *args) {
   const char *devs[2] = {args->dev_name, args->dev_name2};
   for (int p = 0; p < DUAL_PORTS; p++) {
     mgr[p] = new kv_bench::UrmaManager();
-    mgr[p]->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu : auto_poll_cpu(args, true));
+    mgr[p]->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
+                                           : auto_poll_cpu(args, true));
     if (!mgr[p]->Init(devs[p / 2], args->cacheable, args->jetty_count,
                       args->threads, args->event_mode, args->trans_mode,
                       eids[p])) {
@@ -1495,7 +1594,8 @@ static int run_dual_client(const argument_t *args) {
     }
   }
   /* 打流线程 */
-  dual_worker_t *workers = (dual_worker_t *)calloc(args->threads, sizeof(dual_worker_t));
+  dual_worker_t *workers =
+      (dual_worker_t *)calloc(args->threads, sizeof(dual_worker_t));
   if (workers == NULL)
     return -1;
   for (uint32_t i = 0; i < args->threads; i++) {
@@ -1503,7 +1603,8 @@ static int run_dual_client(const argument_t *args) {
     workers[i].off = (uint64_t)i * round_bytes;
     if (kv_hist_init(&workers[i].hist_req, 1, 60ULL * 1000000000ULL, 3) != 0)
       return -1;
-    if (pthread_create(&workers[i].tid, NULL, dual_worker_main, &workers[i]) != 0) {
+    if (pthread_create(&workers[i].tid, NULL, dual_worker_main, &workers[i]) !=
+        0) {
       fprintf(stderr, "dual-dev: failed to start worker %u\n", i);
       return -1;
     }
@@ -1511,7 +1612,8 @@ static int run_dual_client(const argument_t *args) {
   /* 采样 */
   uint64_t t0 = now_ns();
   uint64_t last_bytes = 0;
-  while (!ctx->stop && now_ns() - t0 < args->duration_sec * 1000000000ULL + 2ULL * 1000000000ULL) {
+  while (!ctx->stop && now_ns() - t0 < args->duration_sec * 1000000000ULL +
+                                           2ULL * 1000000000ULL) {
     sleep(1);
     uint64_t bytes = 0, ops = 0, errors = 0;
     for (uint32_t i = 0; i < args->threads; i++) {
@@ -1577,7 +1679,8 @@ static int run_dual_server(const argument_t *args) {
   const char *devs[2] = {args->dev_name, args->dev_name2};
   for (int p = 0; p < DUAL_PORTS; p++) {
     mgr[p] = new kv_bench::UrmaManager();
-    mgr[p]->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu : auto_poll_cpu(args, false));
+    mgr[p]->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
+                                           : auto_poll_cpu(args, false));
     if (!mgr[p]->Init(devs[p / 2], args->cacheable, args->jetty_count, 1,
                       args->event_mode, args->trans_mode, eids[p])) {
       fprintf(stderr, "dual-dev: port %d init failed\n", p);
@@ -1986,15 +2089,17 @@ static void usage(void) {
   printf("      --duration <seconds>   client run duration (default 10)\n");
   printf("      --jetty-count <n>      min send Jetty count, 1..200 (default "
          "1; threads may raise it)\n");
+  printf("      --affinity-mode <m>    affinity | anti | none (default "
+         "affinity)\n");
   printf(
-      "      --affinity-mode <m>    affinity | anti | none (default affinity)\n");
-  printf("      --source-cpus <list>   client CPU list, e.g. 4,5 (default: auto "
-         "per chip)\n");
+      "      --source-cpus <list>   client CPU list, e.g. 4,5 (default: auto "
+      "per chip)\n");
   printf("      --destination-cpus <list> server CPU list, e.g. 8,9 (default: "
          "auto per chip)\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
-  printf("      --concurrency <n>      write inflight requests 1..10 (default 1)\n");
+  printf("      --concurrency <n>      write inflight requests 1..10 (default "
+         "1)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --poll-cpu <n>         pin URMA poll thread to cpu (default: "
@@ -2007,8 +2112,9 @@ static void usage(void) {
   printf("      --mixed-ratio <pct>    write percentage in mixed mode (default "
          "50)\n");
   printf("      --report-interval <s>  periodic report interval (default 1)\n");
-  printf("      --mbind                enable NUMA mbind of the buffer (default "
-         "on; --no-mbind to disable)\n");
+  printf(
+      "      --mbind                enable NUMA mbind of the buffer (default "
+      "on; --no-mbind to disable)\n");
   printf("      --drv-ext              enable bonding chip routing "
          "(has_drv_ext + src/dst chip, default on; --no-drv-ext to disable)\n");
   printf("      --import-rtp           import remote jetty via plain RTP (skip "
@@ -2018,8 +2124,9 @@ static void usage(void) {
   printf("      --fixed-offset         always use offset 0 (hot-cache test) "
          "instead of cycling\n");
   printf("      --timeout-ms <ms>      completion timeout (default 5000)\n");
-  printf("      --query-chips          print CPU->NUMA->chip and pick_round_chips "
-         "selection, then exit\n");
+  printf(
+      "      --query-chips          print CPU->NUMA->chip and pick_round_chips "
+      "selection, then exit\n");
 }
 
 static int validate_input_params(argument_t *args) {
@@ -2089,14 +2196,14 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->threads = 1;
   args->concurrency = 1;
   args->single_chip = 0;
-  args->poll_cpu = -1;        /* 默认自动选空闲核给轮询线程 */
+  args->poll_cpu = -1; /* 默认自动选空闲核给轮询线程 */
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
   args->report_interval = 1;
   args->seed = 42;
   args->timeout_ms = DEFAULT_TIMEOUT_MS;
-  args->drv_ext = true;  /* 默认开 chip 路由，--no-drv-ext 关闭 */
-  args->mbind = true;    /* 默认 NUMA 绑定，--no-mbind 关闭 */
+  args->drv_ext = true; /* 默认开 chip 路由，--no-drv-ext 关闭 */
+  args->mbind = true;   /* 默认 NUMA 绑定，--no-mbind 关闭 */
 
   while (1) {
     int c = getopt_long(argc, argv, "m:d:i:p:e", g_long_options, NULL);
@@ -2246,7 +2353,8 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
  * CPU->NUMA->chip 拓扑、source/destination 列表的 chip，以及三种亲和模式下
  * pick_round_chips 会选出的 src_a/src_b/dst，便于核对配置。 */
 static int run_chip_query(const argument_t *args) {
-  /* 只打印结果：实际选中的 source/destination CPU（含自动选择）+ chip 路由结果 */
+  /* 只打印结果：实际选中的 source/destination CPU（含自动选择）+ chip 路由结果
+   */
   printf("== source-cpus (client, %s) ==\n",
          args->source_cpus ? "explicit" : "auto-selected");
   {

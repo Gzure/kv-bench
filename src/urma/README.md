@@ -20,7 +20,7 @@
   lane lease、metrics、worker RPC 与 bthread 依赖；bench 场景不做故障恢复。
 - 每轮（一次业务请求）经 `UrmaManager::AcquireSendLane` 从资源层 Jetty 池取一条
   新的 send jetty，用后 `ReleaseSendLane` 归还（池按 FIFO 空闲队列轮转 + in-use 标记分配）。
-- 完成模型：`UrmaManager` 起独立轮询线程 `urma_poll_jfc`，按
-  `user_ctx = workerId<<40 | seq` 完成每个打流线程的事件槽；
-  `UrmaManager::WaitEvent` 等待并复位槽。
+- 完成模型：`UrmaManager` 起独立轮询线程 `urma_poll_jfc`；每个 worker 从固定空闲
+  事件槽池领取带 generation 的 token，按 `user_ctx = workerId<<40 | token` 完成。
+  槽只在 `ProbeEvent` / `WaitEvent` / `AbortEvent` 消费后归还，迟到 CQE 不会覆盖新事件。`WaitEvent` 超时只取消事件 token，不取消硬件 WR；调用方会隔离对应 send lane，直到连接销毁。
 - 控制面握手为 TCP + POD（`WireInfo`），数据面只走 URMA。

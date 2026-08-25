@@ -92,3 +92,12 @@ target_compile_definitions(kv-bench
 		_GNU_SOURCE
 		$<$<BOOL:${KV_BENCH_BONDP_CTL}>:KV_BENCH_BONDP_CTL>
 )
+
+include(CTest)
+if(BUILD_TESTING)
+	add_executable(event-slot-pool-test tests/event_slot_pool_test.cpp)
+	target_include_directories(event-slot-pool-test
+		PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	add_test(NAME event-slot-pool COMMAND event-slot-pool-test)
+endif()
