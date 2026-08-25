@@ -888,9 +888,9 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         k++; /* 请求未完成，处理下一个在飞槽 */
         continue;
       }
-      /* 请求完成：20 条 WR 全部完成；带宽按 8M 数据/请求统计（与 80M 传输
-       * 字节分开，时延见 hist_req） */
-      __atomic_add_fetch(&w->bytes, KV_SEND_SIZE, __ATOMIC_RELAXED);
+      /* 请求完成：20 条 WR 全部完成；带宽按传输字节 = 8M × 10 次 = 80M/请求
+       * （时延见 hist_req） */
+      __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
       for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
         mgr->ReleaseSendLane(s->jetty[i]);
         s->jetty[i].reset();
