@@ -49,9 +49,10 @@
   4 /* 客户端 data_len = threads * 4 * value_size（get/mixed 用） */
 #define SERVER_DATA_WINDOW 4
 
-/* write 流水线模型：一个请求 = 同一 8MB buffer 发 10 次（chip 交替
+/* write 流水线模型：一个请求 = 同一 local 8MB buffer 向同一 remote 8MB 槽
+ * 写 10 次（chip 交替
  * 1,2,1,2...），每次发送拆 2 条 4MB WR，【每条 4MB WR 一个独立 jetty】；
- * 10 次全完成（20 条 WR）= 请求完成；带宽按 8MB 数据/请求统计 */
+ * 10 次全完成（20 条 WR）= 请求完成；带宽按 80MB 传输字节/请求统计 */
 #define KV_WR_SIZE (4UL * 1024 * 1024)   /* 单条 WR 4MB */
 #define KV_WR_PER_SEND 2                 /* 每次发送 8M = 2 条 4M WR */
 #define KV_SEND_SIZE (KV_WR_SIZE * KV_WR_PER_SEND)  /* 8MB（同一 buffer） */
@@ -772,12 +773,8 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
-  /* 数据区窗口：concurrency 块 8M buffer（重叠请求各占一块） */
-  uint32_t window_reqs =
-      (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
-  if (window_reqs < 1)
-    window_reqs = 1;
-  uint64_t base_off = (req_seq % window_reqs) * KV_SEND_SIZE;
+  /* 地址绑定实际的在飞槽，避免请求乱序完成后复用序号导致地址碰撞。 */
+  uint64_t base_off = (uint64_t)slot_idx * KV_SEND_SIZE;
   uint64_t remote_base = conn.RemoteSegVa() + (base_off % SERVER_PIPE_BYTES);
 
   wr_slot_t *s = &w->wr_slots[slot_idx];
@@ -785,7 +782,8 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   s->done_cnt = 0;
   s->active = true;
   s->post_ns = now_ns(); /* 时延起点：第 1 条 WR post 前 */
-  /* 20 条 4M WR：send_idx = 第几次发送（chip 交替），half = 8M 前半/后半 */
+  /* 20 条 4M WR：send_idx 只决定 chip；10 次发送均覆盖同一 remote 8M 槽。
+   * half = 该 8M 槽的前半/后半。 */
   for (uint32_t wr = 0; wr < KV_WR_PER_REQ; wr++) {
     uint32_t send_idx = wr / KV_WR_PER_SEND;
     uint32_t half = wr % KV_WR_PER_SEND;
@@ -808,8 +806,7 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
     if (!mgr->PostWrite(
             jetty, conn,
             (uint64_t)ctx->client_data + base_off + (uint64_t)half * KV_WR_SIZE,
-            remote_base + (uint64_t)send_idx * KV_SEND_SIZE +
-                (uint64_t)half * KV_WR_SIZE,
+            remote_base + (uint64_t)half * KV_WR_SIZE,
             (uint32_t)KV_WR_SIZE, (uint32_t)src, (uint32_t)dst, ue)) {
       fprintf(stderr,
               "[pipe] req %llu WR %u (send %u) post failed, aborting\n",
@@ -1261,9 +1258,14 @@ static int create_workers(context_t *ctx, uint32_t count) {
     w->local_index = i;
     w->run_arg = ctx;
     w->rng = ctx->args.seed + i * 2654435761u;
-    /* 空闲槽栈初始化（write 流水线用） */
-    w->free_count = KV_MAX_WR_SLOTS;
-    for (uint32_t s = 0; s < KV_MAX_WR_SLOTS; s++) {
+    /* 只启用已分配本地 buffer 对应的槽：[0, concurrency)。 */
+    uint32_t slot_count = ctx->args.concurrency >= 1
+                              ? (uint32_t)ctx->args.concurrency
+                              : 1;
+    if (slot_count > KV_MAX_WR_SLOTS)
+      slot_count = KV_MAX_WR_SLOTS;
+    w->free_count = slot_count;
+    for (uint32_t s = 0; s < slot_count; s++) {
       w->free_slots[s] = s;
     }
     if (kv_hist_init(&w->hist, 1, 60ULL * 1000000000ULL, 3) != 0 ||

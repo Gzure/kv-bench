@@ -89,7 +89,8 @@ kv_bench 打流线程
 
 ## 打流模型（write：请求级流水线重叠）
 
-**一个 KV 请求 = 同一 8MB buffer 发 10 次**（chip 交替：第 1 次 chip1、第 2 次
+**一个 KV 请求 = 同一 local 8MB buffer 向同一 remote 8MB 槽写 10 次**（重复覆盖；
+chip 交替：第 1 次 chip1、第 2 次
 chip2、第 3 次 chip1...，5+5），**每次发送拆 2 条 4MB WR，每条 4MB WR 独立取一个
 jetty**（20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不等 CQE）；请求之间
 不等前一个完成（重叠）**，在飞请求 ≤ `--concurrency`（各占一块 8M buffer），完成
