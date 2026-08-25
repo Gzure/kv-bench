@@ -203,7 +203,7 @@ bool UrmaManager::InitUrmaLib() {
 
 bool UrmaManager::Init(const std::string &devName, bool cacheable,
                        uint32_t jettyCount, uint32_t threadsMin, bool eventMode,
-                       uint32_t transMode) {
+                       uint32_t transMode, int eidIndex) {
   if (initialized_) {
     return true;
   }
