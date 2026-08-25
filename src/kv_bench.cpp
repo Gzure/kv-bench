@@ -92,7 +92,6 @@ typedef struct argument {
   uint32_t threads;
   int concurrency; /* write 并发度 1..10（req）/ 1..100（group），默认 1 */
   int concurrency_unit; /* 0=req_group：在飞批次数（窗口=10×N 请求）；1=req：在飞请求数 */
-  bool batch_sync; /* 批同步：一批 10 请求发完→等全部完成→下一批（批时延干净） */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst） */
   int poll_cpu;    /* 轮询线程绑核；-1 = 自动选空闲核 */
   int op;
@@ -414,12 +413,10 @@ static int mbind_to_node(void *addr, size_t len, int node) {
  * 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
-  /* write：每线程数据区 = 窗口请求数 × 8MB（batch-sync 开 = 1 块串行复用；
-   * 关 = concurrency 块重叠）；get/mixed：value_size 窗口 */
-  uint64_t window_reqs = (args->op == OP_WRITE && !args->batch_sync)
-                             ? (args->concurrency > 0
-                                    ? (uint64_t)args->concurrency
-                                    : 1)
+  /* write：每线程数据区 = concurrency 块 8M buffer（重叠请求各占一块）；
+   * get/mixed：value_size 窗口 */
+  uint64_t window_reqs = (args->op == OP_WRITE && args->concurrency > 0)
+                             ? (uint64_t)args->concurrency
                              : 1;
   uint64_t data_len = (args->op == OP_WRITE)
                           ? (uint64_t)args->threads * window_reqs * KV_SEND_SIZE
@@ -763,18 +760,16 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
 /* ---------------- write 流水线（请求 = 同一 8M buffer 发 10 次） ------------ */
 
 /* post 一个请求到指定槽：同一 8M buffer 发 10 次（chip 交替），每次发送拆
- * 2 条 4M WR、【每条 4M WR 独立取一个 jetty】；20 条 WR 全 post 后登记。
- * start_ns = 时延起点（batch-sync 开 = 提交/入队时间；关 = post 时间） */
+ * 2 条 4M WR、【每条 4M WR 独立取一个 jetty】；20 条 WR 连续全部 post（不等
+ * CQE），post_ns = 第 1 条 WR post 前（时延起点）。 */
 static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
-                        uint64_t req_seq, uint64_t start_ns) {
+                        uint64_t req_seq) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
-  /* 数据区窗口：batch-sync 开 = 1 块 8M buffer（串行复用）；
-   * 关 = concurrency 块（重叠请求各占一块） */
-  uint32_t window_reqs = args->batch_sync ? 1
-                       : (args->concurrency >= 1 ? (uint32_t)args->concurrency
-                                                 : 1);
+  /* 数据区窗口：concurrency 块 8M buffer（重叠请求各占一块） */
+  uint32_t window_reqs =
+      (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
   if (window_reqs < 1)
     window_reqs = 1;
   uint64_t base_off = (req_seq % window_reqs) * KV_SEND_SIZE;
@@ -784,7 +779,7 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   s->req_seq = req_seq;
   s->done_cnt = 0;
   s->active = true;
-  s->post_ns = start_ns; /* 时延起点：提交/入队时间（batch-sync 开，含排队） */
+  s->post_ns = now_ns(); /* 时延起点：第 1 条 WR post 前 */
   /* 20 条 4M WR：send_idx = 第几次发送（chip 交替），half = 8M 前半/后半 */
   for (uint32_t wr = 0; wr < KV_WR_PER_REQ; wr++) {
     uint32_t send_idx = wr / KV_WR_PER_SEND;
@@ -834,10 +829,11 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
 /* write 流水线主循环：
  * 请求 = 同一 8M buffer 发 10 次（chip 交替 1,2,1,2...），每次发送拆 2 条 4M WR
  * （每条独立 jetty，20 条 WR/请求）。
- * --batch-sync 开（默认）：每个 8M 请求串行（真正在飞恒 1 请求 = 20 条 4M WR，
- *   一个请求全完成才开始下一个；--concurrency 只是排队请求数）；
- * --batch-sync 关：8M 请求可重叠（在飞请求 ≤ --concurrency，各占一块 8M buffer）。
- * 时延 = 请求第 1 条 WR post → 最后一条 CQE。 */
+/* write 流水线主循环（请求级流水线重叠）：
+ * 请求 = 同一 8M buffer 发 10 次（chip 交替 1,2,1,2...），每次发送拆 2 条 4M WR
+ * （每条独立 jetty，20 条 WR/请求）。20 条 4M WR 连续全部 post（4M 之间不等
+ * CQE）；请求之间不等前一个完成（重叠），在飞请求 ≤ --concurrency（各占一块
+ * 8M buffer），完成一个补发一个。时延 = 请求第 1 条 WR post → 最后一条 CQE。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;
@@ -846,8 +842,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
   if (concurrency > KV_MAX_CONCURRENCY)
     concurrency = KV_MAX_CONCURRENCY;
-  /* 在飞请求数上限：batch-sync 开 = 1（串行）；关 = concurrency（重叠） */
-  uint32_t max_inflight_reqs = args->batch_sync ? 1 : concurrency;
+  /* 在飞请求数上限：重叠 = concurrency */
+  uint32_t max_inflight_reqs = concurrency;
   uint64_t interval_ns = 0;
   if (args->qps > 0) {
     uint64_t per_thread = args->qps / args->threads;
@@ -858,20 +854,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   uint64_t next_req_ns = now_ns();
 
   uint64_t req_seq = 0;  /* 请求全局序号 */
-  uint32_t req_active = 0; /* 在飞请求数（≤ max_inflight_reqs） */
-
-  /* 请求队列（batch-sync 开）：深度 = concurrency，start FIFO。
-   * 请求"提交"（进入队列）即记 start，串行处理，完成才补提交——
-   * 时延 = 提交 → 完成（含排队等待前面请求），稳态 ≈ N × 单请求处理时间 */
-  uint64_t req_start_q[KV_MAX_CONCURRENCY];
-  uint32_t q_head = 0, q_tail = 0, q_count = 0;
-  if (args->batch_sync) {
-    for (uint32_t i = 0; i < concurrency; i++) {
-      req_start_q[q_tail] = now_ns();
-      q_tail = (q_tail + 1) % KV_MAX_CONCURRENCY;
-      q_count++;
-    }
-  }
+  uint32_t req_active = 0; /* 在飞请求数（≤ concurrency） */
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
@@ -903,26 +886,18 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         k++; /* 请求未完成，处理下一个在飞槽 */
         continue;
       }
-      /* 请求完成：20 条 WR 全部完成；带宽按传输字节 = 8M × 10 次 = 80M/请求
-       * （时延 = 提交 → 完成，见 hist_req） */
+      /* 请求完成：20 条 WR 全部完成；带宽按传输字节 = 8M × 10 次 = 80M/请求 */
       __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
       for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
         mgr->ReleaseSendLane(s->jetty[i]);
         s->jetty[i].reset();
       }
       s->active = false;
-      /* 请求级时延：batch-sync 开 = 提交（入队）→ 最后 CQE（含排队等待）；
-       * 关 = post → 最后 CQE */
+      /* 请求级时延：第 1 条 WR post → 最后一条 CQE */
       kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
       __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
       if (req_active > 0)
         req_active--;
-      /* batch-sync：补提交一个新请求（保持队列深度 = concurrency） */
-      if (args->batch_sync) {
-        req_start_q[q_tail] = now_ns();
-        q_tail = (q_tail + 1) % KV_MAX_CONCURRENCY;
-        q_count++;
-      }
       /* 完成槽：从在飞列表移除（末尾交换）+ 归还空闲栈 */
       w->free_slots[w->free_count++] = idx;
       w->active_slots[k] = w->active_slots[w->active_count - 1];
@@ -930,14 +905,11 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       /* 不 k++：换进来的槽仍需处理 */
     }
 
-    /* 2. 发送：batch-sync 开 = 队列取队头 post（在飞恒 1，串行）；
-     * 关 = 重叠（在飞 ≤ concurrency） */
+    /* 2. 发送：有请求就一直发（重叠），在飞请求 ≤ concurrency 或池空 */
     while (now_ns() < deadline && !ctx->fatal) {
       if (req_active >= max_inflight_reqs)
         break; /* 在飞达上限，等请求完成腾名额 */
-      if (args->batch_sync && q_count == 0)
-        break; /* 队列空（不该发生，完成会补提交） */
-      if (interval_ns > 0 && args->batch_sync) {
+      if (interval_ns > 0) {
         if (now_ns() < next_req_ns) {
           uint64_t left = next_req_ns - now_ns();
           if (left > 50000)
@@ -951,14 +923,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       if (w->free_count == 0)
         break; /* 槽满（≤ 10，理论不会） */
       uint32_t slot = w->free_slots[--w->free_count];
-      /* 时延起点：batch-sync 开 = 请求提交（进入队列）时间（含排队等待）；
-       * 关 = 本请求 post 时间 */
-      uint64_t start_ns = args->batch_sync ? req_start_q[q_head] : now_ns();
-      if (args->batch_sync) {
-        q_head = (q_head + 1) % KV_MAX_CONCURRENCY;
-        q_count--;
-      }
-      if (post_one_req(ctx, w, slot, req_seq, start_ns) != 0) {
+      if (post_one_req(ctx, w, slot, req_seq) != 0) {
         w->free_slots[w->free_count++] = slot; /* 归还槽 */
         return -1;
       }
@@ -1356,10 +1321,8 @@ static int run_client(const argument_t *args) {
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
     /* 池 ≥ 在飞请求 × 20（每请求 20 条 4M WR 各占一条 jetty）：
-     * batch-sync 开 = 1 请求；关 = concurrency 请求重叠 */
-    uint32_t reqs = (!args->batch_sync && args->concurrency >= 1)
-                        ? (uint32_t)args->concurrency
-                        : 1;
+     * 池 ≥ 在飞请求 × 20（每请求 20 条 4M WR 各占一条 jetty） */
+    uint32_t reqs = (args->concurrency >= 1) ? (uint32_t)args->concurrency : 1;
     uint32_t pipe = reqs * KV_WR_PER_REQ;
     if (pipe > min_lanes)
       min_lanes = pipe;
@@ -1659,8 +1622,6 @@ static struct option g_long_options[] = {
     {"query-chips", no_argument, NULL, 1024},
     {"concurrency", required_argument, NULL, 1025},
     {"concurrency-unit", required_argument, NULL, 1027},
-    {"batch-sync", no_argument, NULL, 1028},
-    {"no-batch-sync", no_argument, NULL, 1029},
     {"poll-cpu", required_argument, NULL, 1032},
     {"single-chip", required_argument, NULL, 1026},
     {NULL, 0, NULL, 0}};
@@ -1697,8 +1658,6 @@ static void usage(void) {
          "or 1..100 (unit=req), default 1\n");
   printf("      --concurrency-unit <u> req|req_group: req = inflight 8M requests; "
          "req_group = inflight batches (10 x 8M requests)\n");
-  printf("      --batch-sync          one batch (10 x 8M) completes before next "
-         "starts; clean batch latency (default on; --no-batch-sync to disable)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --poll-cpu <n>         pin URMA poll thread to cpu (default: "
@@ -1794,8 +1753,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->affinity_mode = AFF_AFFINITY; /* 默认亲和 */
   args->threads = 1;
   args->concurrency = 1;
-  args->concurrency_unit = 0; /* 默认 req_group：在飞批次数 */
-  args->batch_sync = true;    /* 默认批同步（一批完成才发下一批） */
+  args->concurrency_unit = 0; /* 默认 req_group：在飞请求数 */
   args->single_chip = 0;
   args->poll_cpu = -1;        /* 默认自动选空闲核给轮询线程 */
   args->op = OP_WRITE;
@@ -1936,12 +1894,6 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       break;
     case 1026:
       args->single_chip = (int)strtol(optarg, NULL, 0);
-      break;
-    case 1028:
-      args->batch_sync = true;
-      break;
-    case 1029:
-      args->batch_sync = false;
       break;
     case 1032:
       args->poll_cpu = (int)strtol(optarg, NULL, 0);

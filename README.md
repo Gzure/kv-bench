@@ -87,22 +87,50 @@ kv_bench 打流线程
 `--server-ip` 存在时进程是 client；没有该参数时是 server。两端的 `--dev-name`
 应使用同一类 URMA/bonding 设备；`--destination-cpus` 两端保持一致（客户端用它计算目的 chip）。
 
-## 打流模型（write：请求 8MB，一次并发 10 个请求 = 80MB，精简 yuanrong pipeline）
+## 打流模型（write：请求级流水线重叠）
 
 **一个 KV 请求 = 同一 8MB buffer 发 10 次**（chip 交替：第 1 次 chip1、第 2 次
 chip2、第 3 次 chip1...，5+5），**每次发送拆 2 条 4MB WR，每条 4MB WR 独立取一个
-jetty**（20 条 WR/请求）。10 次全部完成（20 条 CQE）才计一次请求：
+jetty**（20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不等 CQE）；请求之间
+不等前一个完成（重叠）**，在飞请求 ≤ `--concurrency`（各占一块 8M buffer），完成
+一个补发一个：
 
 - 时延 = **第 1 条 WR post → 最后一条 CQE**（`request latency`）。
 - 带宽 = **80MB 传输字节/请求**（同一 8M 数据发 10 次 = 10×8M）。
-- **`--concurrency`**：在飞请求数（req_group 1..10）或在飞 4M WR 数（req 1..200）；
-  **`--batch-sync`（默认）**：一个请求 20 条全完成才开始下一个（请求串行）。
-- **`--batch-sync`（默认开）**：每个 8M 请求**串行**（真正在飞恒 1 请求 = 20 条
-  4M WR，一个请求全完成才开始下一个；`--concurrency` 只是排队请求数）；
-  `--no-batch-sync` 关闭后 **8M 请求可重叠**（在飞请求 ≤ `--concurrency`，
-  各占一块 8M buffer，池 ≥ 重叠数 × 20）。
+- **`--concurrency`**：在飞请求数（req_group 1..10）；`req` 单位 = 在飞 4M WR 数
+  （1..200，窗口 = ceil(N/20) 请求）。
 - **`--single-chip 1|2`**：单 chip 场景——所有发送固定走该 chip（src==dst），
   `--mbind` 时缓冲绑到该 chip 对应的 NUMA 节点（测单 chip 极限 + 内存亲和）。
+
+### 并发流程图（concurrency=N）
+
+```
+   ┌─────────────────────────── 主循环 ───────────────────────────┐
+   │                                                              │
+   │  ① 收完成：ProbeEvent 扫描在飞槽，20 条 WR 全完成 → 请求完成    │
+   │     (bytes += 80M, 记 request latency, 释放 20 jetty, 腾窗口) │
+   │                    │                                         │
+   │                    ▼                                         │
+   │  ② 发送：在飞请求 < N 且池有 jetty → post 新请求                │
+   │     ┌─ post_one_req：同一 8M buffer 发 10 次 ─────────────┐   │
+   │     │  for wr in 0..19:                                   │   │
+   │     │    取 1 个 jetty                                    │   │
+   │     │    PostEvent + PostWrite(4M, chip=wr/2%2?2:1)      │   │
+   │     │    （20 条 WR 连续 post，不等 CQE）                  │   │
+   │     └────────────────────────────────────────────────────┘   │
+   └───────────────┬───────────────────────────────▲──────────────┘
+                   │ 在飞请求达 N / 池空 → break 等   │
+                   └──────── 完成补发 ───────────────┘
+
+时间线（concurrency=4，请求 r0..r3 重叠，每请求 20 条 WR 在飞）:
+
+      r0: |======= 20 WR =======|
+      r1:   |======= 20 WR =======|
+      r2:     |======= 20 WR =======|
+      r3:       |======= 20 WR =======|
+  在飞: 4 个请求 × 20 WR = 80 条 4M WR 同时在飞（4 块 8M buffer）
+  完成: r0 完成 → 释放 → 补发 r4（窗口恒 4 请求）
+```
 
 ## 操作类型
 
