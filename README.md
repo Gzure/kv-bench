@@ -97,8 +97,7 @@ jetty**（20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不�
 
 - 时延 = **第 1 条 WR post → 最后一条 CQE**（`request latency`）。
 - 带宽 = **80MB 传输字节/请求**（同一 8M 数据发 10 次 = 10×8M）。
-- **`--concurrency`**：在飞请求数（req_group 1..10）；`req` 单位 = 在飞 4M WR 数
-  （1..200，窗口 = ceil(N/20) 请求）。
+- **`--concurrency`**：在飞请求数（1..10，重叠度）。
 - **`--single-chip 1|2`**：单 chip 场景——所有发送固定走该 chip（src==dst），
   `--mbind` 时缓冲绑到该 chip 对应的 NUMA 节点（测单 chip 极限 + 内存亲和）。
 

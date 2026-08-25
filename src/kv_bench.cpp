@@ -90,8 +90,7 @@ typedef struct argument {
   const char *destination_cpus;
   bool cacheable;
   uint32_t threads;
-  int concurrency; /* write 并发度 1..10（req）/ 1..100（group），默认 1 */
-  int concurrency_unit; /* 0=req_group：在飞批次数（窗口=10×N 请求）；1=req：在飞请求数 */
+  int concurrency; /* write 在飞请求数 1..10，默认 1 */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst） */
   int poll_cpu;    /* 轮询线程绑核；-1 = 自动选空闲核 */
   int op;
@@ -1621,7 +1620,6 @@ static struct option g_long_options[] = {
     {"timeout-ms", required_argument, NULL, 1018},
     {"query-chips", no_argument, NULL, 1024},
     {"concurrency", required_argument, NULL, 1025},
-    {"concurrency-unit", required_argument, NULL, 1027},
     {"poll-cpu", required_argument, NULL, 1032},
     {"single-chip", required_argument, NULL, 1026},
     {NULL, 0, NULL, 0}};
@@ -1654,10 +1652,7 @@ static void usage(void) {
          "auto per chip)\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
-  printf("      --concurrency <n>      write concurrency: 1..10 (unit=req_group) "
-         "or 1..100 (unit=req), default 1\n");
-  printf("      --concurrency-unit <u> req|req_group: req = inflight 8M requests; "
-         "req_group = inflight batches (10 x 8M requests)\n");
+  printf("      --concurrency <n>      write inflight requests 1..10 (default 1)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --poll-cpu <n>         pin URMA poll thread to cpu (default: "
@@ -1692,20 +1687,10 @@ static int validate_input_params(argument_t *args) {
     fprintf(stderr, "Invalid thread count %u\n", args->threads);
     return -1;
   }
-  if (args->concurrency_unit == 1) {
-    /* group 单位：在飞 8M 组数 1..100 */
-    if (args->concurrency < 1 || args->concurrency > KV_MAX_WR_SLOTS) {
-      fprintf(stderr, "Invalid concurrency %d (1..%d for unit=group)\n",
-              args->concurrency, KV_MAX_WR_SLOTS);
-      return -1;
-    }
-  } else {
-    /* req 单位：在飞请求数 1..10（窗口 10×N 组 ≤ 100） */
-    if (args->concurrency < 1 || args->concurrency > KV_MAX_CONCURRENCY) {
-      fprintf(stderr, "Invalid concurrency %d (1..%d for unit=req)\n",
-              args->concurrency, KV_MAX_CONCURRENCY);
-      return -1;
-    }
+  if (args->concurrency < 1 || args->concurrency > KV_MAX_CONCURRENCY) {
+    fprintf(stderr, "Invalid concurrency %d (1..%d)\n", args->concurrency,
+            KV_MAX_CONCURRENCY);
+    return -1;
   }
   if (args->single_chip < 0 || args->single_chip > 2) {
     fprintf(stderr, "Invalid single-chip %d (0=dual chip, 1|2)\n",
@@ -1753,7 +1738,6 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->affinity_mode = AFF_AFFINITY; /* 默认亲和 */
   args->threads = 1;
   args->concurrency = 1;
-  args->concurrency_unit = 0; /* 默认 req_group：在飞请求数 */
   args->single_chip = 0;
   args->poll_cpu = -1;        /* 默认自动选空闲核给轮询线程 */
   args->op = OP_WRITE;
@@ -1877,20 +1861,6 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       break;
     case 1025:
       args->concurrency = (int)strtol(optarg, NULL, 0);
-      break;
-    case 1027:
-      /* req = 在飞 8M 组数（组级并行，1..100）；req_group = 在飞 80M 请求数
-       * （请求级并行，1..10，默认） */
-      if (strcmp(optarg, "req") == 0 || strcmp(optarg, "8m") == 0) {
-        args->concurrency_unit = 1;
-      } else if (strcmp(optarg, "req_group") == 0 ||
-                 strcmp(optarg, "80m") == 0) {
-        args->concurrency_unit = 0;
-      } else {
-        fprintf(stderr, "Invalid concurrency-unit: %s (req|req_group)\n",
-                optarg);
-        return -1;
-      }
       break;
     case 1026:
       args->single_chip = (int)strtol(optarg, NULL, 0);
