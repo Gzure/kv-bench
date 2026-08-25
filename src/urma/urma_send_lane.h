@@ -4,15 +4,17 @@
  *
  * 与 yuanrong 差异：
  *  - 内部自带 std::mutex（yuanrong 由 UrmaResource 在外部持锁，这里收进对象本身）；
- *  - PopIdle 按游标轮转取空闲 jetty，保证"每轮都取到新的"（多线程下同时天然分散）。
+ *  - PopIdle 按 FIFO 空闲队列轮转 jetty，保证"每轮都取到新的"（多线程下同时天然分散）。
  */
 #ifndef KV_BENCH_URMA_SEND_LANE_H
 #define KV_BENCH_URMA_SEND_LANE_H
 
 #include <algorithm>
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace kv_bench {
@@ -37,29 +39,31 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         jettys_.clear();
         idleIndices_.clear();
-        cursor_ = 0;
+        isIdle_.clear();
+        jettyIndices_.clear();
     }
 
     void Add(std::shared_ptr<UrmaJetty> jetty)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        idleIndices_.push_back(jettys_.size());
+        const size_t index = jettys_.size();
+        jettyIndices_[jetty.get()] = index;
+        idleIndices_.push_back(index);
+        isIdle_.push_back(true);
         jettys_.push_back(std::move(jetty));
     }
 
-    /* 取一条空闲 jetty：从游标起找第一个空闲下标并移除，游标前移（每轮"新的"） */
+    /* FIFO 轮转取空闲 jetty：获取/归还均为 O(1)，每轮仍优先取最早归还的 jetty。 */
     bool PopIdle(std::shared_ptr<UrmaJetty> &jetty)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        const size_t n = jettys_.size();
-        for (size_t i = 0; i < n; i++) {
-            const size_t idx = (cursor_ + i) % n;
-            auto it = std::find(idleIndices_.begin(), idleIndices_.end(), idx);
-            if (it == idleIndices_.end()) {
+        while (!idleIndices_.empty()) {
+            const size_t idx = idleIndices_.front();
+            idleIndices_.pop_front();
+            if (idx >= jettys_.size() || !isIdle_[idx]) {
                 continue;
             }
-            idleIndices_.erase(it);
-            cursor_ = idx + 1;
+            isIdle_[idx] = false;
             jetty = jettys_[idx];
             return true;
         }
@@ -73,34 +77,36 @@ public:
             return;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        for (size_t i = 0; i < jettys_.size(); i++) {
-            if (jettys_[i] == jetty) {
-                if (std::find(idleIndices_.begin(), idleIndices_.end(), i) == idleIndices_.end()) {
-                    idleIndices_.push_back(i);
-                }
-                return;
-            }
+        auto it = jettyIndices_.find(jetty.get());
+        if (it == jettyIndices_.end() || isIdle_[it->second]) {
+            return;
         }
+        isIdle_[it->second] = true;
+        idleIndices_.push_back(it->second);
     }
 
     /* 从池移除（对齐 yuanrong Remove：末尾交换 + 下标修正） */
     bool Remove(const std::shared_ptr<UrmaJetty> &jetty)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (size_t i = 0; i < jettys_.size(); i++) {
-            if (jettys_[i] != jetty) {
-                continue;
-            }
-            idleIndices_.erase(std::remove(idleIndices_.begin(), idleIndices_.end(), i), idleIndices_.end());
-            const size_t lastIdx = jettys_.size() - 1;
-            if (i != lastIdx) {
-                jettys_[i] = std::move(jettys_[lastIdx]);
-                std::replace(idleIndices_.begin(), idleIndices_.end(), lastIdx, i);
-            }
-            jettys_.pop_back();
-            return true;
+        auto jettyIt = jettyIndices_.find(jetty.get());
+        if (jettyIt == jettyIndices_.end()) {
+            return false;
         }
-        return false;
+
+        const size_t index = jettyIt->second;
+        const size_t lastIndex = jettys_.size() - 1;
+        idleIndices_.erase(std::remove(idleIndices_.begin(), idleIndices_.end(), index), idleIndices_.end());
+        jettyIndices_.erase(jettyIt);
+        if (index != lastIndex) {
+            jettys_[index] = std::move(jettys_[lastIndex]);
+            isIdle_[index] = isIdle_[lastIndex];
+            jettyIndices_[jettys_[index].get()] = index;
+            std::replace(idleIndices_.begin(), idleIndices_.end(), lastIndex, index);
+        }
+        jettys_.pop_back();
+        isIdle_.pop_back();
+        return true;
     }
 
     Stats GetStats() const
@@ -123,8 +129,9 @@ public:
 private:
     mutable std::mutex mutex_;
     std::vector<std::shared_ptr<UrmaJetty>> jettys_;
-    std::vector<size_t> idleIndices_;
-    size_t cursor_{0};
+    std::deque<size_t> idleIndices_;
+    std::vector<bool> isIdle_;
+    std::unordered_map<const UrmaJetty *, size_t> jettyIndices_;
 };
 
 }  // namespace kv_bench

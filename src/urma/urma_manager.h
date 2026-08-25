@@ -10,6 +10,7 @@
 #ifndef KV_BENCH_URMA_MANAGER_H
 #define KV_BENCH_URMA_MANAGER_H
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -24,6 +25,7 @@
 namespace kv_bench {
 
 constexpr uint32_t kEventSlotsPerWorker = 256;
+constexpr uint32_t kMaxRegisteredWorkers = 1024;
 constexpr uint32_t kRidShift = 40;
 constexpr uint64_t kRidMask = (1ULL << kRidShift) - 1;
 
@@ -130,6 +132,7 @@ private:
   bool InitUrmaLib();
   bool EnsurePollThread();
   void PollThreadMain();
+  EventSlots *GetEventSlots(uint32_t workerId) const;
   void CompleteEvent(uint32_t workerId, uint64_t userCtx, bool ok);
   bool Exchange(int sockfd, const HandshakeParams &params,
                 std::shared_ptr<UrmaConnection> &conn,
@@ -149,8 +152,10 @@ private:
 
   int pollCpu_{-1}; /* 轮询线程绑核，-1 = 不绑 */
 
-  std::vector<std::unique_ptr<EventSlots>> workerSlots_;
-  mutable std::mutex workerMutex_;
+  /* 槽地址发布后不再移动；CQE 热路径可无锁读取。 */
+  std::array<std::unique_ptr<EventSlots>, kMaxRegisteredWorkers> workerSlots_;
+  std::atomic<uint32_t> workerCount_{0};
+  mutable std::mutex workerRegisterMutex_;
 };
 
 } // namespace kv_bench

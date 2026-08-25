@@ -38,7 +38,7 @@ kv-bench/
         │                         PostWrite 系列/轮询线程+事件槽/Stop
         ├── urma_resource.{h,cpp} 资源层：UrmaResource + RAII 句柄
         │                         (context/jfce/jfc/jfr/jetty/targetJetty/segment)
-        └── urma_send_lane.h      SendJettyPool（线程安全内建，游标轮转）
+        └── urma_send_lane.h      SendJettyPool（线程安全内建，FIFO 空闲队列轮转）
 Provider 层  liburma (umdk)        urma_* API（urma_api.h / urma_ubagg.h）
 ```
 
@@ -146,7 +146,7 @@ client                                  server
 - `AbortEvent`：post 失败时槽复位 0。
 - 数据面（write 分片流水线）：每个分片 `PostWrite`（事件 ue）→ `ProbeEvent` 轮询完成 → 完成一个补发一个（见 §6.1）；get 为 `PostRead` 直接 READ（见 §6.3）。
 
-**send lane（每请求取新 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从游标起找第一个空闲下标并移除、游标前移——**每个请求都取到"新的" jetty**，多线程下天然分散。池大小 = `max(--jetty-count, threads, 在飞请求窗口)`。
+**send lane（每请求取新 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从 FIFO 空闲队列头部取下标，`Release` 从尾部归还——**每个请求都取到"新的" jetty**，多线程下天然分散。池大小 = `max(--jetty-count, threads, 在飞请求窗口)`。
 
 ---
 

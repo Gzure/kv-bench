@@ -280,10 +280,17 @@ urma_target_seg_t *UrmaManager::LocalSeg() const {
 bool UrmaManager::RegisterWorker(uint32_t &workerId) {
   bool first = false;
   {
-    std::lock_guard<std::mutex> lock(workerMutex_);
-    workerSlots_.push_back(std::make_unique<EventSlots>(kEventSlotsPerWorker));
-    workerId = static_cast<uint32_t>(workerSlots_.size() - 1);
-    first = (workerSlots_.size() == 1);
+    std::lock_guard<std::mutex> lock(workerRegisterMutex_);
+    const uint32_t count = workerCount_.load(std::memory_order_relaxed);
+    if (count >= kMaxRegisteredWorkers) {
+      fprintf(stderr, "Too many URMA workers (max=%u)\n",
+              kMaxRegisteredWorkers);
+      return false;
+    }
+    workerSlots_[count] = std::make_unique<EventSlots>(kEventSlotsPerWorker);
+    workerId = count;
+    first = (count == 0);
+    workerCount_.store(count + 1, std::memory_order_release);
   }
   if (first) {
     EnsurePollThread();
@@ -297,25 +304,33 @@ void UrmaManager::UnregisterWorker(uint32_t workerId) {
 }
 
 uint32_t UrmaManager::WorkerCount() const {
-  return static_cast<uint32_t>(workerSlots_.size());
+  return workerCount_.load(std::memory_order_acquire);
+}
+
+UrmaManager::EventSlots *UrmaManager::GetEventSlots(uint32_t workerId) const {
+  if (workerId >= workerCount_.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
+  return workerSlots_[workerId].get();
 }
 
 uint64_t UrmaManager::PostEvent(uint32_t workerId, uint64_t &seq) {
-  if (workerId >= workerSlots_.size() || workerSlots_[workerId] == nullptr) {
+  EventSlots *slots = GetEventSlots(workerId);
+  if (slots == nullptr) {
     return 0;
   }
-  EventSlots &slots = *workerSlots_[workerId];
-  seq = slots.localSeq.fetch_add(1) & kRidMask;
-  uint64_t *slot = &slots.slots[seq % kEventSlotsPerWorker];
+  seq = slots->localSeq.fetch_add(1) & kRidMask;
+  uint64_t *slot = &slots->slots[seq % kEventSlotsPerWorker];
   __atomic_store_n(slot, seq << 2, __ATOMIC_RELEASE);
   return ((uint64_t)workerId << kRidShift) | seq;
 }
 
 bool UrmaManager::WaitEvent(uint32_t workerId, uint64_t seq, int timeoutMs) {
-  if (workerId >= workerSlots_.size() || workerSlots_[workerId] == nullptr) {
+  EventSlots *slots = GetEventSlots(workerId);
+  if (slots == nullptr) {
     return false;
   }
-  uint64_t *slot = &workerSlots_[workerId]->slots[seq % kEventSlotsPerWorker];
+  uint64_t *slot = &slots->slots[seq % kEventSlotsPerWorker];
   uint64_t doneOk = (seq << 2) | 1;
   uint64_t doneFail = (seq << 2) | 2;
   uint64_t deadline = NowNs() + (uint64_t)timeoutMs * 1000000ULL;
@@ -339,10 +354,11 @@ bool UrmaManager::WaitEvent(uint32_t workerId, uint64_t seq, int timeoutMs) {
 }
 
 int UrmaManager::ProbeEvent(uint32_t workerId, uint64_t seq) {
-  if (workerId >= workerSlots_.size() || workerSlots_[workerId] == nullptr) {
+  EventSlots *slots = GetEventSlots(workerId);
+  if (slots == nullptr) {
     return 0;
   }
-  uint64_t *slot = &workerSlots_[workerId]->slots[seq % kEventSlotsPerWorker];
+  uint64_t *slot = &slots->slots[seq % kEventSlotsPerWorker];
   uint64_t v = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
   uint64_t doneOk = (seq << 2) | 1;
   uint64_t doneFail = (seq << 2) | 2;
@@ -358,10 +374,11 @@ int UrmaManager::ProbeEvent(uint32_t workerId, uint64_t seq) {
 }
 
 void UrmaManager::AbortEvent(uint32_t workerId, uint64_t seq) {
-  if (workerId >= workerSlots_.size() || workerSlots_[workerId] == nullptr) {
+  EventSlots *slots = GetEventSlots(workerId);
+  if (slots == nullptr) {
     return;
   }
-  uint64_t *slot = &workerSlots_[workerId]->slots[seq % kEventSlotsPerWorker];
+  uint64_t *slot = &slots->slots[seq % kEventSlotsPerWorker];
   __atomic_store_n(slot, 0, __ATOMIC_RELEASE);
 }
 
@@ -370,11 +387,11 @@ void UrmaManager::CompleteEvent(uint32_t workerId, uint64_t userCtx, bool ok) {
   if ((userCtx >> kRidShift) != workerId) {
     return;
   }
-  std::lock_guard<std::mutex> lock(workerMutex_);
-  if (workerId >= workerSlots_.size() || workerSlots_[workerId] == nullptr) {
+  EventSlots *slots = GetEventSlots(workerId);
+  if (slots == nullptr) {
     return;
   }
-  uint64_t *slot = &workerSlots_[workerId]->slots[seq % kEventSlotsPerWorker];
+  uint64_t *slot = &slots->slots[seq % kEventSlotsPerWorker];
   uint64_t expect = seq << 2;
   uint64_t want = (seq << 2) | (ok ? 1 : 2);
   __atomic_compare_exchange_n(slot, &expect, want, false, __ATOMIC_ACQ_REL,

@@ -51,7 +51,7 @@ int 字段（或任何改布局的提交）就崩，改回去又可能不崩，�
                                      PostWrite 系列(内联 PostJettyRw)/轮询线程+事件槽/清理
 资源层   src/urma/urma_resource.*    UrmaResource + RAII 句柄(context/jfce/jfc/jfr/jetty/segment)
 池对象   src/urma/urma_send_lane.h   SendJettyPool（对齐 yuanrong：Add/PopIdle/Release/Remove/GetStats，
-                                     线程安全内建；游标轮转保证每轮取"新的"空闲 jetty）
+                                     线程安全内建；FIFO 空闲队列保证每轮取"新的"空闲 jetty）
 Provider liburma (umdk)              urma_* API
 ```
 
@@ -172,7 +172,7 @@ request latency(us): avg=5333.33 min=1624.00 p50=5000.00 p90=6100.00 p99=8025.00
 ## Jetty 线性度扫描
 
 **每个 8MB 组从 send Jetty 池取一条新的 jetty**（对齐 yuanrong `AcquireSendLane` 模型）：
-池按游标轮转 + in-use 标记分配，用后归还。**jetty 池容量 = 同时在飞组上限**
+池按 FIFO 空闲队列轮转 + in-use 标记分配，用后归还。**jetty 池容量 = 同时在飞组上限**
 （池越大组并发越高，带宽/时延随之变化），用于观察 Jetty 数量对带宽/时延的线性度：
 用于观察 Jetty 数量对带宽/时延的线性度：
 
