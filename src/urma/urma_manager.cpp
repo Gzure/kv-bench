@@ -217,13 +217,16 @@ bool UrmaManager::Init(const std::string &devName, bool cacheable,
     fprintf(stderr, "urma_get_device_by_name failed: %s\n", devName.c_str());
     return false;
   }
-  int eidIndex = GetEidIndex(dev);
-  if (eidIndex < 0) {
-    fprintf(stderr, "Failed to get eid index\n");
-    return false;
+  int eid = eidIndex;
+  if (eid < 0) {
+    eid = GetEidIndex(dev);
+    if (eid < 0) {
+      fprintf(stderr, "Failed to get eid index\n");
+      return false;
+    }
   }
-  if (!resource_.Init(dev, (uint32_t)eidIndex, cacheable, jettyCount,
-                      threadsMin, transMode)) {
+  if (!resource_.Init(dev, (uint32_t)eid, cacheable, jettyCount, threadsMin,
+                      transMode)) {
     return false;
   }
   if (eventMode_ && !resource_.RearmJfc()) {

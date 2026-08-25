@@ -77,6 +77,8 @@ enum { AFF_AFFINITY = 0, AFF_ANTI = 1, AFF_NONE = 2 };
 
 typedef struct argument {
   char *dev_name;
+  char *dev_name2; /* 双设备模式：第二个物理设备名 */
+  bool dual_dev;   /* 双设备模式：2 设备 × 2 eid = 4 端口，4 条 4M 分发 */
   char *server_ip;
   unsigned int server_port;
   unsigned int trans_mode; /* 0=RM 1=RC 2=UM 3=RS */
@@ -167,6 +169,10 @@ struct context {
   uint32_t worker_count;
   volatile bool stop;
   volatile bool fatal; /* 首错即中断（客户端打流） */
+
+  /* 双设备模式：4 端口 manager 与连接 */
+  kv_bench::UrmaManager *mgr_dual[4];
+  std::shared_ptr<kv_bench::UrmaConnection> conn_dual[4];
 
   /* 服务器 */
   int listen_fd;
@@ -1301,6 +1307,336 @@ static void destroy_context(context_t *ctx, int sockfd) {
   free(ctx);
 }
 
+/* ==================== 双设备模式（2 设备 × 2 eid = 4 端口） ================== */
+
+#define DUAL_PORTS 4
+
+typedef struct dual_worker {
+  uint32_t wid[DUAL_PORTS]; /* 各 manager 的 workerId */
+  uint64_t seq[DUAL_PORTS];
+  std::shared_ptr<kv_bench::UrmaJetty> jetty[DUAL_PORTS];
+  kv_hist_t hist_req;
+  volatile uint64_t ops;
+  volatile uint64_t bytes;
+  volatile uint64_t errors;
+  uint64_t off;
+  bool stop;
+  pthread_t tid;
+  void *run_arg;
+} dual_worker_t;
+
+/* 查询设备 eid 列表前 2 个 eid（每个"口"一个 eid） */
+static int dual_query_eids(const char *dev1, const char *dev2, int eids[DUAL_PORTS]) {
+  const char *devs[2] = {dev1, dev2};
+  for (int d = 0; d < 2; d++) {
+    urma_device_t *dev = urma_get_device_by_name(const_cast<char *>(devs[d]));
+    if (dev == nullptr) {
+      fprintf(stderr, "dual-dev: get device %s failed\n", devs[d]);
+      return -1;
+    }
+    uint32_t cnt = 0;
+    urma_eid_info_t *list = urma_get_eid_list(dev, &cnt);
+    if (list == nullptr || cnt < 2) {
+      fprintf(stderr, "dual-dev: device %s needs >= 2 eids (got %u)\n",
+              devs[d], cnt);
+      if (list) urma_free_eid_list(list);
+      return -1;
+    }
+    eids[d * 2] = (int)list[0].eid_index;
+    eids[d * 2 + 1] = (int)list[1].eid_index;
+    printf("dual-dev: %s eids %d/%d (port %d/%d)\n", devs[d], eids[d * 2],
+           eids[d * 2 + 1], d * 2, d * 2 + 1);
+    urma_free_eid_list(list);
+  }
+  return 0;
+}
+
+/* 双设备打流线程：每请求 = 4 条 4M WR 分发到 4 端口（P0=(dev1,eid0)
+ * P1=(dev1,eid1) P2=(dev2,eid0) P3=(dev2,eid1)），4 条全 post 后等 4 CQE */
+static void *dual_worker_main(void *arg) {
+  dual_worker_t *dw = (dual_worker_t *)arg;
+  context_t *ctx = (context_t *)dw->run_arg;
+  const argument_t *args = &ctx->args;
+  kv_bench::UrmaManager *mgr[DUAL_PORTS];
+  std::shared_ptr<kv_bench::UrmaConnection> conn[DUAL_PORTS];
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    mgr[p] = ctx->mgr_dual[p];
+    conn[p] = ctx->conn_dual[p];
+  }
+  uint64_t deadline = now_ns() + args->duration_sec * 1000000000ULL;
+  uint64_t round_bytes = (uint64_t)DUAL_PORTS * KV_WR_SIZE; /* 4×4M = 16M */
+  uint64_t window = (uint64_t)args->threads * round_bytes;
+
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    if (!mgr[p]->RegisterWorker(dw->wid[p])) {
+      return NULL;
+    }
+  }
+  while (!dw->stop && !ctx->fatal && now_ns() < deadline) {
+    uint64_t t0 = now_ns();
+    uint64_t off = dw->off;
+    bool ok = true;
+    /* 4 条 4M WR 全部 post（不等 CQE） */
+    for (int p = 0; p < DUAL_PORTS; p++) {
+      std::shared_ptr<kv_bench::UrmaJetty> jetty;
+      if (!mgr[p]->AcquireSendLane(jetty)) {
+        ok = false;
+        break;
+      }
+      uint64_t ue = mgr[p]->PostEvent(dw->wid[p], dw->seq[p]);
+      if (!mgr[p]->PostWrite(jetty, *conn[p],
+                             (uint64_t)ctx->client_data + off + (uint64_t)p * KV_WR_SIZE,
+                             conn[p]->RemoteSegVa() + off + (uint64_t)p * KV_WR_SIZE,
+                             (uint32_t)KV_WR_SIZE, (uint32_t)INVALID_CHIP,
+                             (uint32_t)INVALID_CHIP, ue)) {
+        mgr[p]->AbortEvent(dw->wid[p], dw->seq[p]);
+        mgr[p]->ReleaseSendLane(jetty);
+        ok = false;
+        break;
+      }
+      dw->jetty[p] = jetty;
+    }
+    /* 等 4 条 CQE */
+    for (int p = 0; p < DUAL_PORTS && ok; p++) {
+      if (!mgr[p]->WaitEvent(dw->wid[p], dw->seq[p], args->timeout_ms)) {
+        ok = false;
+      }
+      mgr[p]->ReleaseSendLane(dw->jetty[p]);
+      dw->jetty[p].reset();
+    }
+    if (ok) {
+      __atomic_add_fetch(&dw->bytes, round_bytes, __ATOMIC_RELAXED);
+      kv_hist_record(&dw->hist_req, now_ns() - t0);
+      __atomic_add_fetch(&dw->ops, 1, __ATOMIC_RELAXED);
+      dw->off = (dw->off + round_bytes) % window;
+    } else {
+      __atomic_add_fetch(&dw->errors, 1, __ATOMIC_RELAXED);
+      if (!ctx->fatal) {
+        ctx->fatal = true;
+        fprintf(stderr, "[dual] first round failed, aborting\n");
+      }
+      break;
+    }
+  }
+  return NULL;
+}
+
+static int run_dual_client(const argument_t *args) {
+  context_t *ctx = (context_t *)calloc(1, sizeof(context_t));
+  if (ctx == NULL)
+    return -1;
+  ctx->args = *args;
+  ctx->stop = false;
+  int eids[DUAL_PORTS];
+  if (dual_query_eids(args->dev_name, args->dev_name2, eids) != 0) {
+    free(ctx);
+    return -1;
+  }
+  kv_bench::UrmaManager *mgr[DUAL_PORTS];
+  const char *devs[2] = {args->dev_name, args->dev_name2};
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    mgr[p] = new kv_bench::UrmaManager();
+    mgr[p]->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu : auto_poll_cpu(args, true));
+    if (!mgr[p]->Init(devs[p / 2], args->cacheable, args->jetty_count,
+                      args->threads, args->event_mode, args->trans_mode,
+                      eids[p])) {
+      fprintf(stderr, "dual-dev: port %d init failed\n", p);
+      for (int q = 0; q <= p; q++)
+        mgr[q]->Stop();
+      free(ctx);
+      return -1;
+    }
+    ctx->mgr_dual[p] = mgr[p];
+  }
+  /* 缓冲：每线程窗口 = 4×4M，4 端口注册同一 VA */
+  uint64_t round_bytes = (uint64_t)DUAL_PORTS * KV_WR_SIZE;
+  ctx->buf_len = ROUND_UP((uint64_t)args->threads * round_bytes, PAGE_SIZE);
+  ctx->va = memalign(PAGE_SIZE, ctx->buf_len);
+  if (ctx->va == NULL) {
+    return -1;
+  }
+  (void)memset(ctx->va, 0, ctx->buf_len);
+  ctx->client_data = (uint8_t *)ctx->va;
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    if (!mgr[p]->RegisterBuffer(ctx->va, ctx->buf_len)) {
+      fprintf(stderr, "dual-dev: port %d register buffer failed\n", p);
+      return -1;
+    }
+  }
+  /* 握手：1 条 TCP，4 次 Exchange（每端口一份 WireInfo） */
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd < 0)
+    return -1;
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(args->server_port);
+  addr.sin_addr.s_addr = inet_addr(args->server_ip);
+  if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    fprintf(stderr, "Failed to connect %s:%u\n", args->server_ip,
+            args->server_port);
+    close(sockfd);
+    return -1;
+  }
+  kv_bench::HandshakeParams params;
+  params.threads = args->threads;
+  params.opCode = (uint32_t)args->op;
+  params.valueSize = (uint32_t)KV_WR_SIZE;
+  params.transMode = args->trans_mode;
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    if (!mgr[p]->ExchangeAsClient(sockfd, params, ctx->conn_dual[p],
+                                  args->import_rtp)) {
+      fprintf(stderr, "dual-dev: port %d exchange failed\n", p);
+      close(sockfd);
+      return -1;
+    }
+  }
+  /* 打流线程 */
+  dual_worker_t *workers = (dual_worker_t *)calloc(args->threads, sizeof(dual_worker_t));
+  if (workers == NULL)
+    return -1;
+  for (uint32_t i = 0; i < args->threads; i++) {
+    workers[i].run_arg = ctx;
+    workers[i].off = (uint64_t)i * round_bytes;
+    if (kv_hist_init(&workers[i].hist_req, 1, 60ULL * 1000000000ULL, 3) != 0)
+      return -1;
+    if (pthread_create(&workers[i].tid, NULL, dual_worker_main, &workers[i]) != 0) {
+      fprintf(stderr, "dual-dev: failed to start worker %u\n", i);
+      return -1;
+    }
+  }
+  /* 采样 */
+  uint64_t t0 = now_ns();
+  uint64_t last_bytes = 0;
+  while (!ctx->stop && now_ns() - t0 < args->duration_sec * 1000000000ULL + 2ULL * 1000000000ULL) {
+    sleep(1);
+    uint64_t bytes = 0, ops = 0, errors = 0;
+    for (uint32_t i = 0; i < args->threads; i++) {
+      bytes += __atomic_load_n(&workers[i].bytes, __ATOMIC_RELAXED);
+      ops += __atomic_load_n(&workers[i].ops, __ATOMIC_RELAXED);
+      errors += __atomic_load_n(&workers[i].errors, __ATOMIC_RELAXED);
+    }
+    uint64_t now = now_ns();
+    double dt = (double)(now - t0) / 1e9;
+    double bw = (double)(bytes - last_bytes) / 1e9 / 1e6;
+    printf("[t=%.1fs] ops=%llu bandwidth=%.2f MB/s errors=%llu\n", dt,
+           (unsigned long long)ops, bw, (unsigned long long)errors);
+    last_bytes = bytes;
+  }
+  /* 汇总 */
+  uint64_t bytes = 0, ops = 0, errors = 0;
+  kv_hist_t merged;
+  kv_hist_init(&merged, 1, 60ULL * 1000000000ULL, 3);
+  for (uint32_t i = 0; i < args->threads; i++) {
+    bytes += __atomic_load_n(&workers[i].bytes, __ATOMIC_RELAXED);
+    ops += __atomic_load_n(&workers[i].ops, __ATOMIC_RELAXED);
+    errors += __atomic_load_n(&workers[i].errors, __ATOMIC_RELAXED);
+    kv_hist_merge(&merged, &workers[i].hist_req);
+  }
+  double seconds = (double)(now_ns() - t0) / 1e9;
+  printf("\n==== dual-dev summary threads=%u devs=%s,%s rounds=%llu "
+         "bandwidth=%.2f MB/s (%.2f Mb/s) bytes=%llu errors=%llu ====\n",
+         args->threads, args->dev_name, args->dev_name2,
+         (unsigned long long)ops, (double)bytes / seconds / 1e6,
+         (double)bytes / seconds / 1e6 * 8.0, (unsigned long long)bytes,
+         (unsigned long long)errors);
+  print_latency_line_us("request", &merged);
+  kv_hist_destroy(&merged);
+  for (uint32_t i = 0; i < args->threads; i++) {
+    workers[i].stop = true;
+    pthread_join(workers[i].tid, NULL);
+    kv_hist_destroy(&workers[i].hist_req);
+  }
+  free(workers);
+  close(sockfd);
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    ctx->conn_dual[p].reset();
+    mgr[p]->Stop();
+    delete mgr[p];
+  }
+  free(ctx->va);
+  free(ctx);
+  return 0;
+}
+
+static int run_dual_server(const argument_t *args) {
+  context_t *ctx = (context_t *)calloc(1, sizeof(context_t));
+  if (ctx == NULL)
+    return -1;
+  ctx->args = *args;
+  ctx->stop = false;
+  int eids[DUAL_PORTS];
+  if (dual_query_eids(args->dev_name, args->dev_name2, eids) != 0) {
+    free(ctx);
+    return -1;
+  }
+  kv_bench::UrmaManager *mgr[DUAL_PORTS];
+  const char *devs[2] = {args->dev_name, args->dev_name2};
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    mgr[p] = new kv_bench::UrmaManager();
+    mgr[p]->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu : auto_poll_cpu(args, false));
+    if (!mgr[p]->Init(devs[p / 2], args->cacheable, args->jetty_count, 1,
+                      args->event_mode, args->trans_mode, eids[p])) {
+      fprintf(stderr, "dual-dev: port %d init failed\n", p);
+      return -1;
+    }
+    ctx->mgr_dual[p] = mgr[p];
+  }
+  uint64_t round_bytes = (uint64_t)DUAL_PORTS * KV_WR_SIZE;
+  ctx->buf_len = ROUND_UP((uint64_t)args->threads * round_bytes, PAGE_SIZE);
+  ctx->va = memalign(PAGE_SIZE, ctx->buf_len);
+  if (ctx->va == NULL)
+    return -1;
+  (void)memset(ctx->va, 0, ctx->buf_len);
+  ctx->client_data = (uint8_t *)ctx->va;
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    if (!mgr[p]->RegisterBuffer(ctx->va, ctx->buf_len)) {
+      fprintf(stderr, "dual-dev: port %d register buffer failed\n", p);
+      return -1;
+    }
+  }
+  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(args->server_port);
+  if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+      listen(listen_fd, 1) != 0) {
+    fprintf(stderr, "dual-dev: listen failed\n");
+    return -1;
+  }
+  printf("dual-dev server listening on port %d (devs=%s,%s)\n",
+         args->server_port, args->dev_name, args->dev_name2);
+  int connfd = accept(listen_fd, NULL, NULL);
+  if (connfd < 0)
+    return -1;
+  kv_bench::HandshakeParams params;
+  params.threads = args->threads;
+  params.opCode = (uint32_t)args->op;
+  params.valueSize = (uint32_t)KV_WR_SIZE;
+  params.transMode = args->trans_mode;
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    if (!mgr[p]->ExchangeAsServer(connfd, params, ctx->conn_dual[p],
+                                  args->import_rtp)) {
+      fprintf(stderr, "dual-dev: port %d exchange failed\n", p);
+      return -1;
+    }
+  }
+  printf("dual-dev: 4 ports exchanged, waiting client end\n");
+  char buf[16];
+  while (read(connfd, buf, sizeof(buf)) > 0) {
+  }
+  close(connfd);
+  close(listen_fd);
+  for (int p = 0; p < DUAL_PORTS; p++) {
+    ctx->conn_dual[p].reset();
+    mgr[p]->Stop();
+    delete mgr[p];
+  }
+  free(ctx->va);
+  free(ctx);
+  return 0;
+}
+
 static int run_client(const argument_t *args) {
   context_t *ctx = (context_t *)calloc(1, sizeof(context_t));
   if (ctx == NULL)
@@ -1621,6 +1957,8 @@ static struct option g_long_options[] = {
     {"query-chips", no_argument, NULL, 1024},
     {"concurrency", required_argument, NULL, 1025},
     {"poll-cpu", required_argument, NULL, 1032},
+    {"dual-dev", no_argument, NULL, 1033},
+    {"dev-name2", required_argument, NULL, 1034},
     {"single-chip", required_argument, NULL, 1026},
     {NULL, 0, NULL, 0}};
 
@@ -1657,6 +1995,10 @@ static void usage(void) {
          "groups use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --poll-cpu <n>         pin URMA poll thread to cpu (default: "
          "auto pick a non-worker cpu)\n");
+  printf("      --dual-dev             dual physical device mode: 2 devices x "
+         "2 eids = 4 ports, 4 x 4M WR per round\n");
+  printf("      --dev-name2 <dev>      second physical device name (dual-dev "
+         "mode)\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
   printf("      --mixed-ratio <pct>    write percentage in mixed mode (default "
          "50)\n");
@@ -1681,6 +2023,10 @@ static int validate_input_params(argument_t *args) {
       args->value_size > UINT32_MAX || args->duration_sec == 0 ||
       args->jetty_count == 0 || args->jetty_count > MAX_JETTY_COUNT) {
     fprintf(stderr, "Invalid device, value size, duration, or jetty count\n");
+    return -1;
+  }
+  if (args->dual_dev && args->dev_name2 == NULL) {
+    fprintf(stderr, "dual-dev requires --dev-name2 <second device>\n");
     return -1;
   }
   if (args->threads == 0 || args->threads > 512) {
@@ -1868,6 +2214,12 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
     case 1032:
       args->poll_cpu = (int)strtol(optarg, NULL, 0);
       break;
+    case 1033:
+      args->dual_dev = true;
+      break;
+    case 1034:
+      args->dev_name2 = strdup(optarg);
+      break;
     default:
       usage();
       return -1;
@@ -1964,14 +2316,17 @@ int main(int argc, char *argv[]) {
     goto main_exit;
   }
   if (args.server_ip != NULL) {
-    ret = run_client(&args);
+    ret = args.dual_dev ? run_dual_client(&args) : run_client(&args);
   } else {
-    ret = run_server(&args);
+    ret = args.dual_dev ? run_dual_server(&args) : run_server(&args);
   }
 
 main_exit:
   if (args.dev_name != NULL) {
     free(args.dev_name);
+  }
+  if (args.dev_name2 != NULL) {
+    free(args.dev_name2);
   }
   if (args.server_ip != NULL) {
     free(args.server_ip);

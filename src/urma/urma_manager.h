@@ -70,7 +70,7 @@ public:
    * (首个打流线程注册时起轮询线程) */
   bool Init(const std::string &devName, bool cacheable, uint32_t jettyCount,
             uint32_t threadsMin, bool eventMode = false,
-            uint32_t transMode = 0);
+            uint32_t transMode = 0, int eidIndex = -1); /* eidIndex<0 = 自动 */
   void Stop(); /* 停轮询线程 + 资源清理 + urma_uninit */
 
   UrmaResource &Resource() { return resource_; }
