@@ -49,8 +49,8 @@
   4 /* 客户端 data_len = threads * 4 * value_size（get/mixed 用） */
 #define SERVER_DATA_WINDOW 4
 
-/* write 流水线模型：一个请求 = 同一 local 8MB buffer 向同一 remote 8MB 槽
- * 写 10 次（chip 交替
+/* write 流水线模型：一个请求 = 同一 local 8MB buffer 写入 remote 80MB 区域
+ * 的 10 个连续 8MB 槽（chip 交替
  * 1,2,1,2...），每次发送拆 2 条 4MB WR，【每条 4MB WR 一个独立 jetty】；
  * 10 次全完成（20 条 WR）= 请求完成；带宽按 80MB 传输字节/请求统计 */
 #define KV_WR_SIZE (4UL * 1024 * 1024)   /* 单条 WR 4MB */
@@ -112,7 +112,7 @@ typedef struct argument {
 
 typedef struct context context_t;
 
-/* write 流水线：一个在飞单元 = 一个请求（同一 8M buffer 发 10 次 =
+/* write 流水线：一个在飞单元 = 一个请求（local 8M 写 remote 80M =
  * 20 条 4M WR，每条 4M WR 独立 jetty，chip 按发送次数交替） */
 typedef struct wr_slot {
   std::shared_ptr<kv_bench::UrmaJetty> jetty[KV_WR_PER_REQ]; /* 每条 WR 独立 lane */
@@ -763,9 +763,9 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   return (ok_a && ok_b) ? 0 : -1;
 }
 
-/* ---------------- write 流水线（请求 = 同一 8M buffer 发 10 次） ------------ */
+/* ---------------- write 流水线（请求 = local 8M 写 remote 80M） ------------ */
 
-/* post 一个请求到指定槽：同一 8M buffer 发 10 次（chip 交替），每次发送拆
+/* post 一个请求到指定槽：同一 local 8M 写入 remote 80M（chip 交替），每次发送拆
  * 2 条 4M WR、【每条 4M WR 独立取一个 jetty】；20 条 WR 连续全部 post（不等
  * CQE），post_ns = 第 1 条 WR post 前（时延起点）。 */
 static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
@@ -773,17 +773,17 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
-  /* 地址绑定实际的在飞槽，避免请求乱序完成后复用序号导致地址碰撞。 */
-  uint64_t base_off = (uint64_t)slot_idx * KV_SEND_SIZE;
-  uint64_t remote_base = conn.RemoteSegVa() + (base_off % SERVER_PIPE_BYTES);
+  /* local 每槽复用 8M；remote 每槽占 80M，避免在飞请求之间地址碰撞。 */
+  uint64_t local_base_off = (uint64_t)slot_idx * KV_SEND_SIZE;
+  uint64_t remote_base_off = (uint64_t)slot_idx * KV_REQ_BYTES;
+  uint64_t remote_base = conn.RemoteSegVa() + remote_base_off;
 
   wr_slot_t *s = &w->wr_slots[slot_idx];
   s->req_seq = req_seq;
   s->done_cnt = 0;
   s->active = true;
   s->post_ns = now_ns(); /* 时延起点：第 1 条 WR post 前 */
-  /* 20 条 4M WR：send_idx 只决定 chip；10 次发送均覆盖同一 remote 8M 槽。
-   * half = 该 8M 槽的前半/后半。 */
+  /* 20 条 4M WR：send_idx 决定 chip 和 remote 8M 槽；half = 该槽的前/后 4M。 */
   for (uint32_t wr = 0; wr < KV_WR_PER_REQ; wr++) {
     uint32_t send_idx = wr / KV_WR_PER_SEND;
     uint32_t half = wr % KV_WR_PER_SEND;
@@ -805,8 +805,10 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
     uint64_t ue = mgr->PostEvent(w->id, seq);
     if (!mgr->PostWrite(
             jetty, conn,
-            (uint64_t)ctx->client_data + base_off + (uint64_t)half * KV_WR_SIZE,
-            remote_base + (uint64_t)half * KV_WR_SIZE,
+            (uint64_t)ctx->client_data + local_base_off +
+                (uint64_t)half * KV_WR_SIZE,
+            remote_base + (uint64_t)send_idx * KV_SEND_SIZE +
+                (uint64_t)half * KV_WR_SIZE,
             (uint32_t)KV_WR_SIZE, (uint32_t)src, (uint32_t)dst, ue)) {
       fprintf(stderr,
               "[pipe] req %llu WR %u (send %u) post failed, aborting\n",
@@ -834,8 +836,8 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
 /* write 流水线主循环（请求级流水线重叠）：
  * 请求 = 同一 8M buffer 发 10 次（chip 交替 1,2,1,2...），每次发送拆 2 条 4M WR
  * （每条独立 jetty，20 条 WR/请求）。20 条 4M WR 连续全部 post（4M 之间不等
- * CQE）；请求之间不等前一个完成（重叠），在飞请求 ≤ --concurrency（各占一块
- * 8M buffer），完成一个补发一个。时延 = 请求第 1 条 WR post → 最后一条 CQE。 */
+ * CQE）；请求之间不等前一个完成（重叠），在飞请求 ≤ --concurrency（各占 local
+ * 8M + remote 80M），完成一个补发一个。时延 = 请求第 1 条 WR post → 最后一条 CQE。 */
 static int client_write_pipeline(context_t *ctx, worker_t *w,
                                  uint64_t deadline) {
   const argument_t *args = &ctx->args;

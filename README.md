@@ -89,12 +89,12 @@ kv_bench 打流线程
 
 ## 打流模型（write：请求级流水线重叠）
 
-**一个 KV 请求 = 同一 local 8MB buffer 向同一 remote 8MB 槽写 10 次**（重复覆盖；
-chip 交替：第 1 次 chip1、第 2 次
+**一个 KV 请求 = 同一 local 8MB buffer 写入 remote 80MB**（10 个连续且不重叠的
+8MB 区间；chip 交替：第 1 次 chip1、第 2 次
 chip2、第 3 次 chip1...，5+5），**每次发送拆 2 条 4MB WR，每条 4MB WR 独立取一个
 jetty**（20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不等 CQE）；请求之间
-不等前一个完成（重叠）**，在飞请求 ≤ `--concurrency`（各占一块 8M buffer），完成
-一个补发一个：
+不等前一个完成（重叠）**，在飞请求 ≤ `--concurrency`（各占 local 8MB + remote
+80MB），完成一个补发一个：
 
 - 时延 = **第 1 条 WR post → 最后一条 CQE**（`request latency`）。
 - 带宽 = **80MB 传输字节/请求**（同一 8M 数据发 10 次 = 10×8M）。
@@ -112,7 +112,7 @@ jetty**（20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不�
    │                    │                                         │
    │                    ▼                                         │
    │  ② 发送：在飞请求 < N 且池有 jetty → post 新请求                │
-   │     ┌─ post_one_req：同一 8M buffer 发 10 次 ─────────────┐   │
+   │     ┌─ post_one_req：local 8M 写 remote 80M ──────────────┐   │
    │     │  for wr in 0..19:                                   │   │
    │     │    取 1 个 jetty                                    │   │
    │     │    PostEvent + PostWrite(4M, chip=wr/2%2?2:1)      │   │
@@ -128,7 +128,7 @@ jetty**（20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不�
       r1:   |======= 20 WR =======|
       r2:     |======= 20 WR =======|
       r3:       |======= 20 WR =======|
-  在飞: 4 个请求 × 20 WR = 80 条 4M WR 同时在飞（4 块 8M buffer）
+  在飞: 4 个请求 × 20 WR = 80 条 4M WR（local 4×8M，remote 4×80M）
   完成: r0 完成 → 释放 → 补发 r4（窗口恒 4 请求）
 ```
 
