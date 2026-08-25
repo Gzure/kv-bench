@@ -763,9 +763,10 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
 /* ---------------- write 流水线（请求 = 同一 8M buffer 发 10 次） ------------ */
 
 /* post 一个请求到指定槽：同一 8M buffer 发 10 次（chip 交替），每次发送拆
- * 2 条 4M WR、【每条 4M WR 独立取一个 jetty】；20 条 WR 全 post 后登记 */
+ * 2 条 4M WR、【每条 4M WR 独立取一个 jetty】；20 条 WR 全 post 后登记。
+ * start_ns = 时延起点（batch-sync 开 = 提交/入队时间；关 = post 时间） */
 static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
-                        uint64_t req_seq) {
+                        uint64_t req_seq, uint64_t start_ns) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
@@ -783,7 +784,7 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   s->req_seq = req_seq;
   s->done_cnt = 0;
   s->active = true;
-  uint64_t first_post = now_ns(); /* 时延起点：第 1 条 WR post 前 */
+  s->post_ns = start_ns; /* 时延起点：提交/入队时间（batch-sync 开，含排队） */
   /* 20 条 4M WR：send_idx = 第几次发送（chip 交替），half = 8M 前半/后半 */
   for (uint32_t wr = 0; wr < KV_WR_PER_REQ; wr++) {
     uint32_t send_idx = wr / KV_WR_PER_SEND;
@@ -826,7 +827,6 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
     s->seq[wr] = seq;
     s->done[wr] = false;
   }
-  s->post_ns = first_post;
   w->active_slots[w->active_count++] = slot_idx; /* 登记在飞槽 */
   return 0;
 }
@@ -844,6 +844,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   kv_bench::UrmaManager *mgr = ctx->mgr;
   uint32_t concurrency =
       (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
+  if (concurrency > KV_MAX_CONCURRENCY)
+    concurrency = KV_MAX_CONCURRENCY;
   /* 在飞请求数上限：batch-sync 开 = 1（串行）；关 = concurrency（重叠） */
   uint32_t max_inflight_reqs = args->batch_sync ? 1 : concurrency;
   uint64_t interval_ns = 0;
@@ -857,6 +859,19 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
   uint64_t req_seq = 0;  /* 请求全局序号 */
   uint32_t req_active = 0; /* 在飞请求数（≤ max_inflight_reqs） */
+
+  /* 请求队列（batch-sync 开）：深度 = concurrency，start FIFO。
+   * 请求"提交"（进入队列）即记 start，串行处理，完成才补提交——
+   * 时延 = 提交 → 完成（含排队等待前面请求），稳态 ≈ N × 单请求处理时间 */
+  uint64_t req_start_q[KV_MAX_CONCURRENCY];
+  uint32_t q_head = 0, q_tail = 0, q_count = 0;
+  if (args->batch_sync) {
+    for (uint32_t i = 0; i < concurrency; i++) {
+      req_start_q[q_tail] = now_ns();
+      q_tail = (q_tail + 1) % KV_MAX_CONCURRENCY;
+      q_count++;
+    }
+  }
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
@@ -889,18 +904,25 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         continue;
       }
       /* 请求完成：20 条 WR 全部完成；带宽按传输字节 = 8M × 10 次 = 80M/请求
-       * （时延见 hist_req） */
+       * （时延 = 提交 → 完成，见 hist_req） */
       __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
       for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
         mgr->ReleaseSendLane(s->jetty[i]);
         s->jetty[i].reset();
       }
       s->active = false;
-      /* 请求级时延：第 1 条 WR post → 最后一条 CQE */
+      /* 请求级时延：batch-sync 开 = 提交（入队）→ 最后 CQE（含排队等待）；
+       * 关 = post → 最后 CQE */
       kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
       __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
       if (req_active > 0)
         req_active--;
+      /* batch-sync：补提交一个新请求（保持队列深度 = concurrency） */
+      if (args->batch_sync) {
+        req_start_q[q_tail] = now_ns();
+        q_tail = (q_tail + 1) % KV_MAX_CONCURRENCY;
+        q_count++;
+      }
       /* 完成槽：从在飞列表移除（末尾交换）+ 归还空闲栈 */
       w->free_slots[w->free_count++] = idx;
       w->active_slots[k] = w->active_slots[w->active_count - 1];
@@ -908,14 +930,14 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       /* 不 k++：换进来的槽仍需处理 */
     }
 
-    /* 2. 发送：有请求就一直发，直到在飞请求达上限或池空 */
+    /* 2. 发送：batch-sync 开 = 队列取队头 post（在飞恒 1，串行）；
+     * 关 = 重叠（在飞 ≤ concurrency） */
     while (now_ns() < deadline && !ctx->fatal) {
-      /* batch_sync：一个请求 20 条全完成（req_active==0）才开始下一个 */
-      if (args->batch_sync && req_active > 0)
-        break;
       if (req_active >= max_inflight_reqs)
-        break; /* 请求并发满，等请求完成腾名额 */
-      if (interval_ns > 0) {
+        break; /* 在飞达上限，等请求完成腾名额 */
+      if (args->batch_sync && q_count == 0)
+        break; /* 队列空（不该发生，完成会补提交） */
+      if (interval_ns > 0 && args->batch_sync) {
         if (now_ns() < next_req_ns) {
           uint64_t left = next_req_ns - now_ns();
           if (left > 50000)
@@ -929,7 +951,14 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       if (w->free_count == 0)
         break; /* 槽满（≤ 10，理论不会） */
       uint32_t slot = w->free_slots[--w->free_count];
-      if (post_one_req(ctx, w, slot, req_seq) != 0) {
+      /* 时延起点：batch-sync 开 = 请求提交（进入队列）时间（含排队等待）；
+       * 关 = 本请求 post 时间 */
+      uint64_t start_ns = args->batch_sync ? req_start_q[q_head] : now_ns();
+      if (args->batch_sync) {
+        q_head = (q_head + 1) % KV_MAX_CONCURRENCY;
+        q_count--;
+      }
+      if (post_one_req(ctx, w, slot, req_seq, start_ns) != 0) {
         w->free_slots[w->free_count++] = slot; /* 归还槽 */
         return -1;
       }
