@@ -939,6 +939,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   uint64_t req_seq = 0;    /* 请求全局序号 */
   uint32_t req_active = 0; /* 在飞请求数（≤ concurrency） */
 
+  uint64_t lastPollNs_ = now_ns();
+  uint64_t maxPollNs = 0;
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
 
@@ -1014,10 +1016,18 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       progressed = true;
       req_active++;
       req_seq++;
+
+      uint64_t curPollNs = now_ns() - lastPollNs_;
+      if (curPollNs > maxPollNs) {
+        maxPollNs = curPollNs;
+      }
+      lastPollNs_ = now_ns();
     }
 
     // if (!progressed)
     //   sleep_ns(POLL_SLEEP_NS);
+    printf("[worker] worker thread exiting, max poll interval %.3f us\n",
+           (double)maxPollNs / 1000.0);
   }
 
   /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
