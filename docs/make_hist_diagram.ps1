@@ -1,4 +1,4 @@
-﻿# Generate docs/hist_layout.png: kv_hist_t (hist.h) HdrHistogram storage diagram.
+# Generate docs/hist_layout.png: kv_hist_t (hist.h) HdrHistogram storage diagram.
 Add-Type -AssemblyName System.Drawing
 
 $W = 1440; $H = 1150
@@ -115,7 +115,7 @@ foreach ($bk in $buckets) {
 Box $bx $y 60 96 $brFillB $penGray
 T ($bx + 20) ($y + 34) "⋯" $fMonoB $brGray
 $bx += 72
-T $bx ($y + 16) "bucket 25:" $fBoxB $brDark
+T $bx ($y + 16) "bucket 26:" $fBoxB $brDark
 T $bx ($y + 38) "34.4G ~ 68.7G ns" $fBody $brDark
 T $bx ($y + 62) "（覆盖 60 s 上限）" $fBox $brGray
 $y += 112
