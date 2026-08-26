@@ -26,6 +26,15 @@ uint64_t NowNs() {
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* 本线程 CPU 时间：与 NowNs() 同区间取差用于区分"墙钟等待"与"CPU 消耗"。
+ * 注意：event 模式下 poll 线程大部分墙钟时间在 urma_wait_jfc 里睡眠等 CQE，
+ * 墙钟-CPU ≈ CQE 到达间隔（正常），只有 CPU 时间本身异常大才是忙转。 */
+uint64_t NowCpuNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 void SleepNs(uint64_t ns) {
   struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)ns};
   nanosleep(&ts, nullptr);
@@ -408,8 +417,13 @@ void UrmaManager::PollThreadMain() {
   urma_cr_t crs[kMaxPollCr];
   uint64_t lastPollNs_ = 0;
   uint64_t maxPollNs = 0;
+  uint64_t lastPollCpuNs_ = 0;
+  uint64_t maxPollCpuNs = 0;
+  uint64_t maxPollWaitNs = 0; /* 墙钟-CPU：event 模式主要是 wait_jfc 阻塞（CQE 到达间隔） */
   uint64_t lastOnlyPollNs_ = 0;
   uint64_t maxOnlyPollNs = 0;
+  uint64_t lastOnlyPollCpuNs_ = 0;
+  uint64_t maxOnlyPollCpuNs = 0;
   while (!stop_) {
     int cnt;
     if (eventMode_) {
@@ -439,6 +453,12 @@ void UrmaManager::PollThreadMain() {
       if (curOnlyPollNs > maxOnlyPollNs) {
         maxOnlyPollNs = curOnlyPollNs;
       }
+      if (lastOnlyPollCpuNs_ != 0) {
+        uint64_t curOnlyCpuNs = NowCpuNs() - lastOnlyPollCpuNs_;
+        if (curOnlyCpuNs > maxOnlyPollCpuNs) {
+          maxOnlyPollCpuNs = curOnlyCpuNs;
+        }
+      }
     }
     if (cnt > 0) {
       for (int i = 0; i < cnt; i++) {
@@ -452,6 +472,7 @@ void UrmaManager::PollThreadMain() {
       }
 
       uint64_t now = NowNs();
+      uint64_t cpuNow = NowCpuNs();
       if (lastPollNs_ != 0) {
         uint64_t curPollNs = now - lastPollNs_;
         // if (curPollNs > 500000ULL) {
@@ -461,18 +482,33 @@ void UrmaManager::PollThreadMain() {
         if (curPollNs > maxPollNs) {
           maxPollNs = curPollNs;
         }
+        uint64_t curPollCpuNs = cpuNow - lastPollCpuNs_;
+        if (curPollCpuNs > maxPollCpuNs) {
+          maxPollCpuNs = curPollCpuNs;
+        }
+        if (curPollNs > curPollCpuNs) {
+          uint64_t wait = curPollNs - curPollCpuNs;
+          if (wait > maxPollWaitNs) {
+            maxPollWaitNs = wait;
+          }
+        }
       }
       lastPollNs_ = now;
+      lastPollCpuNs_ = cpuNow;
     } else if (cnt < 0) {
       fprintf(stderr, "Failed to poll jfc, ret=%d\n", cnt);
       SleepNs(1000 * kPollSleepNs);
     }
     lastOnlyPollNs_ = NowNs();
+    lastOnlyPollCpuNs_ = NowCpuNs();
   }
 
-  printf("[poll] poll thread exiting, max poll interval %.3f us, max only poll "
-         "interval %.3f us\n",
-         (double)maxPollNs / 1000.0, (double)maxOnlyPollNs / 1000.0);
+  printf("[poll] poll thread exiting, max poll interval %.3f us (cpu %.3f, "
+         "wait %.3f), max only poll "
+         "interval %.3f us (cpu %.3f)\n",
+         (double)maxPollNs / 1000.0, (double)maxPollCpuNs / 1000.0,
+         (double)maxPollWaitNs / 1000.0, (double)maxOnlyPollNs / 1000.0,
+         (double)maxOnlyPollCpuNs / 1000.0);
 }
 
 /* ---------------- send lane（每轮从池取一条 jetty） ---------------- */

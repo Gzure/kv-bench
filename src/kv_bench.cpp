@@ -206,6 +206,14 @@ static uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* 本线程 CPU 时间：与 now_ns()（墙钟）同区间取差，墙钟-本差值 = 被抢占/让出
+ * CPU 的时间（诊断调度问题用）。 */
+static uint64_t now_cpu_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 static void sleep_ns(uint64_t ns) {
   struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)ns};
   nanosleep(&ts, NULL);
@@ -941,14 +949,21 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
   uint64_t lastPollNs_ = 0;
   uint64_t maxPollNs = 0;
+  uint64_t lastPollCpuNs_ = 0;
+  uint64_t maxPollCpuNs = 0;
+  uint64_t maxPollPreemptNs = 0;
   uint64_t lastReqNs_ = 0;
   uint64_t maxReqNs = 0;
   uint64_t lastWorkerNs_ = 0;
   uint64_t maxWorkerNs = 0;
   uint64_t lastProbeWorkerNs_ = 0;
   uint64_t maxProbeWorkerNs = 0;
+  uint64_t maxProbeCpuNs = 0;
+  uint64_t maxProbePreemptNs = 0;
   uint64_t lastSendWorkerNs_ = 0;
   uint64_t maxSendWorkerNs = 0;
+  uint64_t maxSendCpuNs = 0;
+  uint64_t maxSendPreemptNs = 0;
 
   uint64_t maxProbeNs = 0;
   uint64_t maxReleaseNs = 0;
@@ -963,6 +978,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
      * ProbeEvent 成功即复位槽不能依赖单轮结果），20 条全完成 = 请求完成 */
     uint32_t k = 0;
     lastProbeWorkerNs_ = now_ns();
+    uint64_t probeCpuStartNs = now_cpu_ns();
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
@@ -1032,6 +1048,17 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     if (curProbePollNs > maxProbeWorkerNs) {
       maxProbeWorkerNs = curProbePollNs;
     }
+    uint64_t curProbeCpuNs = now_cpu_ns() - probeCpuStartNs;
+    if (curProbeCpuNs > maxProbeCpuNs) {
+      maxProbeCpuNs = curProbeCpuNs;
+    }
+    if (curProbePollNs > curProbeCpuNs) {
+      uint64_t pre = curProbePollNs - curProbeCpuNs;
+      if (pre > maxProbePreemptNs) {
+        maxProbePreemptNs = pre;
+      }
+    }
+    uint64_t sendCpuStartNs = now_cpu_ns();
 
     /* 2. 发送：有请求就一直发（重叠），在飞请求 ≤ concurrency 或池空 */
     while (now_ns() < deadline && !ctx->fatal) {
@@ -1075,10 +1102,21 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     // if (!progressed)
     //   sleep_ns(POLL_SLEEP_NS);
     uint64_t now = now_ns();
+    uint64_t curCpuNs = now_cpu_ns();
 
     uint64_t curSendPollNs = now - curProbeWorkerEndNs;
     if (curSendPollNs > maxSendWorkerNs) {
       maxSendWorkerNs = curSendPollNs;
+    }
+    uint64_t curSendCpuNs = curCpuNs - sendCpuStartNs;
+    if (curSendCpuNs > maxSendCpuNs) {
+      maxSendCpuNs = curSendCpuNs;
+    }
+    if (curSendPollNs > curSendCpuNs) {
+      uint64_t pre = curSendPollNs - curSendCpuNs;
+      if (pre > maxSendPreemptNs) {
+        maxSendPreemptNs = pre;
+      }
     }
 
     if (lastPollNs_ != 0) {
@@ -1086,18 +1124,38 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       if (curPollNs > maxPollNs) {
         maxPollNs = curPollNs;
       }
+      if (lastPollCpuNs_ != 0) {
+        uint64_t curPollCpuNs = curCpuNs - lastPollCpuNs_;
+        if (curPollCpuNs > maxPollCpuNs) {
+          maxPollCpuNs = curPollCpuNs;
+        }
+        if (curPollNs > curPollCpuNs) {
+          uint64_t pre = curPollNs - curPollCpuNs;
+          if (pre > maxPollPreemptNs) {
+            maxPollPreemptNs = pre;
+          }
+        }
+      }
     }
     lastPollNs_ = now;
+    lastPollCpuNs_ = curCpuNs;
   }
 
-  printf("[worker] worker thread exiting, max poll interval %.3f us, req "
-         "interval %.3f us, worker interval %.3f us, probe work interval %.3f "
-         "us, release interval %.3f us, record interval %.3f us, probe "
+  printf("[worker] worker thread exiting, max poll interval %.3f us (cpu %.3f, "
+         "preempt %.3f), req "
+         "interval %.3f us, worker interval %.3f us (cpu %.3f, preempt %.3f), "
+         "probe work interval %.3f "
+         "us (cpu %.3f, preempt %.3f), release interval %.3f us, record "
+         "interval %.3f us, probe "
          "interval %.3f us, post one send interval %.3f us\n",
-         (double)maxPollNs / 1000.0, (double)maxReqNs / 1000.0,
-         (double)maxSendWorkerNs / 1000.0, (double)maxProbeWorkerNs / 1000.0,
-         (double)maxReleaseNs / 1000.0, (double)maxRecordNs / 1000.0,
-         (double)maxProbeNs / 1000.0, (double)maxPostNs / 1000.0);
+         (double)maxPollNs / 1000.0, (double)maxPollCpuNs / 1000.0,
+         (double)maxPollPreemptNs / 1000.0, (double)maxReqNs / 1000.0,
+         (double)maxSendWorkerNs / 1000.0, (double)maxSendCpuNs / 1000.0,
+         (double)maxSendPreemptNs / 1000.0,
+         (double)maxProbeWorkerNs / 1000.0, (double)maxProbeCpuNs / 1000.0,
+         (double)maxProbePreemptNs / 1000.0, (double)maxReleaseNs / 1000.0,
+         (double)maxRecordNs / 1000.0, (double)maxProbeNs / 1000.0,
+         (double)maxPostNs / 1000.0);
 
   /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
    * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
