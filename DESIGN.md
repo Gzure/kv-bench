@@ -147,7 +147,7 @@ client                                  server
 - `AbortEvent`：post 失败时仅取消完全匹配的 token，旧 token 不会清掉复用后的新事件。
 - 数据面（write 分片流水线）：每个分片 `PostWrite`（事件 ue）→ `ProbeEvent` 轮询完成 → 完成一个补发一个（见 §6.1）；get 为 `PostRead` 直接 READ（见 §6.3）。
 
-**send lane（每请求取新 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从 FIFO 空闲队列头部取下标，`Release` 从尾部归还——**每个请求都取到"新的" jetty**，多线程下天然分散。池大小 = `max(--jetty-count, threads, 在飞请求窗口)`。
+**send lane（每个 8MB send 取一条 jetty）**：`SendJettyPool`（urma_send_lane.h）内部自带 `std::mutex`，`Add/PopIdle/Release/Remove/GetStats/At`；`PopIdle` 从 FIFO 空闲队列头部取下标，`Release` 从尾部归还。同一个 send 的两条 4MB WR 共用该 jetty，请求完成后归还 10 条 jetty。池大小 = `max(--jetty-count, threads, 10×在飞请求数)`。
 
 ---
 
@@ -212,7 +212,7 @@ while (!stop && !fatal && now < deadline):
 
 ## 7. 统计与报表
 
-- 每线程 HdrHistogram-lite（`hist.h`，ns 精度，3 位有效数字），**write 每请求记一次时延**（该请求 20 个分片全部完成）；get 每请求记一次（READ CQE 完成）。
+- 每线程 HdrHistogram-lite（`hist.h`，ns 精度，3 位有效数字），**write 每请求记一次时延**（该请求 10 个 send、20 条 WR 全部完成）；get 每请求记一次（READ CQE 完成）。
 - 汇总：`avg / min / p50 / p90 / p99 / p999 / p9999 / pmax`（us）。
 - 采样线程每 `--report-interval` 秒差分 `ops/bytes` → 瞬时 IOPS 与带宽。
 - **带宽双单位输出**：`bandwidth=33849.72 MB/s (270797.75 Mb/s)`（大 B 字节/s + 小 b 比特/s）。

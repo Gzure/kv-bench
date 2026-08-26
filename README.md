@@ -91,8 +91,8 @@ kv_bench 打流线程
 
 **一个 KV 请求 = 同一 local 8MB buffer 写入 remote 80MB**（10 个连续且不重叠的
 8MB 区间；chip 交替：第 1 次 chip1、第 2 次
-chip2、第 3 次 chip1...，5+5），**每次发送拆 2 条 4MB WR，每条 4MB WR 独立取一个
-jetty**（20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不等 CQE）；请求之间
+chip2、第 3 次 chip1...，5+5），**每次发送拆 2 条 4MB WR，两条 WR 共用一个
+jetty**（10 个 jetty、20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不等 CQE）；请求之间
 不等前一个完成（重叠）**，在飞请求 ≤ `--concurrency`（各占 local 8MB + remote
 80MB），完成一个补发一个：
 
@@ -108,13 +108,13 @@ jetty**（20 条 WR/请求）。**20 条 4M WR 连续全部 post（4M 之间不�
    ┌─────────────────────────── 主循环 ───────────────────────────┐
    │                                                              │
    │  ① 收完成：ProbeEvent 扫描在飞槽，20 条 WR 全完成 → 请求完成    │
-   │     (bytes += 80M, 记 request latency, 释放 20 jetty, 腾窗口) │
+   │     (bytes += 80M, 记 request latency, 释放 10 jetty, 腾窗口) │
    │                    │                                         │
    │                    ▼                                         │
    │  ② 发送：在飞请求 < N 且池有 jetty → post 新请求                │
    │     ┌─ post_one_req：local 8M 写 remote 80M ──────────────┐   │
    │     │  for wr in 0..19:                                   │   │
-   │     │    取 1 个 jetty                                    │   │
+   │     │    每个 8M send 取 1 个 jetty（共 10 个）           │   │
    │     │    PostEvent + PostWrite(4M, chip=wr/2%2?2:1)      │   │
    │     │    （20 条 WR 连续 post，不等 CQE）                  │   │
    │     └────────────────────────────────────────────────────┘   │
@@ -186,7 +186,7 @@ for n in 1 2 4 8 16 32 64 128 200; do
 done
 ```
 
-池大小自动取 `max(jetty_count, threads, 10×并发度)`（保证并发度内的在飞组都有 jetty 可取）。
+池大小自动取 `max(jetty_count, threads, 10×并发度)`；每个 8MB send 的两条 4MB WR 共用一个 jetty，因此每个请求占用 10 个 jetty。
 
 ## 其它参数
 
