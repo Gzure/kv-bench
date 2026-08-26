@@ -161,10 +161,13 @@ EINVAL 警告后继续）。
   一个 8M 请求从第 1 条 WR post → 第 20 条 CQE 完成的时延。
 - `--poll-cpu <n>`：URMA 轮询线程绑核（默认自动选一个非 worker 核，避免与
   打流线程争抢）。
-- `--report-interval <s>` 周期打印瞬时 IOPS/带宽。
+- `--report-interval <s>` 周期打印瞬时 IOPS/带宽，以及该周期内完成请求的
+  `avg/min/p50/p90/p99/p999/p9999/pmax` 时延。
 - 汇总行含 requests/IOPS/WR 速率（write = 20×IOPS，get = 1×IOPS）/带宽（MB/s）/errors。
 
 ```text
+[t=1.0s] ops=1100 iops=1099.94 bandwidth=92269.39 MB/s (738155.14 Mb/s) errors=0
+[t=1.0s] request latency(us): avg=7201.312 min=6803.456 p50=7180.288 p90=7421.952 p99=7606.272 p999=7712.768 p9999=7712.768 pmax=7712.768
 ==== summary role=client op=write threads=16 size=4194304 concurrency=4 affinity=affinity jetty_count=200 duration=30.0s ====
 requests=900000 iops=30000.00 wr_rate=600000.00 bandwidth=25165.82 MB/s (201326.59 Mb/s) bytes=75497472000 errors=0
 request latency(us): avg=5333.33 min=1624.00 p50=5000.00 p90=6100.00 p99=8025.00 p999=17670.00 p9999=30480.00 pmax=208400.00

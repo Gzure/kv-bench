@@ -1282,6 +1282,11 @@ static void *client_sampler_main(void *arg) {
   uint64_t last_ops = 0, last_bytes = 0;
   uint64_t t0 = now_ns();
   uint64_t last_t = t0;
+  kv_hist_t current = {}, previous = {}, interval = {};
+  bool latency_ready =
+      kv_hist_init(&current, 1, 60ULL * 1000000000ULL, 3) == 0 &&
+      kv_hist_init(&previous, 1, 60ULL * 1000000000ULL, 3) == 0 &&
+      kv_hist_init(&interval, 1, 60ULL * 1000000000ULL, 3) == 0;
   while (!ctx->stop) {
     sleep(
         (unsigned int)(args->report_interval > 0 ? args->report_interval : 1));
@@ -1292,6 +1297,16 @@ static void *client_sampler_main(void *arg) {
       bytes += __atomic_load_n(&ctx->workers[i].bytes, __ATOMIC_RELAXED);
       errors += __atomic_load_n(&ctx->workers[i].errors, __ATOMIC_RELAXED);
     }
+    if (latency_ready) {
+      kv_hist_reset(&current);
+      for (uint32_t i = 0; i < ctx->worker_count; i++) {
+        worker_t *w = &ctx->workers[i];
+        kv_hist_merge_snapshot(&current,
+                               args->op == OP_WRITE ? &w->hist_req : &w->hist);
+      }
+      kv_hist_delta(&interval, &current, &previous);
+      kv_hist_copy(&previous, &current);
+    }
     double dt = (double)(now - last_t) / 1e9;
     double elapsed = (double)(now - t0) / 1e9;
     if (dt > 0) {
@@ -1300,11 +1315,23 @@ static void *client_sampler_main(void *arg) {
              " iops=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) errors=%" PRIu64 "\n",
              elapsed, ops, (double)(ops - last_ops) / dt, bw_mb_s,
              bw_mb_s * 8.0, errors);
+      if (latency_ready) {
+        char latency_tag[64];
+        snprintf(latency_tag, sizeof(latency_tag), "[t=%.1fs] request",
+                 elapsed);
+        if (interval.total_count == 0)
+          printf("%s latency(us): no samples\n", latency_tag);
+        else
+          print_latency_line_us(latency_tag, &interval);
+      }
     }
     last_ops = ops;
     last_bytes = bytes;
     last_t = now;
   }
+  kv_hist_destroy(&current);
+  kv_hist_destroy(&previous);
+  kv_hist_destroy(&interval);
   return NULL;
 }
 

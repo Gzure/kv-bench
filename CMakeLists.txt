@@ -100,4 +100,11 @@ if(BUILD_TESTING)
 		PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 	)
 	add_test(NAME event-slot-pool COMMAND event-slot-pool-test)
+
+	add_executable(hist-test tests/hist_test.cpp)
+	target_include_directories(hist-test
+		PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+	)
+	target_link_libraries(hist-test PRIVATE pthread)
+	add_test(NAME hist COMMAND hist-test)
 endif()

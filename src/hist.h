@@ -114,6 +114,35 @@ static inline void kv_hist_destroy(kv_hist_t *h)
     h->counts_array_length = 0;
 }
 
+static inline void kv_hist_reset(kv_hist_t *h)
+{
+    if (h == nullptr || h->counts == nullptr) {
+        return;
+    }
+    memset(h->counts, 0, (size_t)h->counts_array_length * sizeof(uint64_t));
+    h->total_count = 0;
+    h->min_value = UINT64_MAX;
+    h->max_value = 0;
+}
+
+static inline void kv_hist_copy(kv_hist_t *dst, const kv_hist_t *src)
+{
+    if (dst == nullptr || src == nullptr || dst->counts == nullptr || src->counts == nullptr) {
+        return;
+    }
+    int32_t n = src->counts_array_length;
+    if (n > dst->counts_array_length) {
+        n = dst->counts_array_length;
+    }
+    memcpy(dst->counts, src->counts, (size_t)n * sizeof(uint64_t));
+    if (n < dst->counts_array_length) {
+        memset(dst->counts + n, 0, (size_t)(dst->counts_array_length - n) * sizeof(uint64_t));
+    }
+    dst->total_count = src->total_count;
+    dst->min_value = src->min_value;
+    dst->max_value = src->max_value;
+}
+
 static inline int32_t kv_hist_get_bucket_index(const kv_hist_t *h, uint64_t value)
 {
     if (value < (uint64_t)h->sub_bucket_half_count) {
@@ -146,7 +175,7 @@ static inline void kv_hist_record(kv_hist_t *h, uint64_t value)
     if (index < 0 || index >= h->counts_array_length) {
         return;
     }
-    h->counts[index]++;
+    __atomic_add_fetch(&h->counts[index], 1, __ATOMIC_RELAXED);
     h->total_count++;
     if (value < h->min_value) {
         h->min_value = value;
@@ -177,6 +206,71 @@ static inline void kv_hist_merge(kv_hist_t *dst, const kv_hist_t *src)
     }
     if (src->max_value > dst->max_value) {
         dst->max_value = src->max_value;
+    }
+}
+
+/* Merge bucket counts while another thread may be recording samples. */
+static inline void kv_hist_merge_snapshot(kv_hist_t *dst, const kv_hist_t *src)
+{
+    if (src == nullptr || src->counts == nullptr || dst->counts == nullptr) {
+        return;
+    }
+    int32_t n = src->counts_array_length;
+    if (n > dst->counts_array_length) {
+        n = dst->counts_array_length;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        uint64_t c = __atomic_load_n(&src->counts[i], __ATOMIC_RELAXED);
+        if (c == 0) {
+            continue;
+        }
+        dst->counts[i] += c;
+        dst->total_count += c;
+        int32_t bucket_index = i >> dst->sub_bucket_half_count_magnitude;
+        int32_t sub_bucket_index = i & (dst->sub_bucket_half_count - 1);
+        uint64_t value = kv_hist_value_from_index(dst, bucket_index, sub_bucket_index);
+        if (value < dst->min_value) {
+            dst->min_value = value;
+        }
+        if (value > dst->max_value) {
+            dst->max_value = value;
+        }
+    }
+}
+
+/* Build the samples added between two cumulative snapshots. */
+static inline void kv_hist_delta(kv_hist_t *dst, const kv_hist_t *current, const kv_hist_t *previous)
+{
+    if (dst == nullptr || current == nullptr || previous == nullptr || dst->counts == nullptr ||
+        current->counts == nullptr || previous->counts == nullptr) {
+        return;
+    }
+    kv_hist_reset(dst);
+    int32_t n = current->counts_array_length;
+    if (n > previous->counts_array_length) {
+        n = previous->counts_array_length;
+    }
+    if (n > dst->counts_array_length) {
+        n = dst->counts_array_length;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        uint64_t current_count = current->counts[i];
+        uint64_t previous_count = previous->counts[i];
+        uint64_t added = current_count >= previous_count ? current_count - previous_count : current_count;
+        if (added == 0) {
+            continue;
+        }
+        dst->counts[i] = added;
+        dst->total_count += added;
+        int32_t bucket_index = i >> dst->sub_bucket_half_count_magnitude;
+        int32_t sub_bucket_index = i & (dst->sub_bucket_half_count - 1);
+        uint64_t value = kv_hist_value_from_index(dst, bucket_index, sub_bucket_index);
+        if (value < dst->min_value) {
+            dst->min_value = value;
+        }
+        if (value > dst->max_value) {
+            dst->max_value = value;
+        }
     }
 }
 
