@@ -977,8 +977,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     /* 1. 收完成：只遍历在飞槽列表；每槽探测 20 条 WR（done[i] 持久化，
      * ProbeEvent 成功即复位槽不能依赖单轮结果），20 条全完成 = 请求完成 */
     uint32_t k = 0;
-    lastProbeWorkerNs_ = now_ns();
-    uint64_t probeCpuStartNs = now_cpu_ns();
+    // lastProbeWorkerNs_ = now_ns();
+    // uint64_t probeCpuStartNs = now_cpu_ns();
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
@@ -1001,11 +1001,11 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           progressed = true;
         }
       }
-      uint64_t probeNsEnd_ = now_ns();
-      uint64_t curProbeNs = probeNsEnd_ - probeNsStart_;
-      if (curProbeNs > maxProbeNs) {
-        maxProbeNs = curProbeNs;
-      }
+      // uint64_t probeNsEnd_ = now_ns();
+      // uint64_t curProbeNs = probeNsEnd_ - probeNsStart_;
+      // if (curProbeNs > maxProbeNs) {
+      //   maxProbeNs = curProbeNs;
+      // }
 
       if (s->done_cnt < KV_WR_PER_REQ) {
         k++; /* 请求未完成，处理下一个在飞槽 */
@@ -1018,21 +1018,21 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         s->jetty[send_idx].reset();
       }
 
-      uint64_t releaseNsEnd_ = now_ns();
-      uint64_t curRelaseNs = releaseNsEnd_ - probeNsEnd_;
-      if (curRelaseNs > maxReleaseNs) {
-        maxReleaseNs = curRelaseNs;
-      }
+      // uint64_t releaseNsEnd_ = now_ns();
+      // uint64_t curRelaseNs = releaseNsEnd_ - probeNsEnd_;
+      // if (curRelaseNs > maxReleaseNs) {
+      //   maxReleaseNs = curRelaseNs;
+      // }
 
       s->active = false;
       /* 请求级时延：第 1 条 WR post → 最后一条 CQE */
       kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
       __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
 
-      uint64_t curRecordNs = now_ns() - releaseNsEnd_;
-      if (curRecordNs > maxRecordNs) {
-        maxRecordNs = curRecordNs;
-      }
+      // uint64_t curRecordNs = now_ns() - releaseNsEnd_;
+      // if (curRecordNs > maxRecordNs) {
+      //   maxRecordNs = curRecordNs;
+      // }
 
       if (req_active > 0)
         req_active--;
@@ -1043,22 +1043,22 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       /* 不 k++：换进来的槽仍需处理 */
     }
 
-    uint64_t curProbeWorkerEndNs = now_ns();
-    uint64_t curProbePollNs = curProbeWorkerEndNs - lastProbeWorkerNs_;
-    if (curProbePollNs > maxProbeWorkerNs) {
-      maxProbeWorkerNs = curProbePollNs;
-    }
-    uint64_t curProbeCpuNs = now_cpu_ns() - probeCpuStartNs;
-    if (curProbeCpuNs > maxProbeCpuNs) {
-      maxProbeCpuNs = curProbeCpuNs;
-    }
-    if (curProbePollNs > curProbeCpuNs) {
-      uint64_t pre = curProbePollNs - curProbeCpuNs;
-      if (pre > maxProbePreemptNs) {
-        maxProbePreemptNs = pre;
-      }
-    }
-    uint64_t sendCpuStartNs = now_cpu_ns();
+    // uint64_t curProbeWorkerEndNs = now_ns();
+    // uint64_t curProbePollNs = curProbeWorkerEndNs - lastProbeWorkerNs_;
+    // if (curProbePollNs > maxProbeWorkerNs) {
+    //   maxProbeWorkerNs = curProbePollNs;
+    // }
+    // uint64_t curProbeCpuNs = now_cpu_ns() - probeCpuStartNs;
+    // if (curProbeCpuNs > maxProbeCpuNs) {
+    //   maxProbeCpuNs = curProbeCpuNs;
+    // }
+    // if (curProbePollNs > curProbeCpuNs) {
+    //   uint64_t pre = curProbePollNs - curProbeCpuNs;
+    //   if (pre > maxProbePreemptNs) {
+    //     maxProbePreemptNs = pre;
+    //   }
+    // }
+    // uint64_t sendCpuStartNs = now_cpu_ns();
 
     /* 2. 发送：有请求就一直发（重叠），在飞请求 ≤ concurrency 或池空 */
     while (now_ns() < deadline && !ctx->fatal) {
@@ -1078,139 +1078,139 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       if (w->free_count == 0)
         break; /* 槽满（≤ 10，理论不会） */
       uint32_t slot = w->free_slots[--w->free_count];
-      uint64_t postNsStart_ = now_ns();
+      // uint64_t postNsStart_ = now_ns();
       if (post_one_req(ctx, w, slot, req_seq) != 0) {
         w->free_slots[w->free_count++] = slot; /* 归还槽 */
         return -1;
       }
-      uint64_t curPostNs_ = now_ns() - postNsStart_;
-      if (curPostNs_ > maxPostNs) {
-        maxPostNs = curPostNs_;
-      }
+      // uint64_t curPostNs_ = now_ns() - postNsStart_;
+      // if (curPostNs_ > maxPostNs) {
+      //   maxPostNs = curPostNs_;
+      // }
       progressed = true;
       req_active++;
       req_seq++;
-      if (lastReqNs_ != 0) {
-        uint64_t curReqNs = now_ns() - lastReqNs_;
-        if (curReqNs > maxReqNs) {
-          maxReqNs = curReqNs;
-        }
-      }
-      lastReqNs_ = now_ns();
+      // if (lastReqNs_ != 0) {
+      //   uint64_t curReqNs = now_ns() - lastReqNs_;
+      //   if (curReqNs > maxReqNs) {
+      //     maxReqNs = curReqNs;
+      //   }
+      // }
+      // lastReqNs_ = now_ns();
     }
 
     // if (!progressed)
     //   sleep_ns(POLL_SLEEP_NS);
-    uint64_t now = now_ns();
-    uint64_t curCpuNs = now_cpu_ns();
+    // uint64_t now = now_ns();
+    // uint64_t curCpuNs = now_cpu_ns();
 
-    uint64_t curSendPollNs = now - curProbeWorkerEndNs;
-    if (curSendPollNs > maxSendWorkerNs) {
-      maxSendWorkerNs = curSendPollNs;
-    }
-    uint64_t curSendCpuNs = curCpuNs - sendCpuStartNs;
-    if (curSendCpuNs > maxSendCpuNs) {
-      maxSendCpuNs = curSendCpuNs;
-    }
-    if (curSendPollNs > curSendCpuNs) {
-      uint64_t pre = curSendPollNs - curSendCpuNs;
-      if (pre > maxSendPreemptNs) {
-        maxSendPreemptNs = pre;
-      }
-    }
+    // uint64_t curSendPollNs = now - curProbeWorkerEndNs;
+    // if (curSendPollNs > maxSendWorkerNs) {
+    //   maxSendWorkerNs = curSendPollNs;
+    // }
+    // uint64_t curSendCpuNs = curCpuNs - sendCpuStartNs;
+    // if (curSendCpuNs > maxSendCpuNs) {
+    //   maxSendCpuNs = curSendCpuNs;
+    // }
+    // if (curSendPollNs > curSendCpuNs) {
+    //   uint64_t pre = curSendPollNs - curSendCpuNs;
+    //   if (pre > maxSendPreemptNs) {
+    //     maxSendPreemptNs = pre;
+    //   }
+    // }
 
-    if (lastPollNs_ != 0) {
-      uint64_t curPollNs = now - lastPollNs_;
-      if (curPollNs > maxPollNs) {
-        maxPollNs = curPollNs;
-      }
-      if (lastPollCpuNs_ != 0) {
-        uint64_t curPollCpuNs = curCpuNs - lastPollCpuNs_;
-        if (curPollCpuNs > maxPollCpuNs) {
-          maxPollCpuNs = curPollCpuNs;
-        }
-        if (curPollNs > curPollCpuNs) {
-          uint64_t pre = curPollNs - curPollCpuNs;
-          if (pre > maxPollPreemptNs) {
-            maxPollPreemptNs = pre;
-          }
-        }
-      }
-    }
-    lastPollNs_ = now;
-    lastPollCpuNs_ = curCpuNs;
+    // if (lastPollNs_ != 0) {
+    //   uint64_t curPollNs = now - lastPollNs_;
+    //   if (curPollNs > maxPollNs) {
+    //     maxPollNs = curPollNs;
+    //   }
+    //   if (lastPollCpuNs_ != 0) {
+    //     uint64_t curPollCpuNs = curCpuNs - lastPollCpuNs_;
+    //     if (curPollCpuNs > maxPollCpuNs) {
+    //       maxPollCpuNs = curPollCpuNs;
+    //     }
+    //     if (curPollNs > curPollCpuNs) {
+    //       uint64_t pre = curPollNs - curPollCpuNs;
+    //       if (pre > maxPollPreemptNs) {
+    //         maxPollPreemptNs = pre;
+    //       }
+    //     }
+    //   }
   }
+  // lastPollNs_ = now;
+  // lastPollCpuNs_ = curCpuNs;
+}
 
-  printf("[worker] worker thread exiting, max poll interval %.3f us (cpu %.3f, "
-         "preempt %.3f), req "
-         "interval %.3f us, worker interval %.3f us (cpu %.3f, preempt %.3f), "
-         "probe work interval %.3f "
-         "us (cpu %.3f, preempt %.3f), release interval %.3f us, record "
-         "interval %.3f us, probe "
-         "interval %.3f us, post one send interval %.3f us\n",
-         (double)maxPollNs / 1000.0, (double)maxPollCpuNs / 1000.0,
-         (double)maxPollPreemptNs / 1000.0, (double)maxReqNs / 1000.0,
-         (double)maxSendWorkerNs / 1000.0, (double)maxSendCpuNs / 1000.0,
-         (double)maxSendPreemptNs / 1000.0,
-         (double)maxProbeWorkerNs / 1000.0, (double)maxProbeCpuNs / 1000.0,
-         (double)maxProbePreemptNs / 1000.0, (double)maxReleaseNs / 1000.0,
-         (double)maxRecordNs / 1000.0, (double)maxProbeNs / 1000.0,
-         (double)maxPostNs / 1000.0);
+// printf("[worker] worker thread exiting, max poll interval %.3f us (cpu %.3f,
+// "
+//        "preempt %.3f), req "
+//        "interval %.3f us, worker interval %.3f us (cpu %.3f, preempt %.3f), "
+//        "probe work interval %.3f "
+//        "us (cpu %.3f, preempt %.3f), release interval %.3f us, record "
+//        "interval %.3f us, probe "
+//        "interval %.3f us, post one send interval %.3f us\n",
+//        (double)maxPollNs / 1000.0, (double)maxPollCpuNs / 1000.0,
+//        (double)maxPollPreemptNs / 1000.0, (double)maxReqNs / 1000.0,
+//        (double)maxSendWorkerNs / 1000.0, (double)maxSendCpuNs / 1000.0,
+//        (double)maxSendPreemptNs / 1000.0,
+//        (double)maxProbeWorkerNs / 1000.0, (double)maxProbeCpuNs / 1000.0,
+//        (double)maxProbePreemptNs / 1000.0, (double)maxReleaseNs / 1000.0,
+//        (double)maxRecordNs / 1000.0, (double)maxProbeNs / 1000.0,
+//        (double)maxPostNs / 1000.0);
 
-  /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
-   * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
-   * 避免残留 */
-  const uint64_t drain_deadline =
-      now_ns() + (uint64_t)args->timeout_ms * 1000000ULL;
-  uint64_t drain_failures = 0;
-  while (w->active_count > 0) {
-    uint32_t idx = w->active_slots[0];
-    wr_slot_t *s = &w->wr_slots[idx];
-    bool request_completed = true;
-    for (uint32_t send_idx = 0; send_idx < KV_SENDS_PER_REQ; send_idx++) {
-      bool send_completed = true;
-      for (uint32_t half = 0; half < KV_WR_PER_SEND; half++) {
-        uint32_t wr = send_idx * KV_WR_PER_SEND + half;
-        if (!s->done[wr]) {
-          uint64_t now = now_ns();
-          int remaining_ms = 0;
-          if (now < drain_deadline) {
-            remaining_ms =
-                (int)((drain_deadline - now + 999999ULL) / 1000000ULL);
-          }
-          if (!mgr->WaitEvent(w->id, s->event_token[wr], remaining_ms)) {
-            fprintf(stderr,
-                    "[pipe] drain timeout: req=%llu WR=%u token=%llu; "
-                    "8M lane quarantined\n",
-                    (unsigned long long)s->req_seq, wr,
-                    (unsigned long long)s->event_token[wr]);
-            drain_failures++;
-            send_completed = false;
-            request_completed = false;
-          } else {
-            kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[wr]);
-          }
+/* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
+ * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
+ * 避免残留 */
+const uint64_t drain_deadline =
+    now_ns() + (uint64_t)args->timeout_ms * 1000000ULL;
+uint64_t drain_failures = 0;
+while (w->active_count > 0) {
+  uint32_t idx = w->active_slots[0];
+  wr_slot_t *s = &w->wr_slots[idx];
+  bool request_completed = true;
+  for (uint32_t send_idx = 0; send_idx < KV_SENDS_PER_REQ; send_idx++) {
+    bool send_completed = true;
+    for (uint32_t half = 0; half < KV_WR_PER_SEND; half++) {
+      uint32_t wr = send_idx * KV_WR_PER_SEND + half;
+      if (!s->done[wr]) {
+        uint64_t now = now_ns();
+        int remaining_ms = 0;
+        if (now < drain_deadline) {
+          remaining_ms = (int)((drain_deadline - now + 999999ULL) / 1000000ULL);
+        }
+        if (!mgr->WaitEvent(w->id, s->event_token[wr], remaining_ms)) {
+          fprintf(stderr,
+                  "[pipe] drain timeout: req=%llu WR=%u token=%llu; "
+                  "8M lane quarantined\n",
+                  (unsigned long long)s->req_seq, wr,
+                  (unsigned long long)s->event_token[wr]);
+          drain_failures++;
+          send_completed = false;
+          request_completed = false;
+        } else {
+          kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[wr]);
         }
       }
-      if (send_completed)
-        mgr->ReleaseSendLane(s->jetty[send_idx]);
-      s->jetty[send_idx].reset();
     }
-    if (request_completed) {
-      kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
-      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
-      __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
-    }
-    s->active = false;
-    w->free_slots[w->free_count++] = idx;
-    w->active_slots[0] = w->active_slots[w->active_count - 1];
-    w->active_count--;
+    if (send_completed)
+      mgr->ReleaseSendLane(s->jetty[send_idx]);
+    s->jetty[send_idx].reset();
   }
-  if (drain_failures > 0) {
-    __atomic_add_fetch(&w->errors, drain_failures, __ATOMIC_RELAXED);
+  if (request_completed) {
+    kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
+    __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
   }
+  s->active = false;
+  w->free_slots[w->free_count++] = idx;
+  w->active_slots[0] = w->active_slots[w->active_count - 1];
+  w->active_count--;
+}
+if (drain_failures > 0) {
+  __atomic_add_fetch(&w->errors, drain_failures, __ATOMIC_RELAXED);
+}
 
-  return 0;
+return 0;
 }
 
 /* get：客户端直接 READ 服务器数据区（value-size 字节）到本地读缓冲 */
