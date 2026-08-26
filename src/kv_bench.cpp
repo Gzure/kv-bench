@@ -18,6 +18,7 @@
  * bthread/brpc/protobuf 依赖。
  */
 
+#include "clock.h"
 #include "hist.h"
 #include "sys/mman.h"
 #include "urma/urma_manager.h"
@@ -200,11 +201,7 @@ struct context {
 
 /* ---------------- 基础工具 ---------------- */
 
-static uint64_t now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
+static uint64_t now_ns(void) { return kv_now_ns(); }
 
 /* 本线程 CPU 时间：与 now_ns()（墙钟）同区间取差，墙钟-本差值 = 被抢占/让出
  * CPU 的时间（诊断调度问题用）。 */
@@ -2665,6 +2662,7 @@ static int run_chip_query(const argument_t *args) {
 }
 
 int main(int argc, char *argv[]) {
+  kv_clock_init(); /* 周期计数器校准：必须在任何计时/建线程之前 */
   argument_t args{};
   int ret;
 

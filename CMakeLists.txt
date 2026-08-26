@@ -77,6 +77,7 @@ message(STATUS "Found liburma: ${URMA_LIBRARY}")
 
 add_executable(kv-bench
 	src/kv_bench.cpp
+	src/clock.cpp
 	src/urma/urma_resource.cpp
 	src/urma/urma_manager.cpp
 )

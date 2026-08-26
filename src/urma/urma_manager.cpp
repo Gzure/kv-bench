@@ -9,6 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../clock.h"
 #include "urma_opcode.h"
 #include "urma_ubagg.h"
 
@@ -20,11 +21,7 @@ constexpr int kMaxPollCr = 32;
 constexpr uint64_t kPollSleepNs =
     1000; /* 1us，对齐参考 UrmaManager::PollJfcWait 退避 */
 
-uint64_t NowNs() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
+uint64_t NowNs() { return kv_now_ns(); }
 
 /* 本线程 CPU 时间：与 NowNs() 同区间取差用于区分"墙钟等待"与"CPU 消耗"。
  * 注意：event 模式下 poll 线程大部分墙钟时间在 urma_wait_jfc 里睡眠等 CQE，
