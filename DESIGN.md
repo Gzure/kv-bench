@@ -212,9 +212,9 @@ while (!stop && !fatal && now < deadline):
 
 ## 7. 统计与报表
 
-- 每线程 HdrHistogram-lite（`hist.h`，ns 精度，3 位有效数字），**write 每请求记一次时延**（该请求 10 个 send、20 条 WR 全部完成）；get 每请求记一次（READ CQE 完成）。
+- 每线程 HdrHistogram-lite（`hist.h`，ns 精度，3 位有效数字），**write 每请求记一次时延**（该请求 10 个 send、20 条 WR 全部完成）；同时每条 WR 从自身 post 到 CQE 被确认记一次 WR 时延；get 每请求及其单条 READ WR 各记一次。
 - 汇总：`avg / min / p50 / p90 / p99 / p999 / p9999 / pmax`（us）。
-- 采样线程每 `--report-interval` 秒差分 `ops/bytes` → 瞬时 IOPS 与带宽，同时通过原子读取桶计数生成累计直方图快照并差分，输出该周期内完成请求的时延分位数；采样过程不阻塞打流线程。
+- 采样线程每 `--report-interval` 秒差分 `ops/bytes` → 瞬时 IOPS 与带宽，同时通过原子读取桶计数生成累计直方图快照并差分，输出该周期内完成 request/WR 的时延分位数；采样过程不阻塞打流线程。
 - **带宽双单位输出**：`bandwidth=33849.72 MB/s (270797.75 Mb/s)`（大 B 字节/s + 小 b 比特/s）。
 - 字节口径：write = 客户端→服务器 payload；get = 服务器→客户端 READ payload。
 

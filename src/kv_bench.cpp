@@ -130,6 +130,7 @@ typedef struct wr_slot {
   std::shared_ptr<kv_bench::UrmaJetty>
       jetty[KV_SENDS_PER_REQ];         /* 每个 8M send 独立 lane */
   uint64_t event_token[KV_WR_PER_REQ]; /* 20 条 WR 的完成事件 token */
+  uint64_t wr_post_ns[KV_WR_PER_REQ];  /* 每条 WR 的 post 时间 */
   bool done[KV_WR_PER_REQ];            /* 各 WR 完成标志（持久） */
   uint8_t done_cnt; /* 已完成 WR 数（=20 请求完成） */
   uint64_t req_seq; /* 请求全局序号 */
@@ -142,6 +143,7 @@ typedef struct worker {
   uint32_t local_index; /* 本连接/本进程内序号 */
   kv_hist_t hist; /* 批时延直方图（10 请求全完成记一次） */
   kv_hist_t hist_req; /* 请求级时延直方图（单个 8M 请求完成记一次） */
+  kv_hist_t hist_wr; /* WR 级时延直方图（每条 4M WR 完成记一次） */
   volatile uint64_t ops;
   volatile uint64_t bytes;
   volatile uint64_t errors;
@@ -756,6 +758,7 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
     mgr->ReleaseSendLane(jetty);
     return -1;
   }
+  uint64_t post_a_ns = now_ns();
   if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_a, remote_a,
                       wr_len, (uint32_t)src_a, (uint32_t)dst_chip, ua)) {
     fprintf(stderr, "[wr] post A failed\n");
@@ -764,12 +767,14 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
     mgr->ReleaseSendLane(jetty);
     return -1;
   }
+  uint64_t post_b_ns = now_ns();
   if (!mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_b, remote_b,
                       wr_len, (uint32_t)src_b, (uint32_t)dst_chip, ub)) {
     fprintf(stderr, "[wr] post B failed\n");
     mgr->AbortEvent(w->id, token_b);
     bool a_completed = mgr->WaitEvent(w->id, token_a, args->timeout_ms);
     if (a_completed) {
+      kv_hist_record(&w->hist_wr, now_ns() - post_a_ns);
       mgr->ReleaseSendLane(jetty);
     } else {
       fprintf(stderr, "[wr] A did not complete; send lane quarantined\n");
@@ -777,7 +782,11 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
     return -1;
   }
   bool ok_a = mgr->WaitEvent(w->id, token_a, args->timeout_ms);
+  if (ok_a)
+    kv_hist_record(&w->hist_wr, now_ns() - post_a_ns);
   bool ok_b = mgr->WaitEvent(w->id, token_b, args->timeout_ms);
+  if (ok_b)
+    kv_hist_record(&w->hist_wr, now_ns() - post_b_ns);
   if (!ok_a) {
     fprintf(stderr,
             "[wr] wait A failed (token=%lu, src_chip=%d, dst_chip=%d)\n",
@@ -814,8 +823,11 @@ static void drain_posted_wrs(kv_bench::UrmaManager *mgr, worker_t *w,
     if (end_wr > posted_wr_count)
       end_wr = posted_wr_count;
     for (uint32_t wr = first_wr; wr < end_wr; wr++) {
-      if (!mgr->WaitEvent(w->id, s->event_token[wr], timeout_ms))
+      if (!mgr->WaitEvent(w->id, s->event_token[wr], timeout_ms)) {
         send_completed = false;
+      } else {
+        kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[wr]);
+      }
     }
     if (send_completed) {
       mgr->ReleaseSendLane(s->jetty[send_idx]);
@@ -874,6 +886,7 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
       s->active = false;
       return -1;
     }
+    s->wr_post_ns[wr] = now_ns();
     if (!mgr->PostWrite(jetty, conn,
                         (uint64_t)ctx->client_data + local_base_off +
                             (uint64_t)half * KV_WR_SIZE,
@@ -949,6 +962,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         if (r == 1) {
           s->done[i] = true;
           s->done_cnt++;
+          kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[i]);
           progressed = true;
         }
       }
@@ -1015,6 +1029,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   while (w->active_count > 0) {
     uint32_t idx = w->active_slots[0];
     wr_slot_t *s = &w->wr_slots[idx];
+    bool request_completed = true;
     for (uint32_t send_idx = 0; send_idx < KV_SENDS_PER_REQ; send_idx++) {
       bool send_completed = true;
       for (uint32_t half = 0; half < KV_WR_PER_SEND; half++) {
@@ -1034,12 +1049,20 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
                     (unsigned long long)s->event_token[wr]);
             drain_failures++;
             send_completed = false;
+            request_completed = false;
+          } else {
+            kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[wr]);
           }
         }
       }
       if (send_completed)
         mgr->ReleaseSendLane(s->jetty[send_idx]);
       s->jetty[send_idx].reset();
+    }
+    if (request_completed) {
+      kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
+      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
     }
     s->active = false;
     w->free_slots[w->free_count++] = idx;
@@ -1075,6 +1098,7 @@ static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_chip) {
     mgr->ReleaseSendLane(jetty);
     return -1;
   }
+  uint64_t post_ns = now_ns();
   if (!mgr->PostRead(jetty, conn, (uint64_t)ctx->client_data + off, remote,
                      size, (uint32_t)src_a, (uint32_t)dst_chip, ue)) {
     fprintf(stderr, "[get] post read failed\n");
@@ -1084,6 +1108,7 @@ static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_chip) {
   }
   bool ok = mgr->WaitEvent(w->id, event_token, args->timeout_ms);
   if (ok) {
+    kv_hist_record(&w->hist_wr, now_ns() - post_ns);
     mgr->ReleaseSendLane(jetty);
   } else {
     fprintf(stderr, "[get] incomplete send lane quarantined\n");
@@ -1218,12 +1243,13 @@ static void print_latency_line_us(const char *tag, const kv_hist_t *h) {
   uint64_t p99 = kv_hist_value_at_percentile(h, 99.0);
   uint64_t p999 = kv_hist_value_at_percentile(h, 99.9);
   uint64_t p9999 = kv_hist_value_at_percentile(h, 99.99);
-  printf("%s latency(us): avg=%.3f min=%.3f p50=%.3f p90=%.3f p99=%.3f "
+  printf("%s latency(us): samples=%" PRIu64
+         " avg=%.3f min=%.3f p50=%.3f p90=%.3f p99=%.3f "
          "p999=%.3f p9999=%.3f pmax=%.3f\n",
-         tag, (double)avg / 1000.0, (double)kv_hist_min(h) / 1000.0,
-         (double)p50 / 1000.0, (double)p90 / 1000.0, (double)p99 / 1000.0,
-         (double)p999 / 1000.0, (double)p9999 / 1000.0,
-         (double)kv_hist_max(h) / 1000.0);
+         tag, h->total_count, (double)avg / 1000.0,
+         (double)kv_hist_min(h) / 1000.0, (double)p50 / 1000.0,
+         (double)p90 / 1000.0, (double)p99 / 1000.0, (double)p999 / 1000.0,
+         (double)p9999 / 1000.0, (double)kv_hist_max(h) / 1000.0);
 }
 
 static const char *op_name(int op) {
@@ -1237,15 +1263,20 @@ static const char *aff_name(int m) {
 
 static void print_client_summary(context_t *ctx, double seconds) {
   const argument_t *args = &ctx->args;
-  kv_hist_t merged, merged_req;
+  kv_hist_t merged = {}, merged_req = {}, merged_wr = {};
   if (kv_hist_init(&merged, 1, 60ULL * 1000000000ULL, 3) != 0 ||
-      kv_hist_init(&merged_req, 1, 60ULL * 1000000000ULL, 3) != 0) {
+      kv_hist_init(&merged_req, 1, 60ULL * 1000000000ULL, 3) != 0 ||
+      kv_hist_init(&merged_wr, 1, 60ULL * 1000000000ULL, 3) != 0) {
+    kv_hist_destroy(&merged);
+    kv_hist_destroy(&merged_req);
+    kv_hist_destroy(&merged_wr);
     return;
   }
   uint64_t ops = 0, bytes = 0, errors = 0;
   for (uint32_t i = 0; i < ctx->worker_count; i++) {
     kv_hist_merge(&merged, &ctx->workers[i].hist);
     kv_hist_merge(&merged_req, &ctx->workers[i].hist_req);
+    kv_hist_merge(&merged_wr, &ctx->workers[i].hist_wr);
     ops += __atomic_load_n(&ctx->workers[i].ops, __ATOMIC_RELAXED);
     bytes += __atomic_load_n(&ctx->workers[i].bytes, __ATOMIC_RELAXED);
     errors += __atomic_load_n(&ctx->workers[i].errors, __ATOMIC_RELAXED);
@@ -1272,8 +1303,62 @@ static void print_client_summary(context_t *ctx, double seconds) {
   } else {
     print_latency_line_us("request", &merged);
   }
+  print_latency_line_us("wr", &merged_wr);
   kv_hist_destroy(&merged);
   kv_hist_destroy(&merged_req);
+  kv_hist_destroy(&merged_wr);
+}
+
+typedef struct latency_window {
+  kv_hist_t current;
+  kv_hist_t previous;
+  kv_hist_t interval;
+  bool ready;
+} latency_window_t;
+
+enum class LatencyKind { Request, Wr };
+
+static void latency_window_init(latency_window_t *window) {
+  *window = {};
+  window->ready =
+      kv_hist_init(&window->current, 1, 60ULL * 1000000000ULL, 3) == 0 &&
+      kv_hist_init(&window->previous, 1, 60ULL * 1000000000ULL, 3) == 0 &&
+      kv_hist_init(&window->interval, 1, 60ULL * 1000000000ULL, 3) == 0;
+}
+
+static void latency_window_destroy(latency_window_t *window) {
+  kv_hist_destroy(&window->current);
+  kv_hist_destroy(&window->previous);
+  kv_hist_destroy(&window->interval);
+}
+
+static void latency_window_sample(context_t *ctx, latency_window_t *window,
+                                  LatencyKind kind) {
+  if (!window->ready)
+    return;
+  kv_hist_reset(&window->current);
+  for (uint32_t i = 0; i < ctx->worker_count; i++) {
+    worker_t *w = &ctx->workers[i];
+    kv_hist_t *source =
+        kind == LatencyKind::Wr
+            ? &w->hist_wr
+            : (ctx->args.op == OP_WRITE ? &w->hist_req : &w->hist);
+    kv_hist_merge_snapshot(&window->current, source);
+  }
+  kv_hist_delta(&window->interval, &window->current, &window->previous);
+  kv_hist_copy(&window->previous, &window->current);
+}
+
+static void print_interval_latency(double elapsed, const char *kind,
+                                   const latency_window_t *window) {
+  if (!window->ready)
+    return;
+  char tag[64];
+  snprintf(tag, sizeof(tag), "[t=%.1fs] %s", elapsed, kind);
+  if (window->interval.total_count == 0)
+    printf("%s latency(us): no samples\n", tag);
+  else
+    print_latency_line_us(tag, &window->interval);
 }
 
 static void *client_sampler_main(void *arg) {
@@ -1282,11 +1367,9 @@ static void *client_sampler_main(void *arg) {
   uint64_t last_ops = 0, last_bytes = 0;
   uint64_t t0 = now_ns();
   uint64_t last_t = t0;
-  kv_hist_t current = {}, previous = {}, interval = {};
-  bool latency_ready =
-      kv_hist_init(&current, 1, 60ULL * 1000000000ULL, 3) == 0 &&
-      kv_hist_init(&previous, 1, 60ULL * 1000000000ULL, 3) == 0 &&
-      kv_hist_init(&interval, 1, 60ULL * 1000000000ULL, 3) == 0;
+  latency_window_t request_latency, wr_latency;
+  latency_window_init(&request_latency);
+  latency_window_init(&wr_latency);
   while (!ctx->stop) {
     sleep(
         (unsigned int)(args->report_interval > 0 ? args->report_interval : 1));
@@ -1297,16 +1380,8 @@ static void *client_sampler_main(void *arg) {
       bytes += __atomic_load_n(&ctx->workers[i].bytes, __ATOMIC_RELAXED);
       errors += __atomic_load_n(&ctx->workers[i].errors, __ATOMIC_RELAXED);
     }
-    if (latency_ready) {
-      kv_hist_reset(&current);
-      for (uint32_t i = 0; i < ctx->worker_count; i++) {
-        worker_t *w = &ctx->workers[i];
-        kv_hist_merge_snapshot(&current,
-                               args->op == OP_WRITE ? &w->hist_req : &w->hist);
-      }
-      kv_hist_delta(&interval, &current, &previous);
-      kv_hist_copy(&previous, &current);
-    }
+    latency_window_sample(ctx, &request_latency, LatencyKind::Request);
+    latency_window_sample(ctx, &wr_latency, LatencyKind::Wr);
     double dt = (double)(now - last_t) / 1e9;
     double elapsed = (double)(now - t0) / 1e9;
     if (dt > 0) {
@@ -1315,23 +1390,15 @@ static void *client_sampler_main(void *arg) {
              " iops=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) errors=%" PRIu64 "\n",
              elapsed, ops, (double)(ops - last_ops) / dt, bw_mb_s,
              bw_mb_s * 8.0, errors);
-      if (latency_ready) {
-        char latency_tag[64];
-        snprintf(latency_tag, sizeof(latency_tag), "[t=%.1fs] request",
-                 elapsed);
-        if (interval.total_count == 0)
-          printf("%s latency(us): no samples\n", latency_tag);
-        else
-          print_latency_line_us(latency_tag, &interval);
-      }
+      print_interval_latency(elapsed, "request", &request_latency);
+      print_interval_latency(elapsed, "wr", &wr_latency);
     }
     last_ops = ops;
     last_bytes = bytes;
     last_t = now;
   }
-  kv_hist_destroy(&current);
-  kv_hist_destroy(&previous);
-  kv_hist_destroy(&interval);
+  latency_window_destroy(&request_latency);
+  latency_window_destroy(&wr_latency);
   return NULL;
 }
 
@@ -1376,7 +1443,7 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args) {
 }
 
 static int create_workers(context_t *ctx, uint32_t count) {
-  ctx->workers = new worker_t[count]; /* worker_t 含 shared_ptr，须用 new */
+  ctx->workers = new worker_t[count](); /* worker_t 含 shared_ptr，须用 new */
   if (ctx->workers == NULL)
     return -1;
   ctx->worker_count = count;
@@ -1400,7 +1467,8 @@ static int create_workers(context_t *ctx, uint32_t count) {
       w->free_slots[s] = s;
     }
     if (kv_hist_init(&w->hist, 1, 60ULL * 1000000000ULL, 3) != 0 ||
-        kv_hist_init(&w->hist_req, 1, 60ULL * 1000000000ULL, 3) != 0)
+        kv_hist_init(&w->hist_req, 1, 60ULL * 1000000000ULL, 3) != 0 ||
+        kv_hist_init(&w->hist_wr, 1, 60ULL * 1000000000ULL, 3) != 0)
       return -1;
   }
   return 0;
@@ -1411,6 +1479,7 @@ static void free_bench_workers(context_t *ctx) {
     for (uint32_t i = 0; i < ctx->worker_count; i++) {
       kv_hist_destroy(&ctx->workers[i].hist);
       kv_hist_destroy(&ctx->workers[i].hist_req);
+      kv_hist_destroy(&ctx->workers[i].hist_wr);
     }
     delete[] ctx->workers;
     ctx->workers = NULL;

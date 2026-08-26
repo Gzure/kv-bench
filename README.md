@@ -162,15 +162,18 @@ EINVAL 警告后继续）。
 - `--poll-cpu <n>`：URMA 轮询线程绑核（默认自动选一个非 worker 核，避免与
   打流线程争抢）。
 - `--report-interval <s>` 周期打印瞬时 IOPS/带宽，以及该周期内完成请求的
-  `avg/min/p50/p90/p99/p999/p9999/pmax` 时延。
+  request 和 WR 的 `avg/min/p50/p90/p99/p999/p9999/pmax` 时延。WR 时延为
+  每条 4M WR 从自身 post 到 CQE 被确认的时间。
 - 汇总行含 requests/IOPS/WR 速率（write = 20×IOPS，get = 1×IOPS）/带宽（MB/s）/errors。
 
 ```text
 [t=1.0s] ops=1100 iops=1099.94 bandwidth=92269.39 MB/s (738155.14 Mb/s) errors=0
-[t=1.0s] request latency(us): avg=7201.312 min=6803.456 p50=7180.288 p90=7421.952 p99=7606.272 p999=7712.768 p9999=7712.768 pmax=7712.768
+[t=1.0s] request latency(us): samples=1100 avg=7201.312 min=6803.456 p50=7180.288 p90=7421.952 p99=7606.272 p999=7712.768 p9999=7712.768 pmax=7712.768
+[t=1.0s] wr latency(us): samples=22000 avg=3140.288 min=2801.664 p50=3112.960 p90=3387.392 p99=3522.560 p999=3596.288 p9999=3596.288 pmax=3596.288
 ==== summary role=client op=write threads=16 size=4194304 concurrency=4 affinity=affinity jetty_count=200 duration=30.0s ====
 requests=900000 iops=30000.00 wr_rate=600000.00 bandwidth=25165.82 MB/s (201326.59 Mb/s) bytes=75497472000 errors=0
-request latency(us): avg=5333.33 min=1624.00 p50=5000.00 p90=6100.00 p99=8025.00 p999=17670.00 p9999=30480.00 pmax=208400.00
+request latency(us): samples=900000 avg=5333.33 min=1624.00 p50=5000.00 p90=6100.00 p99=8025.00 p999=17670.00 p9999=30480.00 pmax=208400.00
+wr latency(us): samples=18000000 avg=2180.12 min=901.12 p50=2105.34 p90=2511.87 p99=3022.84 p999=4318.21 p9999=5901.44 pmax=8102.91
 ```
 
 ## Jetty 线性度扫描
