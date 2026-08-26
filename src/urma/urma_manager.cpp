@@ -430,8 +430,8 @@ void UrmaManager::PollThreadMain() {
     } else {
       cnt = urma_poll_jfc(resource_.Jfc(), kMaxPollCr, crs);
     }
-    if (lastPollNs_ != 0) {
-      uint64_t curOnlyPollNs = NowNs() - lastPollNs_;
+    if (lastOnlyPollNs_ != 0) {
+      uint64_t curOnlyPollNs = NowNs() - lastOnlyPollNs_;
       if (curOnlyPollNs > 100000ULL) {
         fprintf(stderr, "[poll] only poll interval %.3f us\n",
                 (double)curOnlyPollNs / 1000.0);
@@ -454,7 +454,7 @@ void UrmaManager::PollThreadMain() {
       uint64_t now = NowNs();
       if (lastPollNs_ != 0) {
         uint64_t curPollNs = now - lastPollNs_;
-        if (curPollNs > 100000ULL) {
+        if (curPollNs > 500000ULL) {
           fprintf(stderr, "[poll] poll interval %.3f us, now=%lu\n",
                   (double)curPollNs / 1000.0, (double)now / 1000);
         }
@@ -462,12 +462,12 @@ void UrmaManager::PollThreadMain() {
           maxPollNs = curPollNs;
         }
       }
-
-      lastPollNs_ = now;
     } else if (cnt < 0) {
       fprintf(stderr, "Failed to poll jfc, ret=%d\n", cnt);
       SleepNs(1000 * kPollSleepNs);
     }
+    lastPollNs_ = NowNs();
+    lastOnlyPollNs_ = NowNs();
   }
 
   printf("[poll] poll thread exiting, max poll interval %.3f us, max only poll "
