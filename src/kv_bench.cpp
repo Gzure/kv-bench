@@ -1001,7 +1001,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     }
 
     uint64_t curProbeWorkerEndNs = now_ns();
-    uint64_t curProbePollNs = curProbeWorkerEndNs - lastPollNs_;
+    uint64_t curProbePollNs = curProbeWorkerEndNs - lastProbeWorkerNs_;
     if (curProbePollNs > maxProbeWorkerNs) {
       maxProbeWorkerNs = curProbePollNs;
     }
