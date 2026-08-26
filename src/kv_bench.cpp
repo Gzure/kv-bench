@@ -945,12 +945,17 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   uint64_t maxReqNs = 0;
   uint64_t lastWorkerNs_ = 0;
   uint64_t maxWorkerNs = 0;
+  uint64_t lastProbeWorkerNs_ = 0;
+  uint64_t maxProbeWorkerNs = 0;
+  uint64_t lastSendWorkerNs_ = 0;
+  uint64_t maxSendWorkerNs = 0;
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
 
     /* 1. 收完成：只遍历在飞槽列表；每槽探测 20 条 WR（done[i] 持久化，
      * ProbeEvent 成功即复位槽不能依赖单轮结果），20 条全完成 = 请求完成 */
     uint32_t k = 0;
+    lastProbeWorkerNs_ = now_ns();
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
@@ -995,6 +1000,12 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       /* 不 k++：换进来的槽仍需处理 */
     }
 
+    uint64_t curProbeWorkerEndNs = now_ns();
+    uint64_t curProbePollNs = curProbeWorkerEndNs - lastPollNs_;
+    if (curProbePollNs > maxProbeWorkerNs) {
+      maxProbeWorkerNs = curProbePollNs;
+    }
+
     /* 2. 发送：有请求就一直发（重叠），在飞请求 ≤ concurrency 或池空 */
     while (now_ns() < deadline && !ctx->fatal) {
       if (req_active >= max_inflight_reqs)
@@ -1020,9 +1031,11 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       progressed = true;
       req_active++;
       req_seq++;
-      uint64_t curReqNs = now_ns() - lastReqNs_;
-      if (curReqNs > maxReqNs) {
-        maxReqNs = curReqNs;
+      if (lastReqNs_ != 0) {
+        uint64_t curReqNs = now_ns() - lastReqNs_;
+        if (curReqNs > maxReqNs) {
+          maxReqNs = curReqNs;
+        }
       }
       lastReqNs_ = now_ns();
     }
@@ -1030,6 +1043,12 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     // if (!progressed)
     //   sleep_ns(POLL_SLEEP_NS);
     uint64_t now = now_ns();
+
+    uint64_t curSendPollNs = now - curProbeWorkerEndNs;
+    if (curSendPollNs > maxSendWorkerNs) {
+      maxSendWorkerNs = curSendPollNs;
+    }
+
     if (lastPollNs_ != 0) {
       uint64_t curPollNs = now - lastPollNs_;
       if (curPollNs > maxPollNs) {
@@ -1037,20 +1056,13 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       }
     }
     lastPollNs_ = now;
-
-    if (lastWorkerNs_ != 0) {
-      uint64_t curWorkerNs = now - lastWorkerNs_;
-      if (curWorkerNs > maxWorkerNs) {
-        maxWorkerNs = curWorkerNs;
-      }
-    }
-    lastWorkerNs_ = now;
   }
 
   printf("[worker] worker thread exiting, max poll interval %.3f us, req "
-         "interval %.3f us, worker interval %.3f us\n",
+         "interval %.3f us, worker interval %.3f us, probe work interval %.3f "
+         "us\n",
          (double)maxPollNs / 1000.0, (double)maxReqNs / 1000.0,
-         (double)maxWorkerNs / 1000.0);
+         (double)maxSendWorkerNs / 1000.0, (double)maxProbeWorkerNs / 1000.0);
 
   /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
    * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
