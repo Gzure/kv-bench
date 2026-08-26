@@ -430,18 +430,17 @@ void UrmaManager::PollThreadMain() {
     } else {
       cnt = urma_poll_jfc(resource_.Jfc(), kMaxPollCr, crs);
     }
-    if (cnt > 0) {
-      if (lastPollNs_ != 0) {
-        uint64_t curOnlyPollNs = NowNs() - lastPollNs_;
-        if (curOnlyPollNs > 100000ULL) {
-          fprintf(stderr, "[poll] only poll interval %.3f us\n",
-                  (double)curOnlyPollNs / 1000.0);
-        }
-        if (curOnlyPollNs > maxOnlyPollNs) {
-          maxOnlyPollNs = curOnlyPollNs;
-        }
+    if (lastPollNs_ != 0) {
+      uint64_t curOnlyPollNs = NowNs() - lastPollNs_;
+      if (curOnlyPollNs > 100000ULL) {
+        fprintf(stderr, "[poll] only poll interval %.3f us\n",
+                (double)curOnlyPollNs / 1000.0);
       }
-
+      if (curOnlyPollNs > maxOnlyPollNs) {
+        maxOnlyPollNs = curOnlyPollNs;
+      }
+    }
+    if (cnt > 0) {
       for (int i = 0; i < cnt; i++) {
         uint64_t userCtx = crs[i].user_ctx;
         uint32_t wid = (uint32_t)(userCtx >> kRidShift);
