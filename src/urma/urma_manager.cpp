@@ -408,6 +408,8 @@ void UrmaManager::PollThreadMain() {
   urma_cr_t crs[kMaxPollCr];
   uint64_t lastPollNs_ = 0;
   uint64_t maxPollNs = 0;
+  uint64_t lastOnlyPollNs_ = 0;
+  uint64_t maxOnlyPollNs = 0;
   while (!stop_) {
     int cnt;
     if (eventMode_) {
@@ -429,6 +431,16 @@ void UrmaManager::PollThreadMain() {
       cnt = urma_poll_jfc(resource_.Jfc(), kMaxPollCr, crs);
     }
     if (cnt > 0) {
+      if (lastOnlyPollNs_ != 0) {
+        uint64_t curOnlyPollNs = NowNs() - lastOnlyPollNs_;
+        if (curOnlyPollNs > 100000ULL) {
+          fprintf(stderr, "[poll] only poll interval %.3f us\n",
+                  (double)curOnlyPollNs / 1000.0);
+        }
+        if (curOnlyPollNs > maxOnlyPollNs) {
+          maxOnlyPollNs = curOnlyPollNs;
+        }
+      }
       for (int i = 0; i < cnt; i++) {
         uint64_t userCtx = crs[i].user_ctx;
         uint32_t wid = (uint32_t)(userCtx >> kRidShift);
@@ -440,6 +452,10 @@ void UrmaManager::PollThreadMain() {
       }
       if (lastPollNs_ != 0) {
         uint64_t curPollNs = NowNs() - lastPollNs_;
+        if (curPollNs > 100000ULL) {
+          fprintf(stderr, "[poll] poll interval %.3f us\n",
+                  (double)curPollNs / 1000.0);
+        }
         if (curPollNs > maxPollNs) {
           maxPollNs = curPollNs;
         }
@@ -452,8 +468,9 @@ void UrmaManager::PollThreadMain() {
     }
   }
 
-  printf("[poll] poll thread exiting, max poll interval %.3f us\n",
-         (double)maxPollNs / 1000.0);
+  printf("[poll] poll thread exiting, max poll interval %.3f us, max only poll "
+         "interval %.3f us\n",
+         (double)maxPollNs / 1000.0, (double)maxOnlyPollNs / 1000.0);
 }
 
 /* ---------------- send lane（每轮从池取一条 jetty） ---------------- */
