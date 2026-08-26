@@ -451,18 +451,20 @@ void UrmaManager::PollThreadMain() {
         }
         CompleteEvent(wid, userCtx, crs[i].status == URMA_CR_SUCCESS);
       }
+
+      uint64_t now = NowNs();
       if (lastPollNs_ != 0) {
-        uint64_t curPollNs = NowNs() - lastPollNs_;
+        uint64_t curPollNs = now - lastPollNs_;
         if (curPollNs > 100000ULL) {
-          fprintf(stderr, "[poll] poll interval %.3f us\n",
-                  (double)curPollNs / 1000.0);
+          fprintf(stderr, "[poll] poll interval %.3f us, now=%lu\n",
+                  (double)curPollNs / 1000.0, (double)now / 1000);
         }
         if (curPollNs > maxPollNs) {
           maxPollNs = curPollNs;
         }
       }
 
-      lastPollNs_ = NowNs();
+      lastPollNs_ = now;
     } else if (cnt < 0) {
       fprintf(stderr, "Failed to poll jfc, ret=%d\n", cnt);
       SleepNs(1000 * kPollSleepNs);
