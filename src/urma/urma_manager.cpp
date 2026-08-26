@@ -462,11 +462,11 @@ void UrmaManager::PollThreadMain() {
           maxPollNs = curPollNs;
         }
       }
+      lastPollNs_ = now;
     } else if (cnt < 0) {
       fprintf(stderr, "Failed to poll jfc, ret=%d\n", cnt);
       SleepNs(1000 * kPollSleepNs);
     }
-    lastPollNs_ = NowNs();
     lastOnlyPollNs_ = NowNs();
   }
 
