@@ -949,6 +949,13 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   uint64_t maxProbeWorkerNs = 0;
   uint64_t lastSendWorkerNs_ = 0;
   uint64_t maxSendWorkerNs = 0;
+
+  uint64_t maxProbeNs = 0;
+  uint64_t maxReleaseNs = 0;
+  uint64_t maxRecordNs = 0;
+
+  uint64_t maxPostNs = 0;
+
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
 
@@ -959,6 +966,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
+      uint64_t probeNsStart_ = now_ns();
       for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
         if (s->done[i])
           continue;
@@ -977,6 +985,12 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           progressed = true;
         }
       }
+      uint64_t probeNsEnd_ = now_ns();
+      uint64_t curProbeNs = probeNsEnd_ - probeNsStart_;
+      if (curProbeNs > maxProbeNs) {
+        maxProbeNs = curProbeNs;
+      }
+
       if (s->done_cnt < KV_WR_PER_REQ) {
         k++; /* 请求未完成，处理下一个在飞槽 */
         continue;
@@ -987,10 +1001,23 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         mgr->ReleaseSendLane(s->jetty[send_idx]);
         s->jetty[send_idx].reset();
       }
+
+      uint64_t releaseNsEnd_ = now_ns();
+      uint64_t curRelaseNs = releaseNsEnd_ - probeNsEnd_;
+      if (curRelaseNs > maxReleaseNs) {
+        maxReleaseNs = curRelaseNs;
+      }
+
       s->active = false;
       /* 请求级时延：第 1 条 WR post → 最后一条 CQE */
       kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
       __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+
+      uint64_t curRecordNs = now_ns() - releaseNsEnd_;
+      if (curRecordNs > maxRecordNs) {
+        maxRecordNs = curRecordNs;
+      }
+
       if (req_active > 0)
         req_active--;
       /* 完成槽：从在飞列表移除（末尾交换）+ 归还空闲栈 */
@@ -1024,9 +1051,14 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       if (w->free_count == 0)
         break; /* 槽满（≤ 10，理论不会） */
       uint32_t slot = w->free_slots[--w->free_count];
+      uint64_t postNsStart_ = now_ns();
       if (post_one_req(ctx, w, slot, req_seq) != 0) {
         w->free_slots[w->free_count++] = slot; /* 归还槽 */
         return -1;
+      }
+      uint64_t curPostNs_ = now_ns() - postNsStart_;
+      if (curPostNs_ > maxPostNs) {
+        maxPostNs = curPostNs_;
       }
       progressed = true;
       req_active++;
@@ -1060,9 +1092,12 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
   printf("[worker] worker thread exiting, max poll interval %.3f us, req "
          "interval %.3f us, worker interval %.3f us, probe work interval %.3f "
-         "us\n",
+         "us, release interval %.3f us, record interval %.3f us, probe "
+         "interval %.3f us, post one send interval %.3f us\n",
          (double)maxPollNs / 1000.0, (double)maxReqNs / 1000.0,
-         (double)maxSendWorkerNs / 1000.0, (double)maxProbeWorkerNs / 1000.0);
+         (double)maxSendWorkerNs / 1000.0, (double)maxProbeWorkerNs / 1000.0,
+         (double)maxReleaseNs / 1000.0, (double)maxRecordNs / 1000.0,
+         (double)maxProbeNs / 1000.0, (double)maxPostNs / 1000.0);
 
   /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
    * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
