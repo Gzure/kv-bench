@@ -1,4 +1,4 @@
-# Generate docs/hist_layout.png: kv_hist_t (hist.h) HdrHistogram storage diagram.
+﻿# Generate docs/hist_layout.png: kv_hist_t (hist.h) HdrHistogram storage diagram.
 Add-Type -AssemblyName System.Drawing
 
 $W = 1440; $H = 1150
@@ -97,7 +97,7 @@ $y += 66
 # ---------------- Section 2 ----------------
 T 40 $y "② 值轴分桶：低时延线性细桶 → 高时延指数粗桶（前密后疏，任意量级保持 ~3 位有效数字）" $fSec $brBlue
 $y += 40
-# bucket boxes: each 330 wide, 96 tall
+# bucket boxes: each 300 wide, 96 tall
 $buckets = @(
     @{ b = 0;  r = "0 ~ 1023 ns";     w = "1 ns/桶" },
     @{ b = 1;  r = "1024 ~ 2047 ns";  w = "2 ns/桶" },
@@ -106,19 +106,17 @@ $buckets = @(
 )
 $bx = 60
 foreach ($bk in $buckets) {
-    Box $bx $y 330 96 $brFillB $penBlue
+    Box $bx $y 300 96 $brFillB $penBlue
     T ($bx + 12) ($y + 12) ("bucket " + $bk.b) $fBoxB $brBlue
     T ($bx + 12) ($y + 38) $bk.r $fBody $brDark
     T ($bx + 12) ($y + 62) ("1024 个子桶 × " + $bk.w) $fBox $brGray
-    $bx += 342
+    $bx += 314
 }
 Box $bx $y 60 96 $brFillB $penGray
 T ($bx + 20) ($y + 34) "⋯" $fMonoB $brGray
-$bx += 72
-T $bx ($y + 16) "bucket 26:" $fBoxB $brDark
-T $bx ($y + 38) "34.4G ~ 68.7G ns" $fBody $brDark
-T $bx ($y + 62) "（覆盖 60 s 上限）" $fBox $brGray
 $y += 112
+T 60 $y "末级 bucket 26: [34.4G, 68.7G) ns · 桶宽 2^26 ns · 60 s 上限落在该级（record 先钳位 v ≤ 60e9）" $fBody $brDark
+$y += 30
 T 60 $y "规律：每进 1 级，覆盖区间 ×2、子桶宽 ×2 → 桶宽/桶起点 ≈ 1/512 ≈ 0.2% 相对精度，即任意时延量级上 ~3 位有效数字" $fBody $brGreen
 
 $y += 52
