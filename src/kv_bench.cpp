@@ -1016,8 +1016,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       req_seq++;
     }
 
-    if (!progressed)
-      sleep_ns(POLL_SLEEP_NS);
+    // if (!progressed)
+    //   sleep_ns(POLL_SLEEP_NS);
   }
 
   /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
@@ -1197,9 +1197,7 @@ static void *client_worker_main(void *arg) {
 
     uint64_t t0 = now_ns();
     int rc;
-    if (args->op == OP_WRITE) {
-      rc = client_do_write(ctx, w, src_a, src_b, dst_chip);
-    } else if (args->op == OP_GET) {
+    if (args->op == OP_GET) {
       rc = client_do_get(ctx, w, src_a, dst_chip);
     } else {
       if (rng_next(&w->rng) % 100 < args->mixed_ratio) {
