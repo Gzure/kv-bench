@@ -941,6 +941,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
   uint64_t lastPollNs_ = now_ns();
   uint64_t maxPollNs = 0;
+  uint64_t lastReqNs_ = now_ns();
+  uint64_t maxReqNs = 0;
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
     bool progressed = false;
 
@@ -1016,19 +1018,25 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       progressed = true;
       req_active++;
       req_seq++;
-
-      uint64_t curPollNs = now_ns() - lastPollNs_;
-      if (curPollNs > maxPollNs) {
-        maxPollNs = curPollNs;
+      uint64_t curReqNs = now_ns() - lastReqNs_;
+      if (curReqNs > maxReqNs) {
+        maxReqNs = curReqNs;
       }
-      lastPollNs_ = now_ns();
+      lastReqNs_ = now_ns();
     }
 
     // if (!progressed)
     //   sleep_ns(POLL_SLEEP_NS);
-    printf("[worker] worker thread exiting, max poll interval %.3f us\n",
-           (double)maxPollNs / 1000.0);
+    uint64_t curPollNs = now_ns() - lastPollNs_;
+    if (curPollNs > maxPollNs) {
+      maxPollNs = curPollNs;
+    }
+    lastPollNs_ = now_ns();
   }
+
+  printf("[worker] worker thread exiting, max poll interval %.3f us, req "
+         "interval %.3f us\n",
+         (double)maxPollNs / 1000.0, (double)maxReqNs / 1000.0);
 
   /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
    * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
@@ -1082,6 +1090,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   if (drain_failures > 0) {
     __atomic_add_fetch(&w->errors, drain_failures, __ATOMIC_RELAXED);
   }
+
   return 0;
 }
 

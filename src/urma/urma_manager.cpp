@@ -406,7 +406,7 @@ void UrmaManager::PollThreadMain() {
     }
   }
   urma_cr_t crs[kMaxPollCr];
-  uint64_t lastPollNs_ = NowNs();
+  uint64_t lastPollNs_ = 0;
   uint64_t maxPollNs = 0;
   while (!stop_) {
     int cnt;
@@ -438,10 +438,13 @@ void UrmaManager::PollThreadMain() {
         }
         CompleteEvent(wid, userCtx, crs[i].status == URMA_CR_SUCCESS);
       }
-      uint64_t curPollNs = NowNs() - lastPollNs_;
-      if (curPollNs > maxPollNs) {
-        maxPollNs = curPollNs;
+      if (lastpollns_ != 0) {
+        uint64_t curPollNs = NowNs() - lastPollNs_;
+        if (curPollNs > maxPollNs) {
+          maxPollNs = curPollNs;
+        }
       }
+
       lastPollNs_ = NowNs();
     } else if (cnt < 0) {
       fprintf(stderr, "Failed to poll jfc, ret=%d\n", cnt);
