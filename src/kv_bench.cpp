@@ -982,7 +982,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
-      uint64_t probeNsStart_ = now_ns();
+      // uint64_t probeNsStart_ = now_ns();
       for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
         if (s->done[i])
           continue;
@@ -1136,81 +1136,81 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     //       }
     //     }
     //   }
+    // }
   }
   // lastPollNs_ = now;
   // lastPollCpuNs_ = curCpuNs;
-}
 
-// printf("[worker] worker thread exiting, max poll interval %.3f us (cpu %.3f,
-// "
-//        "preempt %.3f), req "
-//        "interval %.3f us, worker interval %.3f us (cpu %.3f, preempt %.3f), "
-//        "probe work interval %.3f "
-//        "us (cpu %.3f, preempt %.3f), release interval %.3f us, record "
-//        "interval %.3f us, probe "
-//        "interval %.3f us, post one send interval %.3f us\n",
-//        (double)maxPollNs / 1000.0, (double)maxPollCpuNs / 1000.0,
-//        (double)maxPollPreemptNs / 1000.0, (double)maxReqNs / 1000.0,
-//        (double)maxSendWorkerNs / 1000.0, (double)maxSendCpuNs / 1000.0,
-//        (double)maxSendPreemptNs / 1000.0,
-//        (double)maxProbeWorkerNs / 1000.0, (double)maxProbeCpuNs / 1000.0,
-//        (double)maxProbePreemptNs / 1000.0, (double)maxReleaseNs / 1000.0,
-//        (double)maxRecordNs / 1000.0, (double)maxProbeNs / 1000.0,
-//        (double)maxPostNs / 1000.0);
+  // printf("[worker] worker thread exiting, max poll interval %.3f us (cpu
+  // %.3f,
+  // "
+  //        "preempt %.3f), req "
+  //        "interval %.3f us, worker interval %.3f us (cpu %.3f, preempt %.3f),
+  //        " "probe work interval %.3f " "us (cpu %.3f, preempt %.3f), release
+  //        interval %.3f us, record " "interval %.3f us, probe " "interval %.3f
+  //        us, post one send interval %.3f us\n", (double)maxPollNs / 1000.0,
+  //        (double)maxPollCpuNs / 1000.0, (double)maxPollPreemptNs / 1000.0,
+  //        (double)maxReqNs / 1000.0, (double)maxSendWorkerNs / 1000.0,
+  //        (double)maxSendCpuNs / 1000.0, (double)maxSendPreemptNs / 1000.0,
+  //        (double)maxProbeWorkerNs / 1000.0, (double)maxProbeCpuNs / 1000.0,
+  //        (double)maxProbePreemptNs / 1000.0, (double)maxReleaseNs / 1000.0,
+  //        (double)maxRecordNs / 1000.0, (double)maxProbeNs / 1000.0,
+  //        (double)maxPostNs / 1000.0);
 
-/* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
- * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
- * 避免残留 */
-const uint64_t drain_deadline =
-    now_ns() + (uint64_t)args->timeout_ms * 1000000ULL;
-uint64_t drain_failures = 0;
-while (w->active_count > 0) {
-  uint32_t idx = w->active_slots[0];
-  wr_slot_t *s = &w->wr_slots[idx];
-  bool request_completed = true;
-  for (uint32_t send_idx = 0; send_idx < KV_SENDS_PER_REQ; send_idx++) {
-    bool send_completed = true;
-    for (uint32_t half = 0; half < KV_WR_PER_SEND; half++) {
-      uint32_t wr = send_idx * KV_WR_PER_SEND + half;
-      if (!s->done[wr]) {
-        uint64_t now = now_ns();
-        int remaining_ms = 0;
-        if (now < drain_deadline) {
-          remaining_ms = (int)((drain_deadline - now + 999999ULL) / 1000000ULL);
-        }
-        if (!mgr->WaitEvent(w->id, s->event_token[wr], remaining_ms)) {
-          fprintf(stderr,
-                  "[pipe] drain timeout: req=%llu WR=%u token=%llu; "
-                  "8M lane quarantined\n",
-                  (unsigned long long)s->req_seq, wr,
-                  (unsigned long long)s->event_token[wr]);
-          drain_failures++;
-          send_completed = false;
-          request_completed = false;
-        } else {
-          kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[wr]);
+  /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
+   * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
+   * 避免残留 */
+  const uint64_t drain_deadline =
+      now_ns() + (uint64_t)args->timeout_ms * 1000000ULL;
+  uint64_t drain_failures = 0;
+  while (w->active_count > 0) {
+    uint32_t idx = w->active_slots[0];
+    wr_slot_t *s = &w->wr_slots[idx];
+    bool request_completed = true;
+    for (uint32_t send_idx = 0; send_idx < KV_SENDS_PER_REQ; send_idx++) {
+      bool send_completed = true;
+      for (uint32_t half = 0; half < KV_WR_PER_SEND; half++) {
+        uint32_t wr = send_idx * KV_WR_PER_SEND + half;
+        if (!s->done[wr]) {
+          uint64_t now = now_ns();
+          int remaining_ms = 0;
+          if (now < drain_deadline) {
+            remaining_ms =
+                (int)((drain_deadline - now + 999999ULL) / 1000000ULL);
+          }
+          if (!mgr->WaitEvent(w->id, s->event_token[wr], remaining_ms)) {
+            fprintf(stderr,
+                    "[pipe] drain timeout: req=%llu WR=%u token=%llu; "
+                    "8M lane quarantined\n",
+                    (unsigned long long)s->req_seq, wr,
+                    (unsigned long long)s->event_token[wr]);
+            drain_failures++;
+            send_completed = false;
+            request_completed = false;
+          } else {
+            kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[wr]);
+          }
         }
       }
+      if (send_completed)
+        mgr->ReleaseSendLane(s->jetty[send_idx]);
+      s->jetty[send_idx].reset();
     }
-    if (send_completed)
-      mgr->ReleaseSendLane(s->jetty[send_idx]);
-    s->jetty[send_idx].reset();
+    if (request_completed) {
+      kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
+      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
+    }
+    s->active = false;
+    w->free_slots[w->free_count++] = idx;
+    w->active_slots[0] = w->active_slots[w->active_count - 1];
+    w->active_count--;
   }
-  if (request_completed) {
-    kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
-    __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
+  if (drain_failures > 0) {
+    __atomic_add_fetch(&w->errors, drain_failures, __ATOMIC_RELAXED);
   }
-  s->active = false;
-  w->free_slots[w->free_count++] = idx;
-  w->active_slots[0] = w->active_slots[w->active_count - 1];
-  w->active_count--;
-}
-if (drain_failures > 0) {
-  __atomic_add_fetch(&w->errors, drain_failures, __ATOMIC_RELAXED);
-}
 
-return 0;
+  return 0;
 }
 
 /* get：客户端直接 READ 服务器数据区（value-size 字节）到本地读缓冲 */
