@@ -438,7 +438,7 @@ void UrmaManager::PollThreadMain() {
         }
         CompleteEvent(wid, userCtx, crs[i].status == URMA_CR_SUCCESS);
       }
-      if (lastpollns_ != 0) {
+      if (lastPollNs_ != 0) {
         uint64_t curPollNs = NowNs() - lastPollNs_;
         if (curPollNs > maxPollNs) {
           maxPollNs = curPollNs;
