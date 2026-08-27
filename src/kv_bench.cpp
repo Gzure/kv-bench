@@ -1098,8 +1098,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
     // if (!progressed)
     //   sleep_ns(POLL_SLEEP_NS);
-    // uint64_t now = now_ns();
-    // uint64_t curCpuNs = now_cpu_ns();
+    uint64_t now = now_ns();
 
     // uint64_t curSendPollNs = now - curProbeWorkerEndNs;
     // if (curSendPollNs > maxSendWorkerNs) {
@@ -1116,28 +1115,17 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     //   }
     // }
 
-    // if (lastPollNs_ != 0) {
-    //   uint64_t curPollNs = now - lastPollNs_;
-    //   if (curPollNs > maxPollNs) {
-    //     maxPollNs = curPollNs;
-    //   }
-    //   if (lastPollCpuNs_ != 0) {
-    //     uint64_t curPollCpuNs = curCpuNs - lastPollCpuNs_;
-    //     if (curPollCpuNs > maxPollCpuNs) {
-    //       maxPollCpuNs = curPollCpuNs;
-    //     }
-    //     if (curPollNs > curPollCpuNs) {
-    //       uint64_t pre = curPollNs - curPollCpuNs;
-    //       if (pre > maxPollPreemptNs) {
-    //         maxPollPreemptNs = pre;
-    //       }
-    //     }
-    //   }
-    // }
+    if (lastPollNs_ != 0) {
+      uint64_t curPollNs = now - lastPollNs_;
+      if (curPollNs > maxPollNs) {
+        maxPollNs = curPollNs;
+      }
+    }
+    lastPollNs_ = now;
   }
-  // lastPollNs_ = now;
-  // lastPollCpuNs_ = curCpuNs;
 
+  printf("[worker] worker thread exiting, max worker interval %.3f us\n",
+         (double)maxPollNs / 1000.0);
   // printf("[worker] worker thread exiting, max poll interval %.3f us (cpu
   // %.3f,
   // "

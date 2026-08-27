@@ -414,14 +414,8 @@ void UrmaManager::PollThreadMain() {
   urma_cr_t crs[kMaxPollCr];
   uint64_t lastPollNs_ = 0;
   uint64_t maxPollNs = 0;
-  uint64_t lastPollCpuNs_ = 0;
-  uint64_t maxPollCpuNs = 0;
-  uint64_t maxPollWaitNs =
-      0; /* 墙钟-CPU：event 模式主要是 wait_jfc 阻塞（CQE 到达间隔） */
   uint64_t lastOnlyPollNs_ = 0;
   uint64_t maxOnlyPollNs = 0;
-  uint64_t lastOnlyPollCpuNs_ = 0;
-  uint64_t maxOnlyPollCpuNs = 0;
   while (!stop_) {
     int cnt;
     if (eventMode_) {
@@ -442,22 +436,16 @@ void UrmaManager::PollThreadMain() {
     } else {
       cnt = urma_poll_jfc(resource_.Jfc(), kMaxPollCr, crs);
     }
-    // if (lastOnlyPollNs_ != 0) {
-    //   uint64_t curOnlyPollNs = NowNs() - lastOnlyPollNs_;
-    //   if (curOnlyPollNs > 100000ULL) {
-    //     fprintf(stderr, "[poll] only poll interval %.3f us\n",
-    //             (double)curOnlyPollNs / 1000.0);
-    //   }
-    //   if (curOnlyPollNs > maxOnlyPollNs) {
-    //     maxOnlyPollNs = curOnlyPollNs;
-    //   }
-    //   if (lastOnlyPollCpuNs_ != 0) {
-    //     uint64_t curOnlyCpuNs = NowCpuNs() - lastOnlyPollCpuNs_;
-    //     if (curOnlyCpuNs > maxOnlyPollCpuNs) {
-    //       maxOnlyPollCpuNs = curOnlyCpuNs;
-    //     }
-    //   }
-    // }
+    if (lastOnlyPollNs_ != 0) {
+      uint64_t curOnlyPollNs = NowNs() - lastOnlyPollNs_;
+      if (curOnlyPollNs > 100000ULL) {
+        fprintf(stderr, "[poll] only poll interval %.3f us\n",
+                (double)curOnlyPollNs / 1000.0);
+      }
+      if (curOnlyPollNs > maxOnlyPollNs) {
+        maxOnlyPollNs = curOnlyPollNs;
+      }
+    }
     if (cnt > 0) {
       for (int i = 0; i < cnt; i++) {
         uint64_t userCtx = crs[i].user_ctx;
@@ -469,44 +457,30 @@ void UrmaManager::PollThreadMain() {
         CompleteEvent(wid, userCtx, crs[i].status == URMA_CR_SUCCESS);
       }
 
-      // uint64_t now = NowNs();
-      // uint64_t cpuNow = NowCpuNs();
-      // if (lastPollNs_ != 0) {
-      //   uint64_t curPollNs = now - lastPollNs_;
-      //   // if (curPollNs > 500000ULL) {
-      //   //   fprintf(stderr, "[poll] poll interval %.3f us, now=%.3f\n",
-      //   //           (double)curPollNs / 1000.0, (double)now / 1000.0);
-      //   // }
-      //   if (curPollNs > maxPollNs) {
-      //     maxPollNs = curPollNs;
-      //   }
-      //   uint64_t curPollCpuNs = cpuNow - lastPollCpuNs_;
-      //   if (curPollCpuNs > maxPollCpuNs) {
-      //     maxPollCpuNs = curPollCpuNs;
-      //   }
-      //   if (curPollNs > curPollCpuNs) {
-      //     uint64_t wait = curPollNs - curPollCpuNs;
-      //     if (wait > maxPollWaitNs) {
-      //       maxPollWaitNs = wait;
-      //     }
-      //   }
-      // }
-      // lastPollNs_ = now;
-      // lastPollCpuNs_ = cpuNow;
+      uint64_t now = NowNs();
+      uint64_t cpuNow = NowCpuNs();
+      if (lastPollNs_ != 0) {
+        uint64_t curPollNs = now - lastPollNs_;
+        // if (curPollNs > 500000ULL) {
+        //   fprintf(stderr, "[poll] poll interval %.3f us, now=%.3f\n",
+        //           (double)curPollNs / 1000.0, (double)now / 1000.0);
+        // }
+        if (curPollNs > maxPollNs) {
+          maxPollNs = curPollNs;
+        }
+      }
+      lastPollNs_ = now;
     } else if (cnt < 0) {
       fprintf(stderr, "Failed to poll jfc, ret=%d\n", cnt);
       SleepNs(1000 * kPollSleepNs);
     }
-    // lastOnlyPollNs_ = NowNs();
-    // lastOnlyPollCpuNs_ = NowCpuNs();
+    lastOnlyPollNs_ = NowNs();
   }
 
-  // printf("[poll] poll thread exiting, max poll interval %.3f us (cpu %.3f, "
-  //        "wait %.3f), max only poll "
-  //        "interval %.3f us (cpu %.3f)\n",
-  //        (double)maxPollNs / 1000.0, (double)maxPollCpuNs / 1000.0,
-  //        (double)maxPollWaitNs / 1000.0, (double)maxOnlyPollNs / 1000.0,
-  //        (double)maxOnlyPollCpuNs / 1000.0);
+  printf("[poll] poll thread exiting, max poll interval %.3f us "
+         "max only poll "
+         "interval %.3f us\n",
+         (double)maxPollNs / 1000.0, (double)maxOnlyPollNs / 1000.0);
 }
 
 /* ---------------- send lane（每轮从池取一条 jetty） ---------------- */
