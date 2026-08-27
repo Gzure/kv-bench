@@ -232,7 +232,7 @@ bool UrmaManager::Init(const std::string &devName, bool cacheable,
     }
   }
   if (!resource_.Init(dev, (uint32_t)eid, cacheable, jettyCount, threadsMin,
-                      transMode)) {
+                      eventMode_, transMode)) {
     return false;
   }
   if (eventMode_ && !resource_.RearmJfc()) {

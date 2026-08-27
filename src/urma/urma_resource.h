@@ -55,8 +55,10 @@ private:
 
 class UrmaJfc {
 public:
+  /* jfce：事件模式下必须传入（cfg.jfce 绑定，否则 bondp 的 rearm 因
+   * jfc_cfg.jfce == NULL 返回 EINVAL）；非事件模式传 nullptr（轮询）。 */
   static bool Create(urma_context_t *ctx, const urma_device_attr_t &devAttr,
-                     std::unique_ptr<UrmaJfc> &jfc);
+                     urma_jfce_t *jfce, std::unique_ptr<UrmaJfc> &jfc);
   ~UrmaJfc();
 
   bool Rearm() const;
@@ -156,9 +158,11 @@ public:
   friend class UrmaJetty; /* UrmaJetty::Create 访问共享 JFR */
 
   /* 设备查询 + context/jfce/jfc/jfr + send jetty 池预填（对齐 yuanrong
-   * UrmaResource::Init L724） */
+   * UrmaResource::Init L724）。eventMode：jfc 创建时绑定 jfce（事件模式），
+   * 非事件模式 jfc 走纯轮询。 */
   bool Init(urma_device_t *device, uint32_t eidIndex, bool cacheable,
-            uint32_t jettyCount, uint32_t minJettys, uint32_t transMode = 0);
+            uint32_t jettyCount, uint32_t minJettys, bool eventMode = false,
+            uint32_t transMode = 0);
   void Clear();
 
   urma_context_t *Ctx() const;

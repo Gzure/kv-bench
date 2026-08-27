@@ -79,14 +79,14 @@ UrmaJfce::~UrmaJfce() {
 /* ---------------- UrmaJfc ---------------- */
 
 bool UrmaJfc::Create(urma_context_t *ctx, const urma_device_attr_t &devAttr,
-                     std::unique_ptr<UrmaJfc> &jfc) {
+                     urma_jfce_t *jfce, std::unique_ptr<UrmaJfc> &jfc) {
   if (ctx == nullptr) {
     return false;
   }
   urma_jfc_cfg_t cfg;
   (void)memset(&cfg, 0, sizeof(cfg));
   cfg.depth = devAttr.dev_cap.max_jfc_depth;
-  cfg.jfce = nullptr;
+  cfg.jfce = jfce; /* 事件模式必须绑定 jfce（对齐 urma_sample.c jfc_cfg.jfce） */
   cfg.user_ctx = (uint64_t)NULL;
   urma_jfc_t *raw = urma_create_jfc(ctx, &cfg);
   if (raw == nullptr) {
@@ -333,7 +333,7 @@ UrmaResource::~UrmaResource() { Clear(); }
 
 bool UrmaResource::Init(urma_device_t *device, uint32_t eidIndex,
                         bool cacheable, uint32_t jettyCount, uint32_t minJettys,
-                        uint32_t transMode) {
+                        bool eventMode, uint32_t transMode) {
   Clear();
   if (device == nullptr) {
     return false;
@@ -381,7 +381,8 @@ bool UrmaResource::Init(urma_device_t *device, uint32_t eidIndex,
   if (!UrmaJfce::Create(context_->Raw(), jfce_)) {
     return false;
   }
-  if (!UrmaJfc::Create(context_->Raw(), devAttr_, jfc_)) {
+  if (!UrmaJfc::Create(context_->Raw(), devAttr_,
+                       eventMode ? jfce_->Raw() : nullptr, jfc_)) {
     return false;
   }
 
