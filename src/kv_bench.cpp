@@ -975,11 +975,10 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
      * ProbeEvent 成功即复位槽不能依赖单轮结果），20 条全完成 = 请求完成 */
     uint32_t k = 0;
     // lastProbeWorkerNs_ = now_ns();
-    // uint64_t probeCpuStartNs = now_cpu_ns();
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
-      // uint64_t probeNsStart_ = now_ns();
+      uint64_t probeNsStart_ = now_ns();
       for (uint32_t i = 0; i < KV_WR_PER_REQ; i++) {
         if (s->done[i])
           continue;
@@ -998,11 +997,11 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           progressed = true;
         }
       }
-      // uint64_t probeNsEnd_ = now_ns();
-      // uint64_t curProbeNs = probeNsEnd_ - probeNsStart_;
-      // if (curProbeNs > maxProbeNs) {
-      //   maxProbeNs = curProbeNs;
-      // }
+      uint64_t probeNsEnd_ = now_ns();
+      uint64_t curProbeNs = probeNsEnd_ - probeNsStart_;
+      if (curProbeNs > maxProbeNs) {
+        maxProbeNs = curProbeNs;
+      }
 
       if (s->done_cnt < KV_WR_PER_REQ) {
         k++; /* 请求未完成，处理下一个在飞槽 */
@@ -1075,15 +1074,15 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       if (w->free_count == 0)
         break; /* 槽满（≤ 10，理论不会） */
       uint32_t slot = w->free_slots[--w->free_count];
-      // uint64_t postNsStart_ = now_ns();
+      uint64_t postNsStart_ = now_ns();
       if (post_one_req(ctx, w, slot, req_seq) != 0) {
         w->free_slots[w->free_count++] = slot; /* 归还槽 */
         return -1;
       }
-      // uint64_t curPostNs_ = now_ns() - postNsStart_;
-      // if (curPostNs_ > maxPostNs) {
-      //   maxPostNs = curPostNs_;
-      // }
+      uint64_t curPostNs_ = now_ns() - postNsStart_;
+      if (curPostNs_ > maxPostNs) {
+        maxPostNs = curPostNs_;
+      }
       progressed = true;
       req_active++;
       req_seq++;
@@ -1124,8 +1123,10 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     lastPollNs_ = now;
   }
 
-  printf("[worker] worker thread exiting, max worker interval %.3f us\n",
-         (double)maxPollNs / 1000.0);
+  printf("[worker] worker thread exiting, max worker interval %.3f us, max "
+         "send interval %.3f us, max probe interval %.3f us\n",
+         (double)maxPollNs / 1000.0, (double)maxPostNs / 1000.0,
+         (double)maxProbeNs / 1000.0);
   // printf("[worker] worker thread exiting, max poll interval %.3f us (cpu
   // %.3f,
   // "
