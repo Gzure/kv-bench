@@ -6,15 +6,13 @@
  * 分层（对齐 yuanrong-datasystem）：
  *   业务层(kv_bench.cpp) -> 管理层(urma/urma_manager) ->
  * 资源层(urma/urma_resource) -> liburma 数据通路只走 URMA： write(Put):
- * Write pipeline: one 80MB request = ten 8MB sends. Each send uses one jetty;
-
- * * src==dst alternates chip1/chip2 and --concurrency controls request
- * overlap.
+ * Write pipeline: one request = KV_SENDS_PER_REQ(10) sends, each send uses one
+ * jetty and splits into 2 WRs of send_size/2 bytes (--send-size, default 8MB).
+ * src==dst alternates chip1/chip2 and --concurrency controls request overlap.
  * Get directly READs the server data region with URMA_OPC_READ.
- * Per-thread
- * histograms report latency percentiles plus bandwidth and IOPS.
-
- * * 亲和：affinity(分片源==目的==chip)/anti(源随机&目的固定)/none(双随机)。 无
+ * Per-thread histograms report latency percentiles plus bandwidth and IOPS.
+ *
+ * 亲和：affinity(分片源==目的==chip)/anti(源随机&目的固定)/none(双随机)。 无
  * bthread/brpc/protobuf 依赖。
  */
 
@@ -53,30 +51,23 @@
   4 /* 客户端 data_len = threads * 4 * value_size（get/mixed 用） */
 #define SERVER_DATA_WINDOW 4
 
-/* One request reuses a local 8MB buffer across ten consecutive remote 8MB
- *
- * regions. Each 8MB send is two 4MB WRs sharing one jetty. All 20 WRs complete
-
- * * the request; bandwidth accounting is 80MB per request. */
-#define KV_WR_SIZE (4UL * 1024 * 1024) /* 单条 WR 4MB */
-#define KV_WR_PER_SEND 2               /* 每次发送 8M = 2 条 4M WR */
-#define KV_SEND_SIZE (KV_WR_SIZE * KV_WR_PER_SEND) /* 8MB（同一 buffer） */
+/* One KV request = KV_SENDS_PER_REQ consecutive sends, each send splits into
+ * KV_WR_PER_SEND WRs sharing one jetty. Send size (send_size) is configurable
+ * via --send-size (default 8MB); each send = 2 WRs of send_size/2 bytes.
+ * KV_REQ_BYTES = send_size * KV_SENDS_PER_REQ per request. */
+#define KV_WR_PER_SEND 2  /* 每次 send 拆 2 条 WR（固定） */
 #define KV_SENDS_PER_REQ 10 /* 每请求发 10 次（chip 交替） */
 #define KV_WR_PER_REQ (KV_SENDS_PER_REQ * KV_WR_PER_SEND) /* 20 条 WR/请求 */
-#define KV_REQ_BYTES (KV_SEND_SIZE * KV_SENDS_PER_REQ) /* 80MB 传输字节 */
 #define KV_MAX_CONCURRENCY 10 /* --concurrency 上限：在飞请求数 */
 #define KV_MAX_WR_SLOTS KV_MAX_CONCURRENCY /* 槽 = 一个请求（20 条 WR） */
 #define KV_MAX_INFLIGHT_REQS KV_MAX_CONCURRENCY
+#define DEFAULT_SEND_SIZE (8UL * 1024 * 1024) /* 默认每 send 8MB */
 
 static_assert(KV_MAX_CONCURRENCY * KV_WR_PER_REQ <=
                   kv_bench::kEventSlotsPerWorker,
               "event slots must cover the maximum in-flight WR count");
 static_assert(KV_MAX_CONCURRENCY * KV_SENDS_PER_REQ <= MAX_JETTY_COUNT,
-              "jetty limit must cover the maximum in-flight 8M sends");
-
-/* 服务器数据区：容纳最大窗口（10 请求 × 10 次 × 8MB = 800MB），固定 */
-#define SERVER_PIPE_BYTES                                                      \
-  ((uint64_t)KV_SENDS_PER_REQ * KV_MAX_CONCURRENCY * KV_SEND_SIZE)
+              "jetty limit must cover the maximum in-flight sends");
 
 #define DEFAULT_TIMEOUT_MS 5000
 #define MAX_CPUS 1024
@@ -90,12 +81,13 @@ enum { AFF_AFFINITY = 0, AFF_ANTI = 1, AFF_NONE = 2 };
 typedef struct argument {
   char *dev_name;
   char *dev_name2; /* 双设备模式：第二个物理设备名 */
-  bool dual_dev; /* 双设备模式：2 设备 × 2 eid = 4 端口，4 条 4M 分发 */
+  bool dual_dev; /* 双设备模式：2 设备 × 2 eid = 4 端口，4 条 WR 分发 */
   char *server_ip;
   unsigned int server_port;
   unsigned int trans_mode; /* 0=RM 1=RC 2=UM 3=RS */
   bool event_mode;
   uint64_t value_size;
+  uint64_t send_size; /* write 每 send 字节数（拆 2 条 WR），默认 8MB */
   uint64_t qps;
   uint64_t duration_sec;
   uint32_t jetty_count;
@@ -124,12 +116,11 @@ typedef struct argument {
 
 typedef struct context context_t;
 
-/* One in-flight request has ten 8MB sends / twenty 4MB WRs. Each adjacent WR
- *
- * pair shares one jetty and chip selection is per 8MB send. */
+/* One in-flight request has KV_SENDS_PER_REQ sends / KV_WR_PER_REQ WRs. Each
+ * adjacent WR pair shares one jetty; chip selection is per send. */
 typedef struct wr_slot {
   std::shared_ptr<kv_bench::UrmaJetty>
-      jetty[KV_SENDS_PER_REQ];         /* 每个 8M send 独立 lane */
+      jetty[KV_SENDS_PER_REQ];         /* 每个 send 独立 lane */
   uint64_t event_token[KV_WR_PER_REQ]; /* 20 条 WR 的完成事件 token */
   uint64_t wr_post_ns[KV_WR_PER_REQ];  /* 每条 WR 的 post 时间 */
   bool done[KV_WR_PER_REQ];            /* 各 WR 完成标志（持久） */
@@ -143,8 +134,8 @@ typedef struct worker {
   uint32_t id;          /* UrmaManager workerId（进程级全局） */
   uint32_t local_index; /* 本连接/本进程内序号 */
   kv_hist_t hist; /* 批时延直方图（10 请求全完成记一次） */
-  kv_hist_t hist_req; /* 请求级时延直方图（单个 8M 请求完成记一次） */
-  kv_hist_t hist_wr; /* WR 级时延直方图（每条 4M WR 完成记一次） */
+  kv_hist_t hist_req; /* 请求级时延直方图（单个请求完成记一次） */
+  kv_hist_t hist_wr; /* WR 级时延直方图（每条 WR 完成记一次） */
   kv_hist_t hist_post; /* PostWrite 调用耗时直方图（每次 post 记一次） */
   volatile uint64_t ops;
   volatile uint64_t bytes;
@@ -441,14 +432,14 @@ static int mbind_to_node(void *addr, size_t len, int node) {
  * 基址算出垃圾指针。 */
 static int layout_client_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
-  /* write：每线程数据区 = concurrency 块 8M buffer（重叠请求各占一块）；
+  /* write：每线程数据区 = concurrency 块 send_size buffer（重叠请求各占一块）；
    * get/mixed：value_size 窗口 */
   uint64_t window_reqs = (args->op == OP_WRITE && args->concurrency > 0)
                              ? (uint64_t)args->concurrency
                              : 1;
   uint64_t data_len =
       (args->op == OP_WRITE)
-          ? (uint64_t)args->threads * window_reqs * KV_SEND_SIZE
+          ? (uint64_t)args->threads * window_reqs * args->send_size
           : (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
   ctx->data_len = data_len;
   ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
@@ -458,10 +449,12 @@ static int layout_client_buffer(context_t *ctx) {
 static int layout_server_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
   uint64_t size = args->value_size;
-  /* 服务器数据区：容纳 write 分片流水线最大窗口（10 并发 × 80MB = 800MB）；
-   * get 为数据源（客户端 READ） */
-  ctx->data_len = (args->op == OP_WRITE) ? SERVER_PIPE_BYTES
-                                         : (uint64_t)SERVER_DATA_WINDOW * size;
+  /* 服务器数据区：容纳 write 分片流水线最大窗口（10 并发 × 10 send ×
+   * send_size）；get 为数据源（客户端 READ） */
+  ctx->data_len = (args->op == OP_WRITE)
+                      ? (uint64_t)KV_SENDS_PER_REQ * KV_MAX_CONCURRENCY *
+                            args->send_size
+                      : (uint64_t)SERVER_DATA_WINDOW * size;
   ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
   return 0;
 }
@@ -685,9 +678,9 @@ static void pick_round_chips(const argument_t *args, bool is_client,
 /* write 分片 chip 分配：每分片一对 (src, dst)。
  * affinity：源==目的==chip，分片在请求内序号 j → chip = j%2 ? 2 : 1（20 分片
  * 交替打散 = 10+10 均匀分两 chip）；anti：源随机、目的固定；none：全随机。 */
-/* write 8M 请求 chip 分配：请求内 2 条 4M WR 同一 chip（src==dst）。
- * affinity：请求间交替 — 第 1 个 8M chip1、第 2 个 8M chip2（一批 10 个 =
- * 5+5）； anti：src 随机、dst 固定；none：全随机。 */
+/* write 请求 chip 分配：请求内 2 条 WR 同一 chip（src==dst）。
+ * affinity：请求间交替 — 第 1 个 send chip1、第 2 个 send chip2（一批 10 个
+ * send = 5+5）； anti：src 随机、dst 固定；none：全随机。 */
 /* 请求内第 send_idx 次发送的 chip 分配（src==dst）：
  * affinity：10 次交替 — 第 1 次 chip1、第 2 次 chip2、第 3 次 chip1...（5+5）；
  * --single-chip：全部固定单 chip；anti：src 随机、dst 固定；none：全随机。 */
@@ -819,12 +812,11 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   return (ok_a && ok_b) ? 0 : -1;
 }
 
-/* ---------------- write 流水线（请求 = local 8M 写 remote 80M） ------------
+/* ---------------- write 流水线（请求 = local send_size 写 remote req_bytes） ------------
  */
 
-/* Post all twenty 4MB WRs without waiting for CQEs. Each adjacent pair shares
-
- * * one jetty and targets one remote 8MB region. */
+/* Post all KV_WR_PER_REQ WRs without waiting for CQEs. Each adjacent pair shares
+ * one jetty and targets one remote send_size region. */
 static void drain_posted_wrs(kv_bench::UrmaManager *mgr, worker_t *w,
                              wr_slot_t *s, uint32_t posted_wr_count,
                              int timeout_ms) {
@@ -858,9 +850,11 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
-  /* local 每槽复用 8M；remote 每槽占 80M，避免在飞请求之间地址碰撞。 */
-  uint64_t local_base_off = (uint64_t)slot_idx * KV_SEND_SIZE;
-  uint64_t remote_base_off = (uint64_t)slot_idx * KV_REQ_BYTES;
+  /* local 每槽复用 send_size；remote 每槽占 req_bytes，避免在飞请求之间地址碰撞。 */
+  uint64_t wr_size = args->send_size / 2;
+  uint64_t req_bytes = args->send_size * KV_SENDS_PER_REQ;
+  uint64_t local_base_off = (uint64_t)slot_idx * args->send_size;
+  uint64_t remote_base_off = (uint64_t)slot_idx * req_bytes;
   uint64_t remote_base = conn.RemoteSegVa() + remote_base_off;
 
   wr_slot_t *s = &w->wr_slots[slot_idx];
@@ -868,7 +862,7 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
   s->done_cnt = 0;
   s->active = true;
   s->post_ns = now_ns(); /* 时延起点：第 1 条 WR post 前 */
-  /* 20 条 4M WR：send_idx 决定 chip 和 remote 8M 槽；half = 该槽的前/后 4M。 */
+  /* 20 条 WR：send_idx 决定 chip 和 remote send_size 槽；half = 该 send 的前/后 wr_size。 */
   for (uint32_t wr = 0; wr < KV_WR_PER_REQ; wr++) {
     uint32_t send_idx = wr / KV_WR_PER_SEND;
     uint32_t half = wr % KV_WR_PER_SEND;
@@ -902,13 +896,13 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
     }
     s->wr_post_ns[wr] = now_ns();
     uint64_t post_t0 = now_ns();
-    bool post_ok =
-        mgr->PostWrite(jetty, conn,
-                       (uint64_t)ctx->client_data + local_base_off +
-                           (uint64_t)half * KV_WR_SIZE,
-                       remote_base + (uint64_t)send_idx * KV_SEND_SIZE +
-                           (uint64_t)half * KV_WR_SIZE,
-                       (uint32_t)KV_WR_SIZE, (uint32_t)src, (uint32_t)dst, ue);
+    bool post_ok = mgr->PostWrite(
+        jetty, conn,
+        (uint64_t)ctx->client_data + local_base_off +
+            (uint64_t)half * wr_size,
+        remote_base + (uint64_t)send_idx * args->send_size +
+            (uint64_t)half * wr_size,
+        (uint32_t)wr_size, (uint32_t)src, (uint32_t)dst, ue);
     kv_hist_record(&w->hist_post, now_ns() - post_t0);
     if (!post_ok) {
       fprintf(stderr, "[pipe] req %llu WR %u (send %u) post failed, aborting\n",
@@ -999,8 +993,9 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         k++; /* 请求未完成，处理下一个在飞槽 */
         continue;
       }
-      /* 请求完成：20 条 WR 全部完成；带宽按传输字节 = 8M × 10 次 = 80M/请求 */
-      __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
+      /* 请求完成：20 条 WR 全部完成；带宽按 req_bytes = send_size × 10 次 */
+      __atomic_add_fetch(&w->bytes, args->send_size * KV_SENDS_PER_REQ,
+                         __ATOMIC_RELAXED);
       for (uint32_t send_idx = 0; send_idx < KV_SENDS_PER_REQ; send_idx++) {
         mgr->ReleaseSendLane(s->jetty[send_idx]);
         s->jetty[send_idx].reset();
@@ -1092,7 +1087,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
           if (!mgr->WaitEvent(w->id, s->event_token[wr], remaining_ms)) {
             fprintf(stderr,
                     "[pipe] drain timeout: req=%llu WR=%u token=%llu; "
-                    "8M lane quarantined\n",
+                    "send lane quarantined\n",
                     (unsigned long long)s->req_seq, wr,
                     (unsigned long long)s->event_token[wr]);
             drain_failures++;
@@ -1110,7 +1105,8 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     if (request_completed) {
       kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
       __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
-      __atomic_add_fetch(&w->bytes, KV_REQ_BYTES, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&w->bytes, args->send_size * KV_SENDS_PER_REQ,
+                         __ATOMIC_RELAXED);
     }
     s->active = false;
     w->free_slots[w->free_count++] = idx;
@@ -1201,8 +1197,8 @@ static void *client_worker_main(void *arg) {
       (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
   w->off = (uint64_t)w->id * DATA_WINDOW_PER_THREAD * args->value_size;
 
-  /* write：分片流水线（80MB 请求 = 20×4MB 分片，jetty 池驱动，持续到 deadline）
-   */
+  /* write：分片流水线（req_bytes 请求 = KV_WR_PER_REQ × wr_size 分片，
+   * jetty 池驱动，持续到 deadline） */
   if (args->op == OP_WRITE) {
     if (client_write_pipeline(ctx, w, deadline) != 0) {
       __atomic_add_fetch(&w->errors, 1, __ATOMIC_RELAXED);
@@ -1335,14 +1331,14 @@ static void print_client_summary(context_t *ctx, double seconds) {
          " concurrency=%d affinity=%s "
          "jetty_count=%u duration=%.1fs ====\n",
          op_name(args->op), args->threads,
-         args->op == OP_WRITE ? KV_SEND_SIZE : args->value_size,
+         args->op == OP_WRITE ? args->send_size : args->value_size,
          args->concurrency, aff_name(args->affinity_mode),
          ctx->mgr->Resource().SendJettyCount(), seconds);
   double iops = seconds > 0 ? (double)ops / seconds : 0.0;
   double bw_mb_s =
       seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
   double bw_mbps = bw_mb_s * 8.0;                        /* 小 b: Mb/s */
-  /* wr_rate：write = 请求 × 20 条 4M WR；带宽按 8M 数据/请求统计 */
+  /* wr_rate：write = 请求 × KV_WR_PER_REQ 条 WR（每条 send_size/2） */
   double wr_rate = iops * (args->op == OP_WRITE ? (double)KV_WR_PER_REQ : 1.0);
   printf("requests=%" PRIu64
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
@@ -1485,6 +1481,7 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args) {
   params.threads = args->threads;
   params.opCode = (uint32_t)args->op;
   params.valueSize = (uint32_t)args->value_size;
+  params.sendSize = (uint32_t)args->send_size;
   params.transMode = args->trans_mode;
   params.dstChip = INVALID_CHIP;
   int dst_chip = first_dst_chip(args);
@@ -1618,7 +1615,7 @@ static int dual_query_eids(const char *dev1, const char *dev2,
   return 0;
 }
 
-/* 双设备打流线程：每请求 = 4 条 4M WR 分发到 4 端口（P0=(dev1,eid0)
+/* 双设备打流线程：每请求 = 4 条 wr_size WR 分发到 4 端口（P0=(dev1,eid0)
  * P1=(dev1,eid1) P2=(dev2,eid0) P3=(dev2,eid1)），4 条全 post 后等 4 CQE */
 static void *dual_worker_main(void *arg) {
   dual_worker_t *dw = (dual_worker_t *)arg;
@@ -1631,7 +1628,8 @@ static void *dual_worker_main(void *arg) {
     conn[p] = ctx->conn_dual[p];
   }
   uint64_t deadline = now_ns() + args->duration_sec * 1000000000ULL;
-  uint64_t round_bytes = (uint64_t)DUAL_PORTS * KV_WR_SIZE; /* 4×4M = 16M */
+  uint64_t wr_size = args->send_size / 2;
+  uint64_t round_bytes = (uint64_t)DUAL_PORTS * wr_size; /* 4 端口 × wr_size */
   uint64_t window = (uint64_t)args->threads * round_bytes;
 
   for (int p = 0; p < DUAL_PORTS; p++) {
@@ -1644,7 +1642,7 @@ static void *dual_worker_main(void *arg) {
     uint64_t off = dw->off;
     bool ok = true;
     int posted = 0;
-    /* 4 条 4M WR 全部 post（不等 CQE） */
+    /* 4 条 WR 全部 post（不等 CQE） */
     for (int p = 0; p < DUAL_PORTS; p++) {
       std::shared_ptr<kv_bench::UrmaJetty> jetty;
       if (!mgr[p]->AcquireSendLane(jetty)) {
@@ -1660,10 +1658,10 @@ static void *dual_worker_main(void *arg) {
       uint64_t post_t0 = now_ns();
       bool post_ok = mgr[p]->PostWrite(
           jetty, *conn[p],
-          (uint64_t)ctx->client_data + off + (uint64_t)p * KV_WR_SIZE,
-          conn[p]->RemoteSegVa() + off + (uint64_t)p * KV_WR_SIZE,
-          (uint32_t)KV_WR_SIZE, (uint32_t)INVALID_CHIP, (uint32_t)INVALID_CHIP,
-          ue);
+          (uint64_t)ctx->client_data + off + (uint64_t)p * wr_size,
+          conn[p]->RemoteSegVa() + off + (uint64_t)p * wr_size,
+          (uint32_t)wr_size, (uint32_t)INVALID_CHIP,
+          (uint32_t)INVALID_CHIP, ue);
       kv_hist_record(&dw->hist_post, now_ns() - post_t0);
       if (!post_ok) {
         mgr[p]->AbortEvent(dw->wid[p], dw->event_token[p]);
@@ -1730,8 +1728,8 @@ static int run_dual_client(const argument_t *args) {
     }
     ctx->mgr_dual[p] = mgr[p];
   }
-  /* 缓冲：每线程窗口 = 4×4M，4 端口注册同一 VA */
-  uint64_t round_bytes = (uint64_t)DUAL_PORTS * KV_WR_SIZE;
+  /* 缓冲：每线程窗口 = 4 端口 × wr_size，4 端口注册同一 VA */
+  uint64_t round_bytes = (uint64_t)DUAL_PORTS * (args->send_size / 2);
   ctx->buf_len = ROUND_UP((uint64_t)args->threads * round_bytes, PAGE_SIZE);
   ctx->va = memalign(PAGE_SIZE, ctx->buf_len);
   if (ctx->va == NULL) {
@@ -1762,7 +1760,8 @@ static int run_dual_client(const argument_t *args) {
   kv_bench::HandshakeParams params;
   params.threads = args->threads;
   params.opCode = (uint32_t)args->op;
-  params.valueSize = (uint32_t)KV_WR_SIZE;
+  params.valueSize = (uint32_t)(args->send_size / 2);
+  params.sendSize = (uint32_t)args->send_size;
   params.transMode = args->trans_mode;
   for (int p = 0; p < DUAL_PORTS; p++) {
     if (!mgr[p]->ExchangeAsClient(sockfd, params, ctx->conn_dual[p],
@@ -1874,7 +1873,7 @@ static int run_dual_server(const argument_t *args) {
     }
     ctx->mgr_dual[p] = mgr[p];
   }
-  uint64_t round_bytes = (uint64_t)DUAL_PORTS * KV_WR_SIZE;
+  uint64_t round_bytes = (uint64_t)DUAL_PORTS * (args->send_size / 2);
   ctx->buf_len = ROUND_UP((uint64_t)args->threads * round_bytes, PAGE_SIZE);
   ctx->va = memalign(PAGE_SIZE, ctx->buf_len);
   if (ctx->va == NULL)
@@ -1905,7 +1904,8 @@ static int run_dual_server(const argument_t *args) {
   kv_bench::HandshakeParams params;
   params.threads = args->threads;
   params.opCode = (uint32_t)args->op;
-  params.valueSize = (uint32_t)KV_WR_SIZE;
+  params.valueSize = (uint32_t)(args->send_size / 2);
+  params.sendSize = (uint32_t)args->send_size;
   params.transMode = args->trans_mode;
   for (int p = 0; p < DUAL_PORTS; p++) {
     if (!mgr[p]->ExchangeAsServer(connfd, params, ctx->conn_dual[p],
@@ -1945,10 +1945,10 @@ static int run_client(const argument_t *args) {
   ctx->mgr->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
                                            : auto_poll_cpu(args, true));
 
-  /* jetty 池 ≥ max(线程数, write 在飞请求 × 10 个 8M send) */
+  /* jetty 池 ≥ max(线程数, write 在飞请求 × 10 个 send) */
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
-    /* 池 ≥ 在飞请求 × 10（每请求 10 个 8M send 各占一条 jetty） */
+    /* 池 ≥ 在飞请求 × 10（每请求 10 个 send 各占一条 jetty） */
     uint32_t reqs = (args->concurrency >= 1) ? (uint32_t)args->concurrency : 1;
     uint32_t pipe = reqs * KV_SENDS_PER_REQ;
     if (pipe > min_lanes)
@@ -2042,6 +2042,7 @@ static void *server_conn_main(void *arg) {
   params.threads = ctx->args.threads;
   params.opCode = (uint32_t)ctx->args.op;
   params.valueSize = (uint32_t)ctx->args.value_size;
+  params.sendSize = (uint32_t)ctx->args.send_size;
   params.transMode = ctx->args.trans_mode;
   params.dstChip = INVALID_CHIP;
   int dst_chip = first_dst_chip(&ctx->args);
@@ -2227,6 +2228,7 @@ static struct option g_long_options[] = {
     {"server-port", required_argument, NULL, 'p'},
     {"event-mode", no_argument, NULL, 'e'},
     {"value-size", required_argument, NULL, 1000},
+    {"send-size", required_argument, NULL, 1035},
     {"qps", required_argument, NULL, 1001},
     {"duration", required_argument, NULL, 1002},
     {"jetty-count", required_argument, NULL, 1003},
@@ -2269,6 +2271,9 @@ static void usage(void) {
          "(default false)\n");
   printf(
       "      --value-size <bytes>   per-WR payload, e.g. 4M/8M (default 4M)\n");
+  printf("      --send-size <bytes>    write per-send bytes, split into 2 WRs "
+         "(default 8M;\n"
+         "                             e.g. 16M->2x8M, 4M->2x2M, 64K->2x32K)\n");
   printf("      --qps <qps>            client target QPS in rounds/sec (0 = as "
          "fast as possible)\n");
   printf("      --duration <seconds>   client run duration (default 10)\n");
@@ -2285,12 +2290,12 @@ static void usage(void) {
   printf("      --threads <n>          client load threads (default 1)\n");
   printf("      --concurrency <n>      write inflight requests 1..10 (default "
          "1)\n");
-  printf("      --single-chip <1|2>    single-chip affinity scenario: all 8M "
-         "groups use one chip (src==dst), mbind to that chip's NUMA\n");
+  printf("      --single-chip <1|2>    single-chip affinity scenario: all "
+         "sends use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --poll-cpu <n>         pin URMA poll thread to cpu (default: "
          "auto pick a non-worker cpu)\n");
   printf("      --dual-dev             dual physical device mode: 2 devices x "
-         "2 eids = 4 ports, 4 x 4M WR per round\n");
+         "2 eids = 4 ports, 4 x (send_size/2) WR per round\n");
   printf("      --dev-name2 <dev>      second physical device name (dual-dev "
          "mode)\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
@@ -2319,6 +2324,18 @@ static int validate_input_params(argument_t *args) {
       args->value_size > UINT32_MAX || args->duration_sec == 0 ||
       args->jetty_count == 0 || args->jetty_count > MAX_JETTY_COUNT) {
     fprintf(stderr, "Invalid device, value size, duration, or jetty count\n");
+    return -1;
+  }
+  /* send_size：必须 ≥ 2*PAGE_SIZE、为偶数、且 send_size/2 是 PAGE_SIZE 倍数
+   * （保证每条 WR 页对齐，满足 URMA 注册/SGE 要求） */
+  if (args->send_size < 2 * PAGE_SIZE ||
+      (args->send_size & 1ULL) ||
+      (args->send_size / 2) % PAGE_SIZE != 0 ||
+      args->send_size > UINT32_MAX) {
+    fprintf(stderr,
+            "Invalid send-size %llu (must be >= 8K, even, wr_size page-"
+            "aligned; e.g. 8M/16M/4M/64K)\n",
+            (unsigned long long)args->send_size);
     return -1;
   }
   if (args->dual_dev && args->dev_name2 == NULL) {
@@ -2374,6 +2391,7 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->server_port = DEFAULT_PORT;
   args->trans_mode = 0;
   args->value_size = DEFAULT_VALUE_SIZE;
+  args->send_size = DEFAULT_SEND_SIZE;
   args->qps = 0;
   args->duration_sec = 10;
   args->jetty_count = 1;
@@ -2419,6 +2437,9 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       break;
     case 1000:
       args->value_size = parse_size(optarg);
+      break;
+    case 1035:
+      args->send_size = parse_size(optarg);
       break;
     case 1001:
       args->qps = strtoull(optarg, NULL, 0);
@@ -2581,9 +2602,10 @@ static int run_chip_query(const argument_t *args) {
       }
       printf("  worker %u: src_a=%d src_b=%d dst=%d\n", i, sa, sb, dst);
     }
-    printf("== write 8M 请求 chip 分配 (mode=%s, 每请求发 %d 次, 每次 8M WR "
-           "同 chip) ==\n",
-           mode_names[m], KV_SENDS_PER_REQ);
+    printf("== write 请求 chip 分配 (mode=%s, send_size=%lluB, 每请求发 %d "
+           "次, 每次 send 同 chip) ==\n",
+           mode_names[m],
+           (unsigned long long)args->send_size, KV_SENDS_PER_REQ);
     for (uint32_t i = 0; i < workers; i++) {
       worker_t w{};
       w.id = i;

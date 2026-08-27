@@ -63,7 +63,9 @@ struct WireInfo {
   uint32_t op_code;
   uint32_t value_size;
   uint32_t dst_chip;
-  uint32_t reserved[3];
+  uint32_t send_size; /* 复用原 reserved[0]：write 每 send 字节数，两端须一致；
+                       * 旧版本 memset 为 0 → 校验时跳过（向后兼容） */
+  uint32_t reserved[2];
 } __attribute__((packed));
 
 int SockSyncData(int sockfd, int size, char *localData, char *remoteData) {
@@ -519,6 +521,7 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   localWire.threads = params.threads;
   localWire.op_code = params.opCode;
   localWire.value_size = params.valueSize;
+  localWire.send_size = params.sendSize;
   localWire.dst_chip = params.dstChip;
 
   WireInfo remoteWire;
@@ -529,10 +532,21 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   }
 
   printf("exchange: remote seg va=0x%lx len=%lu jetty=%u dst_chip=%u "
-         "threads=%u op=%u\n",
+         "threads=%u op=%u send_size=%u\n",
          (uint64_t)remoteWire.seg_va, (uint64_t)remoteWire.seg_len,
          remoteWire.jetty_id.id, remoteWire.dst_chip, remoteWire.threads,
-         remoteWire.op_code);
+         remoteWire.op_code, remoteWire.send_size);
+
+  /* 校验两端 send_size 一致（write 数据面 offset/缓冲布局依赖同尺寸）；
+   * 0 = 对端未设置（旧版本/非 write），跳过校验 */
+  if (params.sendSize != 0 && remoteWire.send_size != 0 &&
+      remoteWire.send_size != params.sendSize) {
+    fprintf(stderr,
+            "exchange: send_size mismatch local=%u remote=%u; both ends must "
+            "pass the same --send-size\n",
+            params.sendSize, remoteWire.send_size);
+    return false;
+  }
 
   auto newConn = std::make_shared<UrmaConnection>();
   newConn->peer.eid = remoteWire.eid;
@@ -542,6 +556,7 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   newConn->peer.threads = remoteWire.threads;
   newConn->peer.opCode = remoteWire.op_code;
   newConn->peer.valueSize = remoteWire.value_size;
+  newConn->peer.sendSize = remoteWire.send_size;
   newConn->peer.seg.ubva.eid = remoteWire.eid;
   newConn->peer.seg.ubva.uasid = remoteWire.uasid;
   newConn->peer.seg.ubva.va = remoteWire.seg_va;

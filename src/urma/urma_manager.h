@@ -36,6 +36,7 @@ struct HandshakeParams {
   uint32_t threads = 1;
   uint32_t opCode = 0;
   uint32_t valueSize = 0;
+  uint32_t sendSize = 0; /* write 每 send 字节数（拆 2 条 WR）；握手校验两端一致 */
   uint32_t dstChip = kInvalidChip; /* 本进程数据落地目的 chip */
   uint32_t transMode = 0; /* 0=RM 1=RC 2=UM 3=RS（RC 时绑定本地 jetty） */
 };
@@ -49,6 +50,7 @@ struct UrmaPeerInfo {
   uint32_t threads = 1; /* 对端打流线程数 */
   uint32_t opCode = 0;  /* 对端 op（write/get/mixed） */
   uint32_t valueSize = 0;
+  uint32_t sendSize = 0; /* 对端 write 每 send 字节数 */
   urma_seg_t seg{};
 };
 
