@@ -438,10 +438,6 @@ void UrmaManager::PollThreadMain() {
     }
     if (lastOnlyPollNs_ != 0) {
       uint64_t curOnlyPollNs = NowNs() - lastOnlyPollNs_;
-      if (curOnlyPollNs > 100000ULL) {
-        fprintf(stderr, "[poll] only poll interval %.3f us\n",
-                (double)curOnlyPollNs / 1000.0);
-      }
       if (curOnlyPollNs > maxOnlyPollNs) {
         maxOnlyPollNs = curOnlyPollNs;
       }

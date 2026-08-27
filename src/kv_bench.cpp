@@ -766,9 +766,9 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   }
   uint64_t post_a_ns = now_ns();
   uint64_t pa_t0 = now_ns();
-  bool pa_ok = mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_a,
-                              remote_a, wr_len, (uint32_t)src_a,
-                              (uint32_t)dst_chip, ua);
+  bool pa_ok =
+      mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_a, remote_a,
+                     wr_len, (uint32_t)src_a, (uint32_t)dst_chip, ua);
   kv_hist_record(&w->hist_post, now_ns() - pa_t0);
   if (!pa_ok) {
     fprintf(stderr, "[wr] post A failed\n");
@@ -779,9 +779,9 @@ static int client_do_write(context_t *ctx, worker_t *w, int src_a, int src_b,
   }
   uint64_t post_b_ns = now_ns();
   uint64_t pb_t0 = now_ns();
-  bool pb_ok = mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_b,
-                              remote_b, wr_len, (uint32_t)src_b,
-                              (uint32_t)dst_chip, ub);
+  bool pb_ok =
+      mgr->PostWrite(jetty, conn, (uint64_t)ctx->client_data + off_b, remote_b,
+                     wr_len, (uint32_t)src_b, (uint32_t)dst_chip, ub);
   kv_hist_record(&w->hist_post, now_ns() - pb_t0);
   if (!pb_ok) {
     fprintf(stderr, "[wr] post B failed\n");
@@ -902,13 +902,13 @@ static int post_one_req(context_t *ctx, worker_t *w, uint32_t slot_idx,
     }
     s->wr_post_ns[wr] = now_ns();
     uint64_t post_t0 = now_ns();
-    bool post_ok = mgr->PostWrite(
-        jetty, conn,
-        (uint64_t)ctx->client_data + local_base_off +
-            (uint64_t)half * KV_WR_SIZE,
-        remote_base + (uint64_t)send_idx * KV_SEND_SIZE +
-            (uint64_t)half * KV_WR_SIZE,
-        (uint32_t)KV_WR_SIZE, (uint32_t)src, (uint32_t)dst, ue);
+    bool post_ok =
+        mgr->PostWrite(jetty, conn,
+                       (uint64_t)ctx->client_data + local_base_off +
+                           (uint64_t)half * KV_WR_SIZE,
+                       remote_base + (uint64_t)send_idx * KV_SEND_SIZE +
+                           (uint64_t)half * KV_WR_SIZE,
+                       (uint32_t)KV_WR_SIZE, (uint32_t)src, (uint32_t)dst, ue);
     kv_hist_record(&w->hist_post, now_ns() - post_t0);
     if (!post_ok) {
       fprintf(stderr, "[pipe] req %llu WR %u (send %u) post failed, aborting\n",
@@ -958,26 +958,7 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 
   uint64_t lastPollNs_ = 0;
   uint64_t maxPollNs = 0;
-  uint64_t lastPollCpuNs_ = 0;
-  uint64_t maxPollCpuNs = 0;
-  uint64_t maxPollPreemptNs = 0;
-  uint64_t lastReqNs_ = 0;
-  uint64_t maxReqNs = 0;
-  uint64_t lastWorkerNs_ = 0;
-  uint64_t maxWorkerNs = 0;
-  uint64_t lastProbeWorkerNs_ = 0;
-  uint64_t maxProbeWorkerNs = 0;
-  uint64_t maxProbeCpuNs = 0;
-  uint64_t maxProbePreemptNs = 0;
-  uint64_t lastSendWorkerNs_ = 0;
-  uint64_t maxSendWorkerNs = 0;
-  uint64_t maxSendCpuNs = 0;
-  uint64_t maxSendPreemptNs = 0;
-
   uint64_t maxProbeNs = 0;
-  uint64_t maxReleaseNs = 0;
-  uint64_t maxRecordNs = 0;
-
   uint64_t maxPostNs = 0;
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
@@ -986,7 +967,6 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
     /* 1. 收完成：只遍历在飞槽列表；每槽探测 20 条 WR（done[i] 持久化，
      * ProbeEvent 成功即复位槽不能依赖单轮结果），20 条全完成 = 请求完成 */
     uint32_t k = 0;
-    // lastProbeWorkerNs_ = now_ns();
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
@@ -1026,21 +1006,10 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
         s->jetty[send_idx].reset();
       }
 
-      // uint64_t releaseNsEnd_ = now_ns();
-      // uint64_t curRelaseNs = releaseNsEnd_ - probeNsEnd_;
-      // if (curRelaseNs > maxReleaseNs) {
-      //   maxReleaseNs = curRelaseNs;
-      // }
-
       s->active = false;
       /* 请求级时延：第 1 条 WR post → 最后一条 CQE */
       kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
       __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
-
-      // uint64_t curRecordNs = now_ns() - releaseNsEnd_;
-      // if (curRecordNs > maxRecordNs) {
-      //   maxRecordNs = curRecordNs;
-      // }
 
       if (req_active > 0)
         req_active--;
@@ -1050,23 +1019,6 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       w->active_count--;
       /* 不 k++：换进来的槽仍需处理 */
     }
-
-    // uint64_t curProbeWorkerEndNs = now_ns();
-    // uint64_t curProbePollNs = curProbeWorkerEndNs - lastProbeWorkerNs_;
-    // if (curProbePollNs > maxProbeWorkerNs) {
-    //   maxProbeWorkerNs = curProbePollNs;
-    // }
-    // uint64_t curProbeCpuNs = now_cpu_ns() - probeCpuStartNs;
-    // if (curProbeCpuNs > maxProbeCpuNs) {
-    //   maxProbeCpuNs = curProbeCpuNs;
-    // }
-    // if (curProbePollNs > curProbeCpuNs) {
-    //   uint64_t pre = curProbePollNs - curProbeCpuNs;
-    //   if (pre > maxProbePreemptNs) {
-    //     maxProbePreemptNs = pre;
-    //   }
-    // }
-    // uint64_t sendCpuStartNs = now_cpu_ns();
 
     /* 2. 发送：有请求就一直发（重叠），在飞请求 ≤ concurrency 或池空 */
     while (now_ns() < deadline && !ctx->fatal) {
@@ -1098,33 +1050,9 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
       progressed = true;
       req_active++;
       req_seq++;
-      // if (lastReqNs_ != 0) {
-      //   uint64_t curReqNs = now_ns() - lastReqNs_;
-      //   if (curReqNs > maxReqNs) {
-      //     maxReqNs = curReqNs;
-      //   }
-      // }
-      // lastReqNs_ = now_ns();
     }
 
-    // if (!progressed)
-    //   sleep_ns(POLL_SLEEP_NS);
     uint64_t now = now_ns();
-
-    // uint64_t curSendPollNs = now - curProbeWorkerEndNs;
-    // if (curSendPollNs > maxSendWorkerNs) {
-    //   maxSendWorkerNs = curSendPollNs;
-    // }
-    // uint64_t curSendCpuNs = curCpuNs - sendCpuStartNs;
-    // if (curSendCpuNs > maxSendCpuNs) {
-    //   maxSendCpuNs = curSendCpuNs;
-    // }
-    // if (curSendPollNs > curSendCpuNs) {
-    //   uint64_t pre = curSendPollNs - curSendCpuNs;
-    //   if (pre > maxSendPreemptNs) {
-    //     maxSendPreemptNs = pre;
-    //   }
-    // }
 
     if (lastPollNs_ != 0) {
       uint64_t curPollNs = now - lastPollNs_;
@@ -1139,21 +1067,6 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
          "send interval %.3f us, max probe interval %.3f us\n",
          (double)maxPollNs / 1000.0, (double)maxPostNs / 1000.0,
          (double)maxProbeNs / 1000.0);
-  // printf("[worker] worker thread exiting, max poll interval %.3f us (cpu
-  // %.3f,
-  // "
-  //        "preempt %.3f), req "
-  //        "interval %.3f us, worker interval %.3f us (cpu %.3f, preempt %.3f),
-  //        " "probe work interval %.3f " "us (cpu %.3f, preempt %.3f), release
-  //        interval %.3f us, record " "interval %.3f us, probe " "interval %.3f
-  //        us, post one send interval %.3f us\n", (double)maxPollNs / 1000.0,
-  //        (double)maxPollCpuNs / 1000.0, (double)maxPollPreemptNs / 1000.0,
-  //        (double)maxReqNs / 1000.0, (double)maxSendWorkerNs / 1000.0,
-  //        (double)maxSendCpuNs / 1000.0, (double)maxSendPreemptNs / 1000.0,
-  //        (double)maxProbeWorkerNs / 1000.0, (double)maxProbeCpuNs / 1000.0,
-  //        (double)maxProbePreemptNs / 1000.0, (double)maxReleaseNs / 1000.0,
-  //        (double)maxRecordNs / 1000.0, (double)maxProbeNs / 1000.0,
-  //        (double)maxPostNs / 1000.0);
 
   /* 收尾：只遍历在飞槽列表；只等未完成的 WR（done[i] 为 false 的）；
    * 已完成的槽已被 ProbeEvent 复位，再 WaitEvent 会白等超时。释放 jetty
@@ -1749,8 +1662,8 @@ static void *dual_worker_main(void *arg) {
           jetty, *conn[p],
           (uint64_t)ctx->client_data + off + (uint64_t)p * KV_WR_SIZE,
           conn[p]->RemoteSegVa() + off + (uint64_t)p * KV_WR_SIZE,
-          (uint32_t)KV_WR_SIZE, (uint32_t)INVALID_CHIP,
-          (uint32_t)INVALID_CHIP, ue);
+          (uint32_t)KV_WR_SIZE, (uint32_t)INVALID_CHIP, (uint32_t)INVALID_CHIP,
+          ue);
       kv_hist_record(&dw->hist_post, now_ns() - post_t0);
       if (!post_ok) {
         mgr[p]->AbortEvent(dw->wid[p], dw->event_token[p]);
