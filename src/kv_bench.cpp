@@ -99,6 +99,8 @@ typedef struct argument {
   int concurrency; /* write 在飞请求数 1..10，默认 1 */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst）
                     */
+  uint32_t chip_weight[2]; /* affinity 模式两 die 权重 [chip1, chip2]，
+                              默认 {1,1}=5+5 均匀；--chip-weight W1:W2 */
   int poll_cpu; /* 轮询线程绑核；-1 = 自动选空闲核 */
   int op;
   uint32_t mixed_ratio;
@@ -682,8 +684,38 @@ static void pick_round_chips(const argument_t *args, bool is_client,
  * affinity：请求间交替 — 第 1 个 send chip1、第 2 个 send chip2（一批 10 个
  * send = 5+5）； anti：src 随机、dst 固定；none：全随机。 */
 /* 请求内第 send_idx 次发送的 chip 分配（src==dst）：
- * affinity：10 次交替 — 第 1 次 chip1、第 2 次 chip2、第 3 次 chip1...（5+5）；
- * --single-chip：全部固定单 chip；anti：src 随机、dst 固定；none：全随机。 */
+ * affinity：按 --chip-weight W1:W2 加权轮询打散（默认 1:1 = 5+5 交替）；
+ * --single-chip：全部固定单 chip；anti：src 随机、dst 固定；none：全随机。
+ *
+ * 加权打散算法（Bresenham 思想，整数运算避免浮点）：对 send_idx 累积误差，
+ * chip1 累积权重 W1、chip2 累积 W2，每步选当前 deficit 更大的那个 chip 补一笔，
+ * 使 KV_SENDS_PER_REQ 个 send 按 W1:W2 比例尽量均匀分布（如 7:3 →
+ * 1,2,1,1,1,2,1,1,2,1 而非连续 7 个 chip1）。1:1 退化为 send_idx%2 交替。 */
+static int pick_weighted_chip(const argument_t *args, uint32_t send_idx) {
+  uint32_t w1 = args->chip_weight[0];
+  uint32_t w2 = args->chip_weight[1];
+  uint32_t total = w1 + w2;
+  if (total == 0) return 1; /* 校验已拦，兜底 */
+  if (w2 == 0) return 1;    /* 全 chip1 */
+  if (w1 == 0) return 2;    /* 全 chip2 */
+  /* Bresenham：c1/c2 为 chip1/chip2 已分配次数，归一化到 total 域比较 deficit */
+  uint32_t c1 = 0, c2 = 0;
+  for (uint32_t i = 0; i <= send_idx; i++) {
+    uint32_t want1 = (i + 1) * w1; /* 到本步 chip1 的累积目标 */
+    uint32_t want2 = (i + 1) * w2;
+    int def1 = (int)(want1 - c1 * total); /* deficit：chip1 还欠多少 */
+    int def2 = (int)(want2 - c2 * total);
+    if (def1 >= def2) {
+      if (i == send_idx) return 1;
+      c1++;
+    } else {
+      if (i == send_idx) return 2;
+      c2++;
+    }
+  }
+  return 1; /* 兜底 */
+}
+
 static void pick_send_chip(const argument_t *args, worker_t *w,
                            uint32_t send_idx, int *src, int *dst) {
   int dst_chip = first_dst_chip(args);
@@ -691,9 +723,11 @@ static void pick_send_chip(const argument_t *args, worker_t *w,
     dst_chip = (int)(w->id % 2) + 1;
   }
   if (args->affinity_mode == AFF_AFFINITY) {
-    *src = *dst = (args->single_chip >= 1 && args->single_chip <= 2)
-                      ? args->single_chip
-                      : ((send_idx % 2 == 0) ? 1 : 2);
+    if (args->single_chip >= 1 && args->single_chip <= 2) {
+      *src = *dst = args->single_chip;
+    } else {
+      *src = *dst = pick_weighted_chip(args, send_idx);
+    }
   } else if (args->affinity_mode == AFF_ANTI) {
     int all_cpus[MAX_CPUS];
     int n_all = enumerate_all_cpus(all_cpus, MAX_CPUS);
@@ -2229,6 +2263,7 @@ static struct option g_long_options[] = {
     {"event-mode", no_argument, NULL, 'e'},
     {"value-size", required_argument, NULL, 1000},
     {"send-size", required_argument, NULL, 1035},
+    {"chip-weight", required_argument, NULL, 1036},
     {"qps", required_argument, NULL, 1001},
     {"duration", required_argument, NULL, 1002},
     {"jetty-count", required_argument, NULL, 1003},
@@ -2274,6 +2309,9 @@ static void usage(void) {
   printf("      --send-size <bytes>    write per-send bytes, split into 2 WRs "
          "(default 8M;\n"
          "                             e.g. 16M->2x8M, 4M->2x2M, 64K->2x32K)\n");
+  printf("      --chip-weight W1:W2    affinity-mode chip1:chip2 weight, e.g. "
+         "7:3 (default 1:1\n"
+         "                             = 5+5 even split; 10:0 = chip1 only)\n");
   printf("      --qps <qps>            client target QPS in rounds/sec (0 = as "
          "fast as possible)\n");
   printf("      --duration <seconds>   client run duration (default 10)\n");
@@ -2356,6 +2394,23 @@ static int validate_input_params(argument_t *args) {
             args->single_chip);
     return -1;
   }
+  /* --chip-weight：非负、不全 0；与 --single-chip 互斥；非 affinity 仅 warning */
+  if (args->chip_weight[0] + args->chip_weight[1] == 0) {
+    fprintf(stderr, "Invalid --chip-weight %u:%u (both zero)\n",
+            args->chip_weight[0], args->chip_weight[1]);
+    return -1;
+  }
+  if (args->single_chip != 0 &&
+      (args->chip_weight[0] != 1 || args->chip_weight[1] != 1)) {
+    fprintf(stderr,
+            "--single-chip and --chip-weight are mutually exclusive\n");
+    return -1;
+  }
+  if (args->affinity_mode != AFF_AFFINITY &&
+      (args->chip_weight[0] != 1 || args->chip_weight[1] != 1)) {
+    fprintf(stderr,
+            "Warning: --chip-weight only affects affinity mode; ignored\n");
+  }
   if (args->op < OP_WRITE || args->op > OP_MIXED) {
     fprintf(stderr, "Invalid op\n");
     return -1;
@@ -2399,6 +2454,8 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->threads = 1;
   args->concurrency = 1;
   args->single_chip = 0;
+  args->chip_weight[0] = 1;
+  args->chip_weight[1] = 1;
   args->poll_cpu = -1; /* 默认自动选空闲核给轮询线程 */
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
@@ -2441,6 +2498,17 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
     case 1035:
       args->send_size = parse_size(optarg);
       break;
+    case 1036: { /* --chip-weight W1:W2 */
+      uint32_t w1 = 0, w2 = 0;
+      if (sscanf(optarg, "%u:%u", &w1, &w2) != 2) {
+        fprintf(stderr, "Invalid --chip-weight '%s' (expect W1:W2, e.g. 7:3)\n",
+                optarg);
+        return -1;
+      }
+      args->chip_weight[0] = w1;
+      args->chip_weight[1] = w2;
+      break;
+    }
     case 1001:
       args->qps = strtoull(optarg, NULL, 0);
       break;
@@ -2602,10 +2670,11 @@ static int run_chip_query(const argument_t *args) {
       }
       printf("  worker %u: src_a=%d src_b=%d dst=%d\n", i, sa, sb, dst);
     }
-    printf("== write 请求 chip 分配 (mode=%s, send_size=%lluB, 每请求发 %d "
-           "次, 每次 send 同 chip) ==\n",
+    printf("== write 请求 chip 分配 (mode=%s, send_size=%lluB, chip-weight=%u:%u"
+           ", 每请求发 %d 次, 每次 send 同 chip) ==\n",
            mode_names[m],
-           (unsigned long long)args->send_size, KV_SENDS_PER_REQ);
+           (unsigned long long)args->send_size, args->chip_weight[0],
+           args->chip_weight[1], KV_SENDS_PER_REQ);
     for (uint32_t i = 0; i < workers; i++) {
       worker_t w{};
       w.id = i;
