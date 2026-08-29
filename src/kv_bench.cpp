@@ -96,7 +96,7 @@ typedef struct argument {
   const char *destination_cpus;
   bool cacheable;
   uint32_t threads;
-  int concurrency; /* write 在飞请求数 1..10，默认 1 */
+  int concurrency; /* write/get 在飞请求数 1..10，默认 1 */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst）
                     */
   uint32_t chip_weight[2]; /* affinity 模式两 die 权重 [chip1, chip2]，
@@ -435,14 +435,20 @@ static int mbind_to_node(void *addr, size_t len, int node) {
 static int layout_client_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
   /* write：每线程数据区 = concurrency 块 send_size buffer（重叠请求各占一块）；
-   * get/mixed：value_size 窗口 */
-  uint64_t window_reqs = (args->op == OP_WRITE && args->concurrency > 0)
-                             ? (uint64_t)args->concurrency
-                             : 1;
-  uint64_t data_len =
-      (args->op == OP_WRITE)
-          ? (uint64_t)args->threads * window_reqs * args->send_size
-          : (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
+   * get：每线程 concurrency 块 value_size 读缓冲（流水线在飞请求各占一块）；
+   * mixed：value_size 窗口（旧同步模型） */
+  uint64_t window_reqs =
+      (args->op != OP_MIXED && args->concurrency > 0)
+          ? (uint64_t)args->concurrency
+          : 1;
+  uint64_t data_len;
+  if (args->op == OP_WRITE)
+    data_len = (uint64_t)args->threads * window_reqs * args->send_size;
+  else if (args->op == OP_GET)
+    data_len = (uint64_t)args->threads * window_reqs * args->value_size;
+  else
+    data_len =
+        (uint64_t)args->threads * DATA_WINDOW_PER_THREAD * args->value_size;
   ctx->data_len = data_len;
   ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
   return 0;
@@ -452,11 +458,13 @@ static int layout_server_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
   uint64_t size = args->value_size;
   /* 服务器数据区：容纳 write 分片流水线最大窗口（10 并发 × 10 send ×
-   * send_size）；get 为数据源（客户端 READ） */
+   * send_size）；get 为数据源（客户端 READ 按槽寻址：10 并发 × value_size） */
   ctx->data_len = (args->op == OP_WRITE)
                       ? (uint64_t)KV_SENDS_PER_REQ * KV_MAX_CONCURRENCY *
                             args->send_size
-                      : (uint64_t)SERVER_DATA_WINDOW * size;
+                      : (args->op == OP_GET)
+                            ? (uint64_t)KV_MAX_CONCURRENCY * size
+                            : (uint64_t)SERVER_DATA_WINDOW * size;
   ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
   return 0;
 }
@@ -1154,7 +1162,226 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
   return 0;
 }
 
-/* get：客户端直接 READ 服务器数据区（value-size 字节）到本地读缓冲 */
+/* ---------------- get 流水线（与 write 相同的请求级重叠模型） ----------------
+ * 每请求 = 1 条 value_size READ（占 1 条 jetty），本地/远端均按槽固定寻址
+ *（slot_idx * value_size）；每线程在飞请求 ≤ --concurrency，post 后不等 CQE，
+ * 完成一个补发一个。时延 = post → CQE（单 WR，request==wr）。 */
+
+/* 返回 0=成功入槽，1=jetty 池暂时耗尽（非致命，稍后重试），-1=致命错误 */
+static int post_one_get(context_t *ctx, worker_t *w, uint32_t slot_idx,
+                        uint64_t req_seq) {
+  const argument_t *args = &ctx->args;
+  kv_bench::UrmaManager *mgr = ctx->mgr;
+  kv_bench::UrmaConnection &conn = *ctx->conn;
+
+  wr_slot_t *s = &w->wr_slots[slot_idx];
+  s->req_seq = req_seq;
+  s->done_cnt = 0;
+  s->active = true;
+  s->post_ns = now_ns(); /* 时延起点：lane/事件分配前（与 write 一致） */
+
+  int src_a, src_b, dst_chip;
+  pick_round_chips(args, true, w, &src_a, &src_b, &dst_chip);
+  /* 目的 chip 优先用服务器握手通告值（与服务器 --destination-cpus 一致） */
+  if (args->drv_ext && ctx->conn->peer.dstChip != INVALID_CHIP) {
+    dst_chip = (int)ctx->conn->peer.dstChip;
+  }
+  if (!args->drv_ext) {
+    src_a = src_b = dst_chip = INVALID_CHIP;
+  }
+
+  std::shared_ptr<kv_bench::UrmaJetty> jetty;
+  if (!mgr->AcquireSendLane(jetty)) {
+    s->active = false;
+    return 1;
+  }
+  uint64_t event_token = 0;
+  uint64_t ue = mgr->PostEvent(w->id, event_token);
+  if (ue == 0) {
+    fprintf(stderr, "[get-pipe] req %llu event slots exhausted\n",
+            (unsigned long long)req_seq);
+    mgr->ReleaseSendLane(jetty);
+    s->active = false;
+    return -1;
+  }
+  s->wr_post_ns[0] = now_ns();
+  if (!mgr->PostRead(jetty, conn,
+                     (uint64_t)ctx->client_data +
+                         (uint64_t)slot_idx * args->value_size,
+                     conn.RemoteSegVa() +
+                         (uint64_t)slot_idx * args->value_size,
+                     (uint32_t)args->value_size, (uint32_t)src_a,
+                     (uint32_t)dst_chip, ue)) {
+    fprintf(stderr, "[get-pipe] req %llu post read failed\n",
+            (unsigned long long)req_seq);
+    mgr->AbortEvent(w->id, event_token);
+    mgr->ReleaseSendLane(jetty);
+    s->active = false;
+    return -1;
+  }
+  s->jetty[0] = jetty;
+  s->event_token[0] = event_token;
+  s->done[0] = false;
+  w->active_slots[w->active_count++] = slot_idx; /* 登记在飞槽 */
+  return 0;
+}
+
+static int client_get_pipeline(context_t *ctx, worker_t *w,
+                               uint64_t deadline) {
+  const argument_t *args = &ctx->args;
+  kv_bench::UrmaManager *mgr = ctx->mgr;
+  uint32_t concurrency =
+      (args->concurrency >= 1 ? (uint32_t)args->concurrency : 1);
+  if (concurrency > KV_MAX_CONCURRENCY)
+    concurrency = KV_MAX_CONCURRENCY;
+  uint32_t max_inflight_reqs = concurrency;
+  uint64_t interval_ns = 0;
+  if (args->qps > 0) {
+    uint64_t per_thread = args->qps / args->threads;
+    if (per_thread == 0)
+      per_thread = 1;
+    interval_ns = 1000000000ULL / per_thread; /* 请求/秒（每线程） */
+  }
+  uint64_t next_req_ns = now_ns();
+
+  uint64_t req_seq = 0;    /* 请求全局序号 */
+  uint32_t req_active = 0; /* 在飞请求数（≤ concurrency） */
+
+  uint64_t lastPollNs_ = 0;
+  uint64_t maxPollNs = 0;
+  uint64_t maxProbeNs = 0;
+  uint64_t maxPostNs = 0;
+
+  while (!w->stop && !ctx->fatal && now_ns() < deadline) {
+    /* 1. 收完成：每槽 1 条 WR，ProbeEvent 命中即请求完成 */
+    uint32_t k = 0;
+    while (k < w->active_count) {
+      uint32_t idx = w->active_slots[k];
+      wr_slot_t *s = &w->wr_slots[idx];
+      uint64_t probeNsStart_ = now_ns();
+      int r = s->done[0] ? 1 : mgr->ProbeEvent(w->id, s->event_token[0]);
+      uint64_t probeNsEnd_ = now_ns();
+      if (probeNsEnd_ - probeNsStart_ > maxProbeNs) {
+        maxProbeNs = probeNsEnd_ - probeNsStart_;
+      }
+      if (r == -1) {
+        fprintf(stderr, "[get-pipe] req %llu READ failed (token=%llu)\n",
+                (unsigned long long)s->req_seq,
+                (unsigned long long)s->event_token[0]);
+        return -1;
+      }
+      if (r != 1) {
+        k++; /* 未完成，处理下一个在飞槽 */
+        continue;
+      }
+      /* 请求完成：记时延、归还 jetty、腾槽 */
+      s->done[0] = true;
+      s->done_cnt = 1;
+      uint64_t t = now_ns();
+      kv_hist_record(&w->hist_wr, t - s->wr_post_ns[0]);
+      kv_hist_record(&w->hist, t - s->post_ns); /* 请求时延（summary 用） */
+      __atomic_add_fetch(&w->bytes, args->value_size, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+      mgr->ReleaseSendLane(s->jetty[0]);
+      s->jetty[0].reset();
+      s->active = false;
+      if (req_active > 0)
+        req_active--;
+      w->free_slots[w->free_count++] = idx;
+      w->active_slots[k] = w->active_slots[w->active_count - 1];
+      w->active_count--;
+      /* 不 k++：换进来的槽仍需处理 */
+    }
+
+    /* 2. 发送：在飞 ≤ concurrency；jetty 池耗尽时等完成腾出后再试 */
+    while (now_ns() < deadline && !ctx->fatal) {
+      if (req_active >= max_inflight_reqs)
+        break;
+      if (interval_ns > 0) {
+        if (now_ns() < next_req_ns) {
+          uint64_t left = next_req_ns - now_ns();
+          if (left > 50000)
+            sleep_ns(left - 50000);
+          while (now_ns() < next_req_ns) {
+          }
+        }
+        next_req_ns = now_ns() + interval_ns;
+      }
+      if (w->free_count == 0)
+        break; /* 槽满（≤ 10，理论不会） */
+      uint32_t slot = w->free_slots[--w->free_count];
+      uint64_t postNsStart_ = now_ns();
+      int pr = post_one_get(ctx, w, slot, req_seq);
+      if (pr != 0) {
+        w->free_slots[w->free_count++] = slot; /* 归还槽 */
+        if (pr < 0)
+          return -1;
+        break; /* 池耗尽：非致命，等完成释放 jetty */
+      }
+      uint64_t curPostNs_ = now_ns() - postNsStart_;
+      if (curPostNs_ > maxPostNs) {
+        maxPostNs = curPostNs_;
+      }
+      req_active++;
+      req_seq++;
+    }
+
+    uint64_t now = now_ns();
+    if (lastPollNs_ != 0) {
+      uint64_t curPollNs = now - lastPollNs_;
+      if (curPollNs > maxPollNs) {
+        maxPollNs = curPollNs;
+      }
+    }
+    lastPollNs_ = now;
+  }
+
+  printf("[worker] get pipeline exiting, max worker interval %.3f us, max "
+         "send interval %.3f us, max probe interval %.3f us\n",
+         (double)maxPollNs / 1000.0, (double)maxPostNs / 1000.0,
+         (double)maxProbeNs / 1000.0);
+
+  /* 收尾：等待所有在飞 READ 完成（WaitEvent 阻塞）；超时隔离 lane */
+  const uint64_t drain_deadline =
+      now_ns() + (uint64_t)args->timeout_ms * 1000000ULL;
+  uint64_t drain_failures = 0;
+  while (w->active_count > 0) {
+    uint32_t idx = w->active_slots[0];
+    wr_slot_t *s = &w->wr_slots[idx];
+    uint64_t now = now_ns();
+    int remaining_ms = 0;
+    if (now < drain_deadline) {
+      remaining_ms = (int)((drain_deadline - now + 999999ULL) / 1000000ULL);
+    }
+    if (!mgr->WaitEvent(w->id, s->event_token[0], remaining_ms)) {
+      fprintf(stderr,
+              "[get-pipe] drain timeout: req=%llu token=%llu; "
+              "send lane quarantined\n",
+              (unsigned long long)s->req_seq,
+              (unsigned long long)s->event_token[0]);
+      drain_failures++;
+    } else {
+      uint64_t t = now_ns();
+      kv_hist_record(&w->hist_wr, t - s->wr_post_ns[0]);
+      kv_hist_record(&w->hist, t - s->post_ns);
+      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&w->bytes, args->value_size, __ATOMIC_RELAXED);
+      mgr->ReleaseSendLane(s->jetty[0]);
+    }
+    s->jetty[0].reset();
+    s->active = false;
+    w->free_slots[w->free_count++] = idx;
+    w->active_slots[0] = w->active_slots[w->active_count - 1];
+    w->active_count--;
+  }
+  if (drain_failures > 0) {
+    __atomic_add_fetch(&w->errors, drain_failures, __ATOMIC_RELAXED);
+  }
+
+  return 0;
+}
+
+/* get（mixed 用旧同步模型）：客户端直接 READ 服务器数据区（value-size 字节）到本地读缓冲 */
 static int client_do_get(context_t *ctx, worker_t *w, int src_a, int dst_chip) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
@@ -1240,6 +1467,20 @@ static void *client_worker_main(void *arg) {
         ctx->fatal = true;
         fprintf(stderr,
                 "[fatal] first write request failed (worker %u), aborting...\n",
+                w->id);
+      }
+    }
+    return NULL;
+  }
+
+  /* get：与 write 相同的请求级流水线（--concurrency 控制在飞 READ 数） */
+  if (args->op == OP_GET) {
+    if (client_get_pipeline(ctx, w, deadline) != 0) {
+      __atomic_add_fetch(&w->errors, 1, __ATOMIC_RELAXED);
+      if (!ctx->fatal) {
+        ctx->fatal = true;
+        fprintf(stderr,
+                "[fatal] first get request failed (worker %u), aborting...\n",
                 w->id);
       }
     }
@@ -1979,12 +2220,18 @@ static int run_client(const argument_t *args) {
   ctx->mgr->SetPollCpu(args->poll_cpu >= 0 ? args->poll_cpu
                                            : auto_poll_cpu(args, true));
 
-  /* jetty 池 ≥ max(线程数, write 在飞请求 × 10 个 send) */
+  /* jetty 池 ≥ max(线程数, write 在飞请求 × 10 个 send, get 线程数 × 在飞请求) */
   uint32_t min_lanes = args->threads;
   if (args->op == OP_WRITE) {
     /* 池 ≥ 在飞请求 × 10（每请求 10 个 send 各占一条 jetty） */
     uint32_t reqs = (args->concurrency >= 1) ? (uint32_t)args->concurrency : 1;
     uint32_t pipe = reqs * KV_SENDS_PER_REQ;
+    if (pipe > min_lanes)
+      min_lanes = pipe;
+  } else if (args->op == OP_GET) {
+    /* get 流水线：池 ≥ 线程数 × 在飞请求（每在飞请求占 1 条 jetty） */
+    uint32_t reqs = (args->concurrency >= 1) ? (uint32_t)args->concurrency : 1;
+    uint32_t pipe = reqs * args->threads;
     if (pipe > min_lanes)
       min_lanes = pipe;
   }
@@ -2326,8 +2573,8 @@ static void usage(void) {
          "auto per chip)\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
-  printf("      --concurrency <n>      write inflight requests 1..10 (default "
-         "1)\n");
+  printf("      --concurrency <n>      write/get inflight requests 1..10 "
+         "(default 1)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all "
          "sends use one chip (src==dst), mbind to that chip's NUMA\n");
   printf("      --poll-cpu <n>         pin URMA poll thread to cpu (default: "
