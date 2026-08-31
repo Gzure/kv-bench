@@ -1163,16 +1163,46 @@ static int client_write_pipeline(context_t *ctx, worker_t *w,
 }
 
 /* ---------------- get 流水线（与 write 相同的请求级重叠模型） ----------------
- * 每请求 = 1 条 value_size READ（占 1 条 jetty），本地/远端均按槽固定寻址
- *（slot_idx * value_size）；每线程在飞请求 ≤ --concurrency，post 后不等 CQE，
- * 完成一个补发一个。时延 = post → CQE（单 WR，request==wr）。 */
+ * 每请求 = KV_WR_PER_SEND 条 value_size/2 READ 共用 1 条 jetty（与 write 每
+ * send 拆 2 条 WR 同构），本地/远端均按槽固定寻址（slot_idx * value_size 起，
+ * WR half 偏移 half * value_size/2）；每线程在飞请求 ≤ --concurrency，post 后
+ * 不等 CQE，完成一个补发一个。时延 = 第 1 条 WR post 前 → 2 条 CQE 全收齐。 */
 
-/* 返回 0=成功入槽，1=jetty 池暂时耗尽（非致命，稍后重试），-1=致命错误 */
+/* get 请求 post 失败回滚：等待已 post 的 WR 完成后释放 jetty；等待超时则
+ * 隔离 lane（不复用，与 write 的 drain_posted_wrs 同策略） */
+static void rollback_get_wrs(kv_bench::UrmaManager *mgr, worker_t *w,
+                             wr_slot_t *s, uint32_t posted_count,
+                             int timeout_ms) {
+  bool all_ok = true;
+  for (uint32_t wr = 0; wr < posted_count; wr++) {
+    if (mgr->WaitEvent(w->id, s->event_token[wr], timeout_ms)) {
+      kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[wr]);
+    } else {
+      all_ok = false;
+      fprintf(stderr, "[get-pipe] req %llu rollback WR %u timeout\n",
+              (unsigned long long)s->req_seq, wr);
+    }
+  }
+  if (all_ok) {
+    mgr->ReleaseSendLane(s->jetty[0]);
+  } else {
+    fprintf(stderr, "[get-pipe] incomplete lane quarantined during rollback\n");
+  }
+  s->jetty[0].reset();
+}
+
+/* Post KV_WR_PER_SEND 条 value_size/2 READ 共用 1 条 jetty，不等 CQE。
+ * 返回 0=成功入槽，1=jetty 池暂时耗尽（非致命，稍后重试），-1=致命错误 */
 static int post_one_get(context_t *ctx, worker_t *w, uint32_t slot_idx,
                         uint64_t req_seq) {
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
+  uint64_t wr_size = args->value_size / KV_WR_PER_SEND;
+  uint64_t local_base =
+      (uint64_t)ctx->client_data + (uint64_t)slot_idx * args->value_size;
+  uint64_t remote_base =
+      conn.RemoteSegVa() + (uint64_t)slot_idx * args->value_size;
 
   wr_slot_t *s = &w->wr_slots[slot_idx];
   s->req_seq = req_seq;
@@ -1190,38 +1220,41 @@ static int post_one_get(context_t *ctx, worker_t *w, uint32_t slot_idx,
     src_a = src_b = dst_chip = INVALID_CHIP;
   }
 
+  /* 2 条 WR 共用 1 条 jetty：先取 lane，再连续 post，不等 CQE */
   std::shared_ptr<kv_bench::UrmaJetty> jetty;
   if (!mgr->AcquireSendLane(jetty)) {
     s->active = false;
-    return 1;
-  }
-  uint64_t event_token = 0;
-  uint64_t ue = mgr->PostEvent(w->id, event_token);
-  if (ue == 0) {
-    fprintf(stderr, "[get-pipe] req %llu event slots exhausted\n",
-            (unsigned long long)req_seq);
-    mgr->ReleaseSendLane(jetty);
-    s->active = false;
-    return -1;
-  }
-  s->wr_post_ns[0] = now_ns();
-  if (!mgr->PostRead(jetty, conn,
-                     (uint64_t)ctx->client_data +
-                         (uint64_t)slot_idx * args->value_size,
-                     conn.RemoteSegVa() +
-                         (uint64_t)slot_idx * args->value_size,
-                     (uint32_t)args->value_size, (uint32_t)src_a,
-                     (uint32_t)dst_chip, ue)) {
-    fprintf(stderr, "[get-pipe] req %llu post read failed\n",
-            (unsigned long long)req_seq);
-    mgr->AbortEvent(w->id, event_token);
-    mgr->ReleaseSendLane(jetty);
-    s->active = false;
-    return -1;
+    return 1; /* 池耗尽：非致命，等完成释放后再试 */
   }
   s->jetty[0] = jetty;
-  s->event_token[0] = event_token;
-  s->done[0] = false;
+  for (uint32_t half = 0; half < KV_WR_PER_SEND; half++) {
+    uint64_t event_token = 0;
+    uint64_t ue = mgr->PostEvent(w->id, event_token);
+    if (ue == 0) {
+      fprintf(stderr, "[get-pipe] req %llu event slots exhausted at WR %u\n",
+              (unsigned long long)req_seq, half);
+      rollback_get_wrs(mgr, w, s, half, args->timeout_ms);
+      s->active = false;
+      return -1;
+    }
+    s->wr_post_ns[half] = now_ns();
+    uint64_t post_t0 = now_ns();
+    bool post_ok = mgr->PostRead(
+        jetty, conn, local_base + (uint64_t)half * wr_size,
+        remote_base + (uint64_t)half * wr_size, (uint32_t)wr_size,
+        (uint32_t)src_a, (uint32_t)dst_chip, ue);
+    kv_hist_record(&w->hist_post, now_ns() - post_t0);
+    if (!post_ok) {
+      fprintf(stderr, "[get-pipe] req %llu WR %u post read failed\n",
+              (unsigned long long)req_seq, half);
+      mgr->AbortEvent(w->id, event_token);
+      rollback_get_wrs(mgr, w, s, half, args->timeout_ms);
+      s->active = false;
+      return -1;
+    }
+    s->event_token[half] = event_token;
+    s->done[half] = false;
+  }
   w->active_slots[w->active_count++] = slot_idx; /* 登记在飞槽 */
   return 0;
 }
@@ -1253,38 +1286,47 @@ static int client_get_pipeline(context_t *ctx, worker_t *w,
   uint64_t maxPostNs = 0;
 
   while (!w->stop && !ctx->fatal && now_ns() < deadline) {
-    /* 1. 收完成：每槽 1 条 WR，ProbeEvent 命中即请求完成 */
+    /* 1. 收完成：每槽探测 2 条 WR（done[i] 持久化），2 条全完成 = 请求完成 */
     uint32_t k = 0;
     while (k < w->active_count) {
       uint32_t idx = w->active_slots[k];
       wr_slot_t *s = &w->wr_slots[idx];
       uint64_t probeNsStart_ = now_ns();
-      int r = s->done[0] ? 1 : mgr->ProbeEvent(w->id, s->event_token[0]);
+      for (uint32_t i = 0; i < KV_WR_PER_SEND; i++) {
+        if (s->done[i])
+          continue;
+        int r = mgr->ProbeEvent(w->id, s->event_token[i]);
+        if (r == -1) {
+          fprintf(stderr, "[get-pipe] req %llu WR %u failed (token=%llu)\n",
+                  (unsigned long long)s->req_seq, i,
+                  (unsigned long long)s->event_token[i]);
+          return -1;
+        }
+        if (r == 1) {
+          s->done[i] = true;
+          s->done_cnt++;
+          kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[i]);
+        }
+      }
       uint64_t probeNsEnd_ = now_ns();
       if (probeNsEnd_ - probeNsStart_ > maxProbeNs) {
         maxProbeNs = probeNsEnd_ - probeNsStart_;
       }
-      if (r == -1) {
-        fprintf(stderr, "[get-pipe] req %llu READ failed (token=%llu)\n",
-                (unsigned long long)s->req_seq,
-                (unsigned long long)s->event_token[0]);
-        return -1;
-      }
-      if (r != 1) {
-        k++; /* 未完成，处理下一个在飞槽 */
+
+      if (s->done_cnt < KV_WR_PER_SEND) {
+        k++; /* 请求未完成，处理下一个在飞槽 */
         continue;
       }
-      /* 请求完成：记时延、归还 jetty、腾槽 */
-      s->done[0] = true;
-      s->done_cnt = 1;
-      uint64_t t = now_ns();
-      kv_hist_record(&w->hist_wr, t - s->wr_post_ns[0]);
-      kv_hist_record(&w->hist, t - s->post_ns); /* 请求时延（summary 用） */
+      /* 请求完成：2 条 WR 全部完成；带宽按 value_size 计 */
       __atomic_add_fetch(&w->bytes, args->value_size, __ATOMIC_RELAXED);
-      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
       mgr->ReleaseSendLane(s->jetty[0]);
       s->jetty[0].reset();
+
       s->active = false;
+      /* 请求级时延：第 1 条 WR post → 最后一条 CQE（与 write 同记 hist_req） */
+      kv_hist_record(&w->hist_req, now_ns() - s->post_ns);
+      __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
+
       if (req_active > 0)
         req_active--;
       w->free_slots[w->free_count++] = idx;
@@ -1341,7 +1383,7 @@ static int client_get_pipeline(context_t *ctx, worker_t *w,
          (double)maxPollNs / 1000.0, (double)maxPostNs / 1000.0,
          (double)maxProbeNs / 1000.0);
 
-  /* 收尾：等待所有在飞 READ 完成（WaitEvent 阻塞）；超时隔离 lane */
+  /* 收尾：等待所有在飞 READ 完成（每槽 2 条 WR，WaitEvent 阻塞）；超时隔离 lane */
   const uint64_t drain_deadline =
       now_ns() + (uint64_t)args->timeout_ms * 1000000ULL;
   uint64_t drain_failures = 0;
@@ -1353,20 +1395,27 @@ static int client_get_pipeline(context_t *ctx, worker_t *w,
     if (now < drain_deadline) {
       remaining_ms = (int)((drain_deadline - now + 999999ULL) / 1000000ULL);
     }
-    if (!mgr->WaitEvent(w->id, s->event_token[0], remaining_ms)) {
-      fprintf(stderr,
-              "[get-pipe] drain timeout: req=%llu token=%llu; "
-              "send lane quarantined\n",
-              (unsigned long long)s->req_seq,
-              (unsigned long long)s->event_token[0]);
-      drain_failures++;
-    } else {
+    bool all_ok = true;
+    for (uint32_t wr = 0; wr < KV_WR_PER_SEND; wr++) {
+      if (!mgr->WaitEvent(w->id, s->event_token[wr], remaining_ms)) {
+        fprintf(stderr,
+                "[get-pipe] drain timeout: req=%llu WR %u token=%llu; "
+                "send lane quarantined\n",
+                (unsigned long long)s->req_seq, wr,
+                (unsigned long long)s->event_token[wr]);
+        all_ok = false;
+      } else {
+        kv_hist_record(&w->hist_wr, now_ns() - s->wr_post_ns[wr]);
+      }
+    }
+    if (all_ok) {
       uint64_t t = now_ns();
-      kv_hist_record(&w->hist_wr, t - s->wr_post_ns[0]);
-      kv_hist_record(&w->hist, t - s->post_ns);
+      kv_hist_record(&w->hist_req, t - s->post_ns);
       __atomic_add_fetch(&w->ops, 1, __ATOMIC_RELAXED);
       __atomic_add_fetch(&w->bytes, args->value_size, __ATOMIC_RELAXED);
       mgr->ReleaseSendLane(s->jetty[0]);
+    } else {
+      drain_failures++;
     }
     s->jetty[0].reset();
     s->active = false;
@@ -1613,16 +1662,22 @@ static void print_client_summary(context_t *ctx, double seconds) {
   double bw_mb_s =
       seconds > 0 ? (double)bytes / seconds / 1e6 : 0.0; /* 大 B: MB/s */
   double bw_mbps = bw_mb_s * 8.0;                        /* 小 b: Mb/s */
-  /* wr_rate：write = 请求 × KV_WR_PER_REQ 条 WR（每条 send_size/2） */
-  double wr_rate = iops * (args->op == OP_WRITE ? (double)KV_WR_PER_REQ : 1.0);
+  /* wr_rate：write = 请求 × KV_WR_PER_REQ（每条 send_size/2）；get 流水线 =
+   * 请求 × KV_WR_PER_SEND（每条 value_size/2）；mixed 同步 get 每请求 1 条 */
+  double wr_factor = 1.0;
+  if (args->op == OP_WRITE)
+    wr_factor = (double)KV_WR_PER_REQ;
+  else if (args->op == OP_GET)
+    wr_factor = (double)KV_WR_PER_SEND;
+  double wr_rate = iops * wr_factor;
   printf("requests=%" PRIu64
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
          ops, iops, wr_rate, bw_mb_s, bw_mbps, bytes, errors);
-  if (args->op == OP_WRITE) {
-    print_latency_line_us("request", &merged_req);
-  } else {
+  if (args->op == OP_MIXED) {
     print_latency_line_us("request", &merged);
+  } else {
+    print_latency_line_us("request", &merged_req);
   }
   print_latency_line_us("wr", &merged_wr);
   if (merged_post.total_count > 0)
@@ -1668,7 +1723,7 @@ static void latency_window_sample(context_t *ctx, latency_window_t *window,
             ? &w->hist_wr
             : (kind == LatencyKind::Post
                    ? &w->hist_post
-                   : (ctx->args.op == OP_WRITE ? &w->hist_req : &w->hist));
+                   : (ctx->args.op == OP_MIXED ? &w->hist : &w->hist_req));
     kv_hist_merge_snapshot(&window->current, source);
   }
   kv_hist_delta(&window->interval, &window->current, &window->previous);
@@ -2552,7 +2607,10 @@ static void usage(void) {
   printf("  -e, --event-mode           use wait_jfc/ack/rearm event mode "
          "(default false)\n");
   printf(
-      "      --value-size <bytes>   per-WR payload, e.g. 4M/8M (default 4M)\n");
+      "      --value-size <bytes>   get per-op bytes, split into 2 WRs like "
+      "write (default 4M;\n"
+      "                             e.g. 16M->2x8M, 64K->2x32K; mixed uses it "
+      "unsplit)\n");
   printf("      --send-size <bytes>    write per-send bytes, split into 2 WRs "
          "(default 8M;\n"
          "                             e.g. 16M->2x8M, 4M->2x2M, 64K->2x32K)\n");
@@ -2621,6 +2679,18 @@ static int validate_input_params(argument_t *args) {
             "Invalid send-size %llu (must be >= 8K, even, wr_size page-"
             "aligned; e.g. 8M/16M/4M/64K)\n",
             (unsigned long long)args->send_size);
+    return -1;
+  }
+  /* get 流水线把 value_size 拆成 KV_WR_PER_SEND 条 WR（与 write 每 send 拆
+   * 2 条同构）：value_size 必须 ≥ 2*PAGE_SIZE 且为 2*PAGE_SIZE 倍数（每条
+   * WR 页对齐）；mixed 的同步 get 不拆分，不受此限制 */
+  if (args->op == OP_GET &&
+      (args->value_size < 2 * PAGE_SIZE ||
+       args->value_size % (2 * PAGE_SIZE) != 0)) {
+    fprintf(stderr,
+            "Invalid value-size %llu for get (must be >= 8K and 8K-aligned "
+            "since it splits into 2 WRs; e.g. 16M/8M/1M/64K)\n",
+            (unsigned long long)args->value_size);
     return -1;
   }
   if (args->dual_dev && args->dev_name2 == NULL) {
