@@ -155,7 +155,7 @@ bool UrmaJetty::Create(UrmaResource &res, bool isSend,
   }
 
   /* send: 共享 context 级 JFR；recv: 独立 JFR（对齐 yuanrong UrmaJetty::Create
-   * L344） */
+   * L344） */:
   std::shared_ptr<UrmaJfr> jfr;
   if (isSend) {
     if (res.sharedJettyJfr_ == nullptr) {
@@ -178,7 +178,7 @@ bool UrmaJetty::Create(UrmaResource &res, bool isSend,
   jfsCfg.flag.bs.order_type = res.TransMode() == 3 ? 1 : 0;
   jfsCfg.flag.bs.multi_path = 1;
   jfsCfg.trans_mode = ResolveTransMode(res.TransMode());
-  jfsCfg.priority = URMA_MAX_PRIORITY;
+  jfsCfg.priority = 4;
   jfsCfg.max_sge = kUrmaMaxSge;
   jfsCfg.max_inline_data = 0;
   jfsCfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
