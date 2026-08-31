@@ -13,7 +13,7 @@
 
 除兼容的 `--server-ip` 直连模式外，程序支持统一的 worker 节点模式：
 
-- Python manager 是独立控制组件，不初始化 URMA；它通过 SSH 执行 `rpm -qa`、部署 artifact，并在 URMA 版本不一致时对节点单独编译。
+- Python manager 是独立控制组件，不初始化 URMA；它通过 SSH 执行 `rpm -qa`、部署 artifact，并在 URMA 版本不一致时对节点单独编译。manager 基于 FastAPI + uvicorn，前端为 Vue 3 + Vite + Element Plus 单页应用（FastAPI 托管构建产物），接口语义见 [manager/README.md](manager/README.md)。
 - worker 是 `kv-bench --worker` 启动的常驻 HTTP 服务，不注册、不回连 manager；worker API 在同一进程内调用测试入口启动和停止任务。
 - 任务的 `bench_item {src, dst, type}` 按拓扑描述数据流，`type` 为 `forward`、`reverse` 或 `bidirectional`。
 - manager REST API 为 `POST /v1/deploy`、`GET/POST /v1/tasks`、`POST /v1/tasks/{id}/start` 和 `POST /v1/tasks/{id}/stop`；worker API 为 `GET /v1/health`、`POST /v1/tasks/start` 和 `POST /v1/tasks/{id}/stop`。

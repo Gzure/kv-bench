@@ -24,10 +24,11 @@ cmake --build build -j
 ## 多节点 manager/worker 模式
 
 新模式对外只暴露 `worker` 节点；原有直接连接模式继续兼容。manager 不初始化
-worker 服务不连接 manager；manager 通过 SSH 部署并通过 worker HTTP API 控制本地 kv-bench：
+worker 服务不连接 manager；manager 通过 SSH 部署并通过 worker HTTP API 控制本地 kv-bench。
+manager 基于 **FastAPI + Vue 3/Element Plus**（Web 界面 + REST API）：
 
 ```bash
-# manager
+# manager（需先安装依赖：pip install -r manager/requirements.txt）
 python3 -m manager.app --port 18080
 
 # 每个 worker

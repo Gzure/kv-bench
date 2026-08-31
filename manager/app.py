@@ -12,13 +12,14 @@ import os
 import shlex
 import subprocess
 import threading
-import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Protocol
 
-from .console import CONSOLE_HTML
+try:
+    import httpx
+except ImportError:  # domain layer stays usable without third-party deps
+    httpx = None
 
 
 @dataclass(frozen=True)
@@ -143,14 +144,23 @@ class SshExecutor:
 
 
 class HttpWorkerClient:
+    """Worker API client over httpx (mature HTTP stack, explicit timeouts)."""
+
+    def _require_httpx(self) -> None:
+        if httpx is None:
+            raise RuntimeError(
+                "httpx is required: pip install -r manager/requirements.txt")
+
     def _post(self, node: Node, path: str, payload: dict[str, Any]) -> None:
-        request = urllib.request.Request(
-            f"http://{node.ip}:{node.api_port}{path}",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(request, timeout=10) as response:
-            if response.status >= 300:
-                raise RuntimeError(f"worker {node.name} returned HTTP {response.status}")
+        self._require_httpx()
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    f"http://{node.ip}:{node.api_port}{path}", json=payload)
+        except httpx.HTTPError as error:
+            raise RuntimeError(f"worker {node.name} unreachable: {error}") from error
+        if response.status_code >= 300:
+            raise RuntimeError(f"worker {node.name} returned HTTP {response.status_code}")
 
     def start(self, node: Node, task_id: str, command: list[str]) -> None:
         self._post(node, "/v1/tasks/start", {"task_id": task_id, "command": command})
@@ -159,8 +169,15 @@ class HttpWorkerClient:
         self._post(node, f"/v1/tasks/{task_id}/stop", {})
 
     def result(self, node: Node, task_id: str) -> dict[str, Any]:
-        with urllib.request.urlopen(f"http://{node.ip}:{node.api_port}/v1/tasks/{task_id}/result", timeout=10) as response:
-            return json.loads(response.read())
+        self._require_httpx()
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(
+                    f"http://{node.ip}:{node.api_port}/v1/tasks/{task_id}/result")
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as error:
+            raise RuntimeError(f"worker {node.name} unreachable: {error}") from error
 
 
 class DeploymentManager:
@@ -284,88 +301,13 @@ class DeploymentManager:
             return task.result
 
 
-class ApiHandler(BaseHTTPRequestHandler):
-    manager: DeploymentManager
-
-    def _json(self, status: int, payload: Any) -> None:
-        data = json.dumps(payload, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(length) or b"{}")
-
-    def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(CONSOLE_HTML.encode())))
-            self.end_headers()
-            self.wfile.write(CONSOLE_HTML.encode())
-        elif self.path in {"/v1/nodes", "/v1/workers"}:
-            nodes = self.manager.node_store.list() if self.manager.node_store else []
-            self._json(200, [{key: value for key, value in asdict(node).items() if key != "password"} for node in nodes])
-        elif self.path == "/v1/tasks":
-            self._json(200, [asdict(task) for task in self.manager.tasks.values()])
-        elif self.path.startswith("/v1/tasks/") and self.path.endswith("/result"):
-            task_id = self.path[len("/v1/tasks/") : -len("/result")].rstrip("/")
-            self._json(200, self.manager.collect_result(task_id))
-        else:
-            self._json(404, {"error": "not found"})
-
-    def do_POST(self) -> None:  # noqa: N802
-        try:
-            if self.path == "/v1/nodes":
-                node = Node(**self._body())
-                if self.manager.node_store is None:
-                    raise ValueError("node store is disabled")
-                self.manager.node_store.upsert(node)
-                self._json(201, {"name": node.name, "state": "saved"})
-            elif self.path == "/v1/deploy":
-                payload = self._body()
-                nodes = [Node(**entry) for entry in payload["nodes"]]
-                result = self.manager.deploy(nodes, payload["artifact"], payload["destination"], payload["source_dir"], payload["umdk_root"])
-                self._json(200, asdict(result))
-            elif self.path == "/v1/tasks":
-                task = self.manager.create_task(self._body())
-                self._json(201, {"task_id": task.task_id, "state": task.state})
-            elif self.path.startswith("/v1/tasks/") and self.path.endswith("/start"):
-                task_id = self.path[len("/v1/tasks/") : -len("/start")].rstrip("/")
-                commands = self.manager.start_task(task_id)
-                self._json(200, {"task_id": task_id, "state": "running", "commands": commands})
-            elif self.path.startswith("/v1/tasks/") and self.path.endswith("/stop"):
-                task_id = self.path[len("/v1/tasks/") : -len("/stop")].rstrip("/")
-                self.manager.stop_task(task_id)
-                self._json(200, {"task_id": task_id, "state": "stopped"})
-            else:
-                self._json(404, {"error": "not found"})
-        except KeyError as error:
-            self._json(404, {"error": str(error)})
-        except (KeyError, ValueError, json.JSONDecodeError) as error:
-            self._json(400, {"error": str(error)})
-
-    def do_DELETE(self) -> None:  # noqa: N802
-        if self.path.startswith("/v1/nodes/") and self.manager.node_store is not None:
-            try:
-                self.manager.node_store.remove(self.path[len("/v1/nodes/") :])
-                self._json(200, {"state": "deleted"})
-            except KeyError as error:
-                self._json(404, {"error": str(error)})
-            return
-        self._json(404, {"error": "not found"})
-
-    def log_message(self, *_args: Any) -> None:
-        return
-
-
 def serve(host: str, port: int) -> None:
+    """Start the FastAPI manager (domain wiring + uvicorn)."""
+    from .api import create_app
+    import uvicorn
+
     manager = DeploymentManager(SshExecutor(), HttpWorkerClient(), NodeStore())
-    handler = type("ManagerApiHandler", (ApiHandler,), {"manager": manager})
-    ThreadingHTTPServer((host, port), handler).serve_forever()
+    uvicorn.run(create_app(manager), host=host, port=port)
 
 
 def main() -> None:
