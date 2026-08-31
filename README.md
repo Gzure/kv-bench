@@ -21,7 +21,72 @@ cmake -S . -B build -DUMDK_ROOT=/path/to/umdk
 cmake --build build -j
 ```
 
+## 多节点 manager/worker 模式
+
+新模式对外只暴露 `worker` 节点；原有直接连接模式继续兼容。manager 不初始化
+worker 服务不连接 manager；manager 通过 SSH 部署并通过 worker HTTP API 控制本地 kv-bench：
+
+```bash
+# manager
+python3 -m manager.app --port 18080
+
+# 每个 worker
+/opt/kv-bench/build/kv-bench --worker --worker-port=18082
+```
+
+REST 接口：
+
+```bash
+curl http://manager:18080/v1/workers
+curl -X POST http://manager:18080/v1/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"workers":[{"name":"node-a","ip":"10.0.0.1"},{"name":"node-b","ip":"10.0.0.2"}],"bench_items":[{"src":"10.0.0.1","dst":"10.0.0.2","type":"bidirectional"}],"options":{"op":"write","duration":30,"threads":4}}'
+curl -X POST http://manager:18080/v1/tasks/task-1/start
+curl http://manager:18080/v1/tasks
+curl -X POST http://manager:18080/v1/tasks/task-1/stop
+```
+
+`direction` 支持 `forward`、`reverse` 和 `bidirectional`。双向任务作为统一任务
+计划下发给参与的 worker，worker 不再通过 CLI 选择 client/server 角色；不使用
+manager 参数时，原有 `--server-ip` 模式保持不变。
+
 `UMDK_ROOT` 只提供 URMA 头文件和库；YuanRong 源码仓不参与构建。
+
+架构说明：manager 是独立 Python 服务，通过 SSH 和 worker HTTP API 完成部署及任务控制；worker 不连接 manager，只提供启动/停止本地 kv-bench 的 API。具体接口见 [manager/README.md](manager/README.md)。
+
+### 多对多测试流程
+
+```mermaid
+flowchart TD
+    A[REST 创建任务] --> B[Manager 校验 worker 列表与参数]
+    B --> C[Manager 生成任务计划]
+    C --> D1[Worker A 注册并接收计划]
+    C --> D2[Worker B 注册并接收计划]
+    C --> D3[Worker N 注册并接收计划]
+    D1 --> E[各 worker 按 pair 计划建立 URMA 连接]
+    D2 --> E
+    D3 --> E
+    E --> F{direction}
+    F -->|forward| G[A 到 B、A 到 C ...]
+    F -->|reverse| H[B 到 A、C 到 A ...]
+    F -->|bidirectional| I[正向与反向同时执行]
+    G --> J[Worker 上报指标]
+    H --> J
+    I --> J
+    J --> K[Manager 汇总任务结果]
+    K --> L[REST 查询任务状态与结果]
+```
+
+这里的方向是数据流方向，不是节点角色：
+
+| direction | 含义 |
+| --- | --- |
+| `forward` | 按任务计划正向发送，例如 A→B、A→C。 |
+| `reverse` | 将正向发送方向反过来，例如 B→A、C→A，用于测量反向链路。 |
+| `bidirectional` | 正向和反向同时发送，例如 A↔B、A↔C，用于观察双向竞争。 |
+
+URMA 握手过程中可能仍需要一个连接发起方，但那只是底层连接建立细节；对用户和
+manager 的任务模型不再表现为 client/server 两种节点角色。
 
 **注意：编译用的 UMDK 头必须与运行机器上的 `liburma*` 库同源（同版本）**。
 `bondp_rjetty_t` 结构体在不同 UMDK 版本间布局有差异（新版含

@@ -41,6 +41,8 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+#include <string>
+#include <vector>
 
 #define PAGE_SHIFT 12
 #define PAGE_SIZE (0x1 << PAGE_SHIFT) /* 4KB */
@@ -86,6 +88,15 @@ static_assert(KV_MAX_CONCURRENCY * KV_SENDS_PER_REQ <= MAX_JETTY_COUNT,
 /* 操作类型 / 亲和模式 */
 enum { OP_WRITE = 0, OP_GET = 1, OP_MIXED = 2 };
 enum { AFF_AFFINITY = 0, AFF_ANTI = 1, AFF_NONE = 2 };
+enum { DIR_FORWARD = 0, DIR_REVERSE = 1, DIR_BIDIRECTIONAL = 2 };
+
+/* Last task result exposed by the in-process worker API.  A worker runs one
+ * topology assignment at a time, so a single slot is sufficient and keeps
+ * the result independent from stdout parsing. */
+static volatile uint64_t g_worker_ops = 0;
+static volatile uint64_t g_worker_bytes = 0;
+static volatile uint64_t g_worker_errors = 0;
+static volatile bool g_worker_result_ready = false;
 
 typedef struct argument {
   char *dev_name;
@@ -109,6 +120,10 @@ typedef struct argument {
                     */
   int poll_cpu; /* 轮询线程绑核；-1 = 自动选空闲核 */
   int op;
+  int direction;
+  bool noninteractive;
+  bool worker_mode;
+  unsigned int worker_port;
   uint32_t mixed_ratio;
   uint32_t report_interval;
   bool mbind; /* NUMA 绑定，默认关（Kunpeng/部分平台 mbind 不可用），--mbind
@@ -1348,6 +1363,12 @@ static void print_client_summary(context_t *ctx, double seconds) {
          " iops=%.2f wr_rate=%.2f bandwidth=%.2f MB/s (%.2f Mb/s) "
          "bytes=%" PRIu64 " errors=%" PRIu64 "\n",
          ops, iops, wr_rate, bw_mb_s, bw_mbps, bytes, errors);
+  if (g_worker_result_ready || ctx->args.worker_mode) {
+    g_worker_ops = ops;
+    g_worker_bytes = bytes;
+    g_worker_errors = errors;
+    g_worker_result_ready = true;
+  }
   if (args->op == OP_WRITE) {
     print_latency_line_us("request", &merged_req);
   } else {
@@ -2202,8 +2223,21 @@ static int run_server(const argument_t *args) {
     return -1;
   }
 
-  printf("Type enter to exit...\n");
-  (void)getchar();
+  if (args->direction == DIR_BIDIRECTIONAL || args->noninteractive) {
+    bool connected = false;
+    while (!ctx->server_stop) {
+      bool active = false;
+      for (uint32_t i = 0; i < MAX_CLIENT_CNT; i++) {
+        active = active || ctx->conns[i].used;
+      }
+      connected = connected || active;
+      if (connected && !active) break;
+      sleep(1);
+    }
+  } else {
+    printf("Type enter to exit...\n");
+    (void)getchar();
+  }
 
   ctx->server_stop = true;
   pthread_join(ctx->sock_thread, NULL);
@@ -2219,6 +2253,202 @@ static int run_server(const argument_t *args) {
 }
 
 /* ---------------- 参数解析 ---------------- */
+
+static void *bidirectional_server_main(void *arg) {
+  return (void *)(intptr_t)run_server((const argument_t *)arg);
+}
+
+static int run_bidirectional(const argument_t *args) {
+  pthread_t server_thread = 0;
+  if (pthread_create(&server_thread, NULL, bidirectional_server_main,
+                     (void *)args) != 0) {
+    fprintf(stderr, "failed to start bidirectional listener\n");
+    return -1;
+  }
+  sleep(1);
+  int ret = run_client(args);
+  pthread_join(server_thread, NULL);
+  return ret;
+}
+
+static int parse_arguments(int argc, char *argv[], argument_t *args);
+
+typedef struct worker_runtime {
+  int listen_fd;
+  bool stop;
+  bool running;
+  pthread_t task_thread;
+  bool task_thread_valid;
+  pthread_mutex_t mutex;
+  char task_id[128];
+  argument_t task_args;
+  std::vector<std::string> command_storage;
+  std::vector<char *> command_argv;
+} worker_runtime_t;
+
+static std::string worker_json_value(const std::string &body, const char *key) {
+  size_t begin = body.find(std::string("\"") + key + "\"");
+  if (begin == std::string::npos) return std::string();
+  begin = body.find(':', begin);
+  if (begin == std::string::npos) return std::string();
+  begin++;
+  while (begin < body.size() && (body[begin] == ' ' || body[begin] == '"')) begin++;
+  size_t end = begin;
+  while (end < body.size() && body[end] != '"' && body[end] != ',' && body[end] != '}') end++;
+  return body.substr(begin, end - begin);
+}
+
+static bool worker_json_command(const std::string &body, worker_runtime_t *runtime) {
+  size_t begin = body.find("\"command\"");
+  begin = begin == std::string::npos ? std::string::npos : body.find('[', begin);
+  size_t end = begin == std::string::npos ? std::string::npos : body.find(']', begin);
+  if (begin == std::string::npos || end == std::string::npos) return false;
+  for (size_t pos = begin + 1; pos < end;) {
+    size_t quote = body.find('"', pos);
+    if (quote == std::string::npos || quote >= end) break;
+    size_t close = body.find('"', quote + 1);
+    if (close == std::string::npos || close > end) return false;
+    runtime->command_storage.push_back(body.substr(quote + 1, close - quote - 1));
+    pos = close + 1;
+  }
+  return !runtime->command_storage.empty();
+}
+
+static void worker_http_reply(int fd, int code, const char *body) {
+  char response[1024];
+  int length = (int)strlen(body);
+  int n = snprintf(response, sizeof(response),
+                   "HTTP/1.1 %d OK\r\nContent-Type: application/json\r\n"
+                   "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+                   code, length, body);
+  (void)send(fd, response, (size_t)n, 0);
+}
+
+static void *worker_task_main(void *arg) {
+  worker_runtime_t *runtime = (worker_runtime_t *)arg;
+  argument_t *task_args = &runtime->task_args;
+  if (task_args->server_ip != NULL) {
+    if (task_args->direction == DIR_BIDIRECTIONAL)
+      (void)run_bidirectional(task_args);
+    else
+      (void)run_client(task_args);
+  } else {
+    (void)run_server(task_args);
+  }
+  if (!g_worker_result_ready) g_worker_result_ready = true;
+  free(task_args->dev_name);
+  free(task_args->dev_name2);
+  free(task_args->server_ip);
+  pthread_mutex_lock(&runtime->mutex);
+  runtime->running = false;
+  runtime->task_thread_valid = false;
+  runtime->task_id[0] = '\0';
+  pthread_mutex_unlock(&runtime->mutex);
+  return NULL;
+}
+
+static void worker_http_handle(int fd, worker_runtime_t *runtime) {
+  char buffer[16384] = {};
+  ssize_t received = recv(fd, buffer, sizeof(buffer) - 1, 0);
+  if (received <= 0) { close(fd); return; }
+  std::string request(buffer, (size_t)received);
+  size_t separator = request.find("\r\n\r\n");
+  std::string body = separator == std::string::npos ? std::string() : request.substr(separator + 4);
+  if (request.rfind("GET /v1/health", 0) == 0) {
+    pthread_mutex_lock(&runtime->mutex);
+    bool running = runtime->running;
+    pthread_mutex_unlock(&runtime->mutex);
+    worker_http_reply(fd, 200, running ? "{\"state\":\"running\"}" : "{\"state\":\"ready\"}");
+  } else if (request.rfind("GET /v1/tasks/", 0) == 0 && request.find("/result") != std::string::npos) {
+    char result[512];
+    bool ready = g_worker_result_ready;
+    snprintf(result, sizeof(result),
+             "{\"state\":\"%s\",\"ops\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"errors\":%" PRIu64 "}",
+             ready ? "ready" : "running", (uint64_t)g_worker_ops,
+             (uint64_t)g_worker_bytes, (uint64_t)g_worker_errors);
+    worker_http_reply(fd, 200, result);
+  } else if (request.rfind("POST /v1/tasks/start", 0) == 0) {
+    pthread_mutex_lock(&runtime->mutex);
+    if (runtime->running) {
+      pthread_mutex_unlock(&runtime->mutex);
+      worker_http_reply(fd, 409, "{\"error\":\"task already running\"}");
+    } else {
+      runtime->command_storage.clear();
+      runtime->command_argv.clear();
+      g_worker_ops = 0;
+      g_worker_bytes = 0;
+      g_worker_errors = 0;
+      g_worker_result_ready = false;
+      std::string task_id = worker_json_value(body, "task_id");
+      bool valid = worker_json_command(body, runtime) && !task_id.empty() && task_id.size() < sizeof(runtime->task_id);
+      if (valid) {
+        for (std::string &value : runtime->command_storage)
+          runtime->command_argv.push_back(const_cast<char *>(value.c_str()));
+        optind = 1;
+        memset(&runtime->task_args, 0, sizeof(runtime->task_args));
+        if (parse_arguments((int)runtime->command_argv.size(), runtime->command_argv.data(), &runtime->task_args) == 0) {
+          runtime->task_args.worker_mode = true;
+          snprintf(runtime->task_id, sizeof(runtime->task_id), "%s", task_id.c_str());
+          runtime->running = true;
+          pthread_t thread;
+          if (pthread_create(&thread, NULL, worker_task_main, runtime) == 0) {
+            runtime->task_thread = thread;
+            runtime->task_thread_valid = true;
+            pthread_detach(thread);
+            pthread_mutex_unlock(&runtime->mutex);
+            worker_http_reply(fd, 202, "{\"state\":\"running\"}");
+            close(fd);
+            return;
+          }
+          free(runtime->task_args.dev_name);
+          free(runtime->task_args.server_ip);
+        }
+      }
+      pthread_mutex_unlock(&runtime->mutex);
+      worker_http_reply(fd, 400, "{\"error\":\"invalid task\"}");
+    }
+  } else if (request.rfind("POST /v1/tasks/", 0) == 0 && request.find("/stop") != std::string::npos) {
+    pthread_mutex_lock(&runtime->mutex);
+    bool running = runtime->running;
+    pthread_t task_thread = runtime->task_thread;
+    bool task_thread_valid = runtime->task_thread_valid;
+    if (running) {
+      runtime->running = false;
+      runtime->task_thread_valid = false;
+    }
+    pthread_mutex_unlock(&runtime->mutex);
+    if (running && task_thread_valid) pthread_cancel(task_thread);
+    worker_http_reply(fd, running ? 200 : 404, running ? "{\"state\":\"stopping\"}" : "{\"error\":\"task not running\"}");
+  } else {
+    worker_http_reply(fd, 404, "{\"error\":\"not found\"}");
+  }
+  close(fd);
+}
+
+static int run_worker(const argument_t *args) {
+  worker_runtime_t runtime{};
+  runtime.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  pthread_mutex_init(&runtime.mutex, NULL);
+  int enabled = 1;
+  setsockopt(runtime.listen_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
+  address.sin_port = htons((uint16_t)args->worker_port);
+  if (runtime.listen_fd < 0 || bind(runtime.listen_fd, (sockaddr *)&address, sizeof(address)) != 0 || listen(runtime.listen_fd, 32) != 0) {
+    if (runtime.listen_fd >= 0) close(runtime.listen_fd);
+    pthread_mutex_destroy(&runtime.mutex);
+    return -1;
+  }
+  printf("worker API listening on :%u\n", args->worker_port);
+  while (!runtime.stop) {
+    int fd = accept(runtime.listen_fd, NULL, NULL);
+    if (fd >= 0) worker_http_handle(fd, &runtime);
+  }
+  close(runtime.listen_fd);
+  pthread_mutex_destroy(&runtime.mutex);
+  return 0;
+}
 
 static struct option g_long_options[] = {
     {"trans-mode", required_argument, NULL, 'm'},
@@ -2251,6 +2481,11 @@ static struct option g_long_options[] = {
     {"poll-cpu", required_argument, NULL, 1032},
     {"dual-dev", no_argument, NULL, 1033},
     {"dev-name2", required_argument, NULL, 1034},
+    {"peer-ip", required_argument, NULL, 1041},
+    {"direction", required_argument, NULL, 1042},
+    {"no-interactive", no_argument, NULL, 1043},
+    {"worker", no_argument, NULL, 1044},
+    {"worker-port", required_argument, NULL, 1045},
     {"single-chip", required_argument, NULL, 1026},
     {NULL, 0, NULL, 0}};
 
@@ -2294,6 +2529,11 @@ static void usage(void) {
   printf("      --dev-name2 <dev>      second physical device name (dual-dev "
          "mode)\n");
   printf("      --op <op>              write | get | mixed (default write)\n");
+  printf("      --peer-ip <ip>         peer address for worker data plane\n");
+  printf("      --direction <type>     forward | reverse | bidirectional\n");
+  printf("      --no-interactive       keep passive worker running without stdin\n");
+  printf("      --worker               run the in-process worker HTTP API\n");
+  printf("      --worker-port <port>   worker API port (default 18082)\n");
   printf("      --mixed-ratio <pct>    write percentage in mixed mode (default "
          "50)\n");
   printf("      --report-interval <s>  periodic report interval (default 1)\n");
@@ -2315,6 +2555,10 @@ static void usage(void) {
 }
 
 static int validate_input_params(argument_t *args) {
+  if (args->worker_port > UINT16_MAX) {
+    fprintf(stderr, "Invalid worker port\n");
+    return -1;
+  }
   if (args->dev_name == NULL || args->value_size == 0 ||
       args->value_size > UINT32_MAX || args->duration_sec == 0 ||
       args->jetty_count == 0 || args->jetty_count > MAX_JETTY_COUNT) {
@@ -2341,6 +2585,10 @@ static int validate_input_params(argument_t *args) {
   }
   if (args->op < OP_WRITE || args->op > OP_MIXED) {
     fprintf(stderr, "Invalid op\n");
+    return -1;
+  }
+  if (args->direction < DIR_FORWARD || args->direction > DIR_BIDIRECTIONAL) {
+    fprintf(stderr, "Invalid direction\n");
     return -1;
   }
   if (args->mixed_ratio > 100) {
@@ -2383,6 +2631,8 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->single_chip = 0;
   args->poll_cpu = -1; /* 默认自动选空闲核给轮询线程 */
   args->op = OP_WRITE;
+  args->direction = DIR_FORWARD;
+  args->worker_port = 18082;
   args->mixed_ratio = 50;
   args->report_interval = 1;
   args->seed = 42;
@@ -2516,6 +2766,30 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
     case 1034:
       args->dev_name2 = strdup(optarg);
       break;
+    case 1041:
+      args->server_ip = strdup(optarg);
+      break;
+    case 1042:
+      if (strcmp(optarg, "forward") == 0)
+        args->direction = DIR_FORWARD;
+      else if (strcmp(optarg, "reverse") == 0)
+        args->direction = DIR_REVERSE;
+      else if (strcmp(optarg, "bidirectional") == 0)
+        args->direction = DIR_BIDIRECTIONAL;
+      else {
+        fprintf(stderr, "Invalid direction: %s\n", optarg);
+        return -1;
+      }
+      break;
+    case 1043:
+      args->noninteractive = true;
+      break;
+    case 1044:
+      args->worker_mode = true;
+      break;
+    case 1045:
+      args->worker_port = (unsigned int)strtoul(optarg, NULL, 0);
+      break;
     default:
       usage();
       return -1;
@@ -2613,8 +2887,12 @@ int main(int argc, char *argv[]) {
     ret = run_chip_query(&args);
     goto main_exit;
   }
-  if (args.server_ip != NULL) {
-    ret = args.dual_dev ? run_dual_client(&args) : run_client(&args);
+  if (args.worker_mode) {
+    ret = run_worker(&args);
+  } else if (args.server_ip != NULL) {
+    ret = args.direction == DIR_BIDIRECTIONAL
+              ? run_bidirectional(&args)
+              : (args.dual_dev ? run_dual_client(&args) : run_client(&args));
   } else {
     ret = args.dual_dev ? run_dual_server(&args) : run_server(&args);
   }

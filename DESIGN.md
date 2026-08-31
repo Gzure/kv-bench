@@ -9,6 +9,49 @@
 
 ## 1. 目标与能力
 
+### 1.1 多节点 manager/worker 控制面
+
+除兼容的 `--server-ip` 直连模式外，程序支持统一的 worker 节点模式：
+
+- Python manager 是独立控制组件，不初始化 URMA；它通过 SSH 执行 `rpm -qa`、部署 artifact，并在 URMA 版本不一致时对节点单独编译。
+- worker 是 `kv-bench --worker` 启动的常驻 HTTP 服务，不注册、不回连 manager；worker API 在同一进程内调用测试入口启动和停止任务。
+- 任务的 `bench_item {src, dst, type}` 按拓扑描述数据流，`type` 为 `forward`、`reverse` 或 `bidirectional`。
+- manager REST API 为 `POST /v1/deploy`、`GET/POST /v1/tasks`、`POST /v1/tasks/{id}/start` 和 `POST /v1/tasks/{id}/stop`；worker API 为 `GET /v1/health`、`POST /v1/tasks/start` 和 `POST /v1/tasks/{id}/stop`。
+
+多对多任务的控制流程如下：
+
+```mermaid
+sequenceDiagram
+    participant U as REST Client
+    participant M as Manager
+    participant A as Worker A
+    participant B as Worker B
+    participant N as Worker N
+
+    U->>M: POST /v1/tasks direction=bidirectional
+    M->>M: 校验 worker 列表并生成 pair plan
+    M-->>U: task-id, queued
+    U->>M: POST /v1/tasks/id/start
+    M->>A: TASK plan
+    M->>B: TASK plan
+    M->>N: TASK plan
+    par 正向
+        A->>B: URMA data plane
+        A->>N: URMA data plane
+    and 反向
+        B->>A: URMA data plane
+        N->>A: URMA data plane
+    end
+    A-->>M: metrics/status
+    B-->>M: metrics/status
+    N-->>M: metrics/status
+    M-->>U: GET /v1/tasks/id
+```
+
+`reverse` 表示把任务计划中的数据流方向反转，而不是把 worker 变成旧模型中的
+server。`bidirectional` 则在同一任务内同时安排正向和反向流，用于测试双向流量
+下的吞吐、延迟和错误率。
+
 | 能力 | 说明 |
 | --- | --- |
 | 带宽测试 | 全速打流（`--qps 0`），统计吞吐（MB/s 大 B 与 Mb/s 小 b 双单位）与 IOPS |
