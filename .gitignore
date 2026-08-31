@@ -5,7 +5,7 @@ __pycache__/
 venv/
 
 # 运行产物 / 敏感文件
-manager/nodes.json
+nodes.json
 
 # 临时目录（本机调试残留）
 .tmp/

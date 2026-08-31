@@ -75,6 +75,30 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.get("/v1/nodes").json(), [])
 
+    def test_node_tags_exposed_in_api(self):
+        response = self.client.post("/v1/nodes", json={
+            "name": "g1", "ip": "10.0.0.9", "password": "secret", "tags": ["gpu", "fast"],
+        })
+        self.assertEqual(response.status_code, 201)
+        nodes = self.client.get("/v1/nodes").json()
+        self.assertEqual(nodes[0]["tags"], ["gpu", "fast"])
+        self.assertNotIn("password", nodes[0])
+
+    def test_task_workers_include_tags_without_password(self):
+        create = self.client.post("/v1/tasks", json={
+            "task_id": "t-tags",
+            "workers": [
+                {"name": "a", "ip": "10.0.0.1", "password": "x", "tags": ["gpu"]},
+                {"name": "b", "ip": "10.0.0.2", "tags": ["fast", "gpu"]},
+            ],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        self.assertEqual(create.status_code, 201)
+        tasks = self.client.get("/v1/tasks").json()
+        self.assertEqual(tasks[0]["workers"]["a"]["tags"], ["gpu"])
+        self.assertEqual(tasks[0]["workers"]["b"]["tags"], ["fast", "gpu"])
+        self.assertNotIn("password", str(tasks))
+
     def test_deploy_reports_version_consistency(self):
         response = self.client.post("/v1/deploy", json={
             "nodes": [

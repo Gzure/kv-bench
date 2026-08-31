@@ -32,6 +32,16 @@ class Node:
     binary: str = "/opt/kv-bench/build/kv-bench"
     api_port: int = 18082
     password: str = field(default="", repr=False)
+    tags: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # 标签归一化：去空白、去重、保持顺序；兼容旧 nodes.json（无 tags 字段）。
+        seen: list[str] = []
+        for tag in self.tags:
+            tag = tag.strip()
+            if tag and tag not in seen:
+                seen.append(tag)
+        object.__setattr__(self, "tags", tuple(seen))
 
 
 class NodeStore:

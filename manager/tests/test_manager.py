@@ -90,6 +90,20 @@ class ManagerTests(unittest.TestCase):
             restored.remove("a")
             self.assertEqual(restored.list(), [])
 
+    def test_node_tags_persist_and_normalize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nodes.json"
+            store = NodeStore(path)
+            node = Node("a", "10.0.0.1", tags=["gpu", "gpu", "  fast ", "fast"])
+            store.upsert(node)
+            # 去空白、去重、保序，元组归一化
+            self.assertEqual(store.get("a").tags, ("gpu", "fast"))
+            restored = NodeStore(path)
+            self.assertEqual(restored.list()[0].tags, ("gpu", "fast"))
+            # 无 tags 字段的旧文件兼容
+            old = Node("b", "10.0.0.2")
+            self.assertEqual(old.tags, ())
+
 
 if __name__ == "__main__":
     unittest.main()

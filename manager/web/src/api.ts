@@ -11,6 +11,7 @@ export interface Node {
   workdir: string
   binary: string
   api_port: number
+  tags: string[]
 }
 
 export interface NodeInput extends Node {
@@ -100,6 +101,21 @@ export function errMsg(error: unknown): string {
     return data?.error ?? error.message
   }
   return String(error)
+}
+
+/** 收集全部节点的去重标签（排序后）。 */
+export function collectTags(nodes: Node[]): string[] {
+  const tags = new Set<string>()
+  for (const node of nodes) {
+    for (const tag of node.tags ?? []) tags.add(tag)
+  }
+  return [...tags].sort((a, b) => a.localeCompare(b, 'zh-CN'))
+}
+
+/** 节点是否匹配标签筛选（任一匹配 ANY）。 */
+export function matchesTags(node: Node, selected: string[]): boolean {
+  if (!selected.length) return true
+  return selected.some((tag) => (node.tags ?? []).includes(tag))
 }
 
 /** 常见打流参数 -> kv-bench CLI 选项（_ 转 -，空值跳过）。 */

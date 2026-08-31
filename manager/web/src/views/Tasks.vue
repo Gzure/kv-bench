@@ -46,9 +46,14 @@
       <el-form-item label="任务 ID">
         <el-input v-model="createForm.task_id" placeholder="留空自动生成" />
       </el-form-item>
+      <el-form-item label="标签筛选">
+        <el-select v-model="workerTagFilter" multiple clearable placeholder="按标签筛选 Worker（任一匹配）" class="full">
+          <el-option v-for="tag in allTags" :key="tag" :value="tag" :label="tag" />
+        </el-select>
+      </el-form-item>
       <el-form-item label="参与 Worker" required>
         <el-select v-model="createForm.workerNames" multiple placeholder="从已保存节点中选择" class="full">
-          <el-option v-for="node in nodes" :key="node.name" :value="node.name" :label="`${node.name}（${node.ip}）`" />
+          <el-option v-for="node in filteredNodes" :key="node.name" :value="node.name" :label="`${node.name}（${node.ip}）`" />
         </el-select>
       </el-form-item>
       <el-form-item label="拓扑 (bench)">
@@ -135,11 +140,21 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { DataLine, Delete, Plus, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 
-import { api, BENCH_OPTION_FIELDS, errMsg, type BenchItem, type Node, type Task, type TaskResult } from '@/api'
+import {
+  api,
+  BENCH_OPTION_FIELDS,
+  collectTags,
+  errMsg,
+  matchesTags,
+  type BenchItem,
+  type Node,
+  type Task,
+  type TaskResult,
+} from '@/api'
 
 const tasks = ref<Task[]>([])
 const nodes = ref<Node[]>([])
@@ -201,6 +216,17 @@ async function stop(task: Task) {
 // ---- 创建 ----
 const createVisible = ref(false)
 const creating = ref(false)
+const workerTagFilter = ref<string[]>([])
+
+const allTags = computed(() => collectTags(nodes.value))
+const filteredNodes = computed(() => nodes.value.filter((node) => matchesTags(node, workerTagFilter.value)))
+
+// 标签筛选变化时，剔除已被过滤掉的已选 Worker。
+watch(workerTagFilter, () => {
+  const visible = new Set(filteredNodes.value.map((node) => node.name))
+  createForm.workerNames = createForm.workerNames.filter((name) => visible.has(name))
+})
+
 const createForm = reactive<{
   task_id: string
   workerNames: string[]
@@ -226,6 +252,7 @@ async function openCreate() {
     benchItems: [{ src: '', dst: '', type: 'forward' }],
     options: { op: 'write' },
   })
+  workerTagFilter.value = []
   createVisible.value = true
 }
 

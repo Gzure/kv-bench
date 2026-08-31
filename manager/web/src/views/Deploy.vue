@@ -20,13 +20,26 @@
       <el-form-item label="UMDK 根目录" required>
         <el-input v-model="form.umdk_root" placeholder="/opt/umdk" />
       </el-form-item>
+      <el-form-item label="按标签筛选">
+        <el-select v-model="tagFilter" multiple clearable placeholder="选择标签后仅显示匹配节点（任一匹配）" class="full">
+          <el-option v-for="tag in allTags" :key="tag" :value="tag" :label="tag" />
+        </el-select>
+      </el-form-item>
       <el-form-item label="目标节点">
-        <el-checkbox-group v-model="selected">
-          <el-checkbox v-for="node in nodes" :key="node.name" :value="node.name">
-            {{ node.name }}（{{ node.ip }}）
-          </el-checkbox>
-        </el-checkbox-group>
-        <el-empty v-if="!nodes.length" description="请先在「节点管理」中添加节点" :image-size="60" />
+        <div class="node-picker">
+          <el-checkbox-group v-model="selected">
+            <el-checkbox v-for="node in filteredNodes" :key="node.name" :value="node.name">
+              {{ node.name }}（{{ node.ip }}）
+              <el-tag v-for="tag in node.tags" :key="tag" size="small" effect="plain" class="chip">{{ tag }}</el-tag>
+            </el-checkbox>
+          </el-checkbox-group>
+          <div v-if="filteredNodes.length" class="picker-actions">
+            <el-button size="small" text type="primary" @click="selectAll">全选</el-button>
+            <el-button size="small" text @click="clearSelected">清空</el-button>
+            <span class="muted">已选 {{ selected.length }} / {{ filteredNodes.length }}</span>
+          </div>
+          <el-empty v-if="!filteredNodes.length" description="没有匹配的节点，请调整标签筛选或在「节点管理」中添加" :image-size="60" />
+        </div>
       </el-form-item>
       <el-form-item>
         <el-button
@@ -38,7 +51,6 @@
         >
           部署并启动 worker
         </el-button>
-        <span v-if="selected.length" class="muted">已选 {{ selected.length }} 个节点</span>
       </el-form-item>
     </el-form>
 
@@ -75,14 +87,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh, Upload } from '@element-plus/icons-vue'
 
-import { api, errMsg, type Node, type VersionCheck } from '@/api'
+import { api, collectTags, errMsg, matchesTags, type Node, type VersionCheck } from '@/api'
 
 const nodes = ref<Node[]>([])
 const selected = ref<string[]>([])
+const tagFilter = ref<string[]>([])
 const deploying = ref(false)
 const result = ref<VersionCheck | null>(null)
 
@@ -91,6 +104,15 @@ const form = reactive({
   destination: '/opt/kv-bench/build/kv-bench',
   source_dir: '/opt/kv-bench',
   umdk_root: '/opt/umdk',
+})
+
+const allTags = computed(() => collectTags(nodes.value))
+const filteredNodes = computed(() => nodes.value.filter((node) => matchesTags(node, tagFilter.value)))
+
+// 标签筛选变化时，剔除已被过滤掉的选中节点。
+watch(tagFilter, () => {
+  const visible = new Set(filteredNodes.value.map((node) => node.name))
+  selected.value = selected.value.filter((name) => visible.has(name))
 })
 
 const versionRows = computed(() => {
@@ -109,6 +131,14 @@ async function loadNodes() {
   } catch (error) {
     ElMessage.error(errMsg(error))
   }
+}
+
+function selectAll() {
+  selected.value = filteredNodes.value.map((node) => node.name)
+}
+
+function clearSelected() {
+  selected.value = []
 }
 
 async function deploy() {
@@ -141,13 +171,13 @@ onMounted(loadNodes)
 
 <style scoped>
 .deploy-form {
-  max-width: 720px;
+  max-width: 760px;
 }
 
 .muted {
   color: #64748b;
   font-size: 13px;
-  margin-left: 12px;
+  margin-left: 8px;
 }
 
 .result-alert {
@@ -156,5 +186,24 @@ onMounted(loadNodes)
 
 .pkg-tag {
   margin-right: 6px;
+}
+
+.node-picker {
+  width: 100%;
+}
+
+.node-picker .el-checkbox {
+  margin-right: 16px;
+  margin-bottom: 6px;
+}
+
+.chip {
+  margin-left: 6px;
+}
+
+.picker-actions {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
 }
 </style>

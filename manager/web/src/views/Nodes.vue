@@ -9,6 +9,12 @@
 
     <el-table :data="nodes" v-loading="loading" stripe>
       <el-table-column prop="name" label="名称" min-width="110" />
+      <el-table-column label="标签" min-width="170">
+        <template #default="{ row }">
+          <el-tag v-for="tag in row.tags" :key="tag" size="small" effect="plain" class="tag-chip">{{ tag }}</el-tag>
+          <span v-if="!row.tags?.length" class="muted">—</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="ip" label="地址" min-width="130" />
       <el-table-column prop="user" label="用户" width="90" />
       <el-table-column prop="ssh_port" label="SSH 端口" width="100" />
@@ -29,6 +35,19 @@
     <el-form :model="form" label-width="110px" @submit.prevent>
       <el-form-item label="名称" required>
         <el-input v-model="form.name" placeholder="如 node-a" />
+      </el-form-item>
+      <el-form-item label="标签">
+        <el-select
+          v-model="form.tags"
+          multiple
+          filterable
+          allow-create
+          default-first-option
+          placeholder="输入标签后回车添加，可多个"
+          class="full"
+        >
+          <el-option v-for="tag in existingTags" :key="tag" :value="tag" :label="tag" />
+        </el-select>
       </el-form-item>
       <el-form-item label="IP 地址" required>
         <el-input v-model="form.ip" placeholder="10.0.0.1" />
@@ -60,16 +79,18 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
 
-import { api, errMsg, type Node, type NodeInput } from '@/api'
+import { api, collectTags, errMsg, type Node, type NodeInput } from '@/api'
 
 const nodes = ref<Node[]>([])
 const loading = ref(false)
 const saving = ref(false)
 const dialogVisible = ref(false)
+
+const existingTags = computed(() => collectTags(nodes.value))
 
 const form = reactive<NodeInput>({
   name: '',
@@ -80,6 +101,7 @@ const form = reactive<NodeInput>({
   api_port: 18082,
   workdir: '/opt/kv-bench',
   binary: '/opt/kv-bench/build/kv-bench',
+  tags: [],
 })
 
 async function load() {
@@ -103,6 +125,7 @@ function openDialog() {
     api_port: 18082,
     workdir: '/opt/kv-bench',
     binary: '/opt/kv-bench/build/kv-bench',
+    tags: [],
   })
   dialogVisible.value = true
 }
@@ -146,3 +169,17 @@ async function remove(node: Node) {
 
 onMounted(load)
 </script>
+
+<style scoped>
+.tag-chip {
+  margin: 2px 4px 2px 0;
+}
+
+.muted {
+  color: #94a3b8;
+}
+
+.full {
+  width: 100%;
+}
+</style>

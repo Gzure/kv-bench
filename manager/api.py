@@ -54,6 +54,7 @@ class NodeIn(BaseModel):
     binary: str = "/opt/kv-bench/build/kv-bench"
     api_port: int = 18082
     password: str = ""
+    tags: list[str] = Field(default_factory=list, description="节点标签（可多个）")
 
 
 class BenchItemIn(BaseModel):
