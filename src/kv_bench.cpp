@@ -1211,10 +1211,16 @@ static int post_one_get(context_t *ctx, worker_t *w, uint32_t slot_idx,
   const argument_t *args = &ctx->args;
   kv_bench::UrmaManager *mgr = ctx->mgr;
   kv_bench::UrmaConnection &conn = *ctx->conn;
-  /* 与 write 同布局：每槽复用 value_size 本地、远端占 req_bytes=value_size×10 */
+  /* 布局：本地每槽占 req_bytes=value_size×10（10 个 send 各写独立 value_size
+   * 区，WR half 再对半拆），并按线程隔离（每线程 stride = 在飞上限 × req_bytes，
+   * 与 layout_client_buffer 的 threads × C × value_size × 10 对齐）；远端按槽
+   * 占 req_bytes（远端是 READ 源，跨线程重叠无害，与 write 的远端布局同构） */
   uint64_t wr_size = args->value_size / 2;
   uint64_t req_bytes = args->value_size * KV_SENDS_PER_REQ;
-  uint64_t local_base_off = (uint64_t)slot_idx * args->value_size;
+  uint64_t per_thread =
+      (uint64_t)(args->concurrency >= 1 ? args->concurrency : 1) * req_bytes;
+  uint64_t local_base_off =
+      (uint64_t)w->id * per_thread + (uint64_t)slot_idx * req_bytes;
   uint64_t remote_base_off = (uint64_t)slot_idx * req_bytes;
   uint64_t remote_base = conn.RemoteSegVa() + remote_base_off;
 
@@ -1260,7 +1266,7 @@ static int post_one_get(context_t *ctx, worker_t *w, uint32_t slot_idx,
     bool post_ok = mgr->PostRead(
         jetty, conn,
         (uint64_t)ctx->client_data + local_base_off +
-            (uint64_t)half * wr_size,
+            (uint64_t)send_idx * args->value_size + (uint64_t)half * wr_size,
         remote_base + (uint64_t)send_idx * args->value_size +
             (uint64_t)half * wr_size,
         (uint32_t)wr_size, (uint32_t)src, (uint32_t)dst, ue);
@@ -2708,13 +2714,16 @@ static int validate_input_params(argument_t *args) {
   }
   /* get 流水线与 write 完全同构：每请求 10 send × 2 WR = 20 条 value_size/2
    * READ（与 write 每 send 拆 2 条同构）；value_size 必须 ≥ 2*PAGE_SIZE 且为
-   * 2*PAGE_SIZE 倍数（每条 WR 页对齐）；mixed 的同步 get 不拆分，不受此限制 */
+   * 2*PAGE_SIZE 倍数（每条 WR 页对齐），且 value_size/2 ≤ UINT32_MAX（SGE
+   * 长度为 32 位，即 value_size ≤ 8GB）；mixed 的同步 get 不拆分，不受此限制 */
   if (args->op == OP_GET &&
       (args->value_size < 2 * PAGE_SIZE ||
-       args->value_size % (2 * PAGE_SIZE) != 0)) {
+       args->value_size % (2 * PAGE_SIZE) != 0 ||
+       args->value_size / 2 > UINT32_MAX)) {
     fprintf(stderr,
-            "Invalid value-size %llu for get (must be >= 8K and 8K-aligned "
-            "since it splits into 20 WRs like write; e.g. 16M/8M/1M/64K)\n",
+            "Invalid value-size %llu for get (must be >= 8K, 8K-aligned, and "
+            "<= 8G since it splits into 20 WRs of value_size/2 like write; "
+            "e.g. 16M/8M/1M/64K)\n",
             (unsigned long long)args->value_size);
     return -1;
   }
