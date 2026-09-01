@@ -119,6 +119,10 @@ manager 调用 worker API：
   并保存到 `runs/{task_id}/logs/{worker}.log`（拉取失败写 `.error`），返回日志内容。
 - worker `GET /v1/health`：查看 worker 本地运行中的 kv-bench 任务。
 
+`options` 覆盖 kv-bench 全部打流参数（`_` 转 `-` 后透传为 CLI 参数）：
+标量 `{"threads": 4}` → `--threads=4`；开关 `{"event_mode": true}` → `--event-mode`；
+默认开启的开关可关闭：`{"mbind": false}` → `--no-mbind`、`{"drv_ext": false}` → `--no-drv-ext`。
+
 ## 持久化与运行产物
 
 manager 运行目录（默认当前目录）下的文件：

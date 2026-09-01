@@ -41,7 +41,7 @@
   </el-card>
 
   <!-- 创建任务 -->
-  <el-dialog v-model="createVisible" title="创建任务" width="680px" destroy-on-close>
+  <el-dialog v-model="createVisible" title="创建任务" width="780px" destroy-on-close class="create-task-dialog">
     <el-form :model="createForm" label-width="100px">
       <el-form-item label="任务 ID">
         <el-input v-model="createForm.task_id" placeholder="留空自动生成" />
@@ -79,13 +79,20 @@
         </div>
       </el-form-item>
       <el-form-item label="打流参数">
-        <div class="option-grid">
-          <div v-for="field in BENCH_OPTION_FIELDS" :key="field.key" class="option-item">
-            <label>{{ field.label }}</label>
-            <el-select v-if="field.type === 'select'" v-model="createForm.options[field.key]" clearable class="full">
-              <el-option v-for="opt in field.options ?? []" :key="opt" :value="opt" :label="opt" />
-            </el-select>
-            <el-input-number v-else v-model="createForm.options[field.key]" :min="0" :controls="false" class="full" placeholder="默认" />
+        <div class="option-groups">
+          <div v-for="group in BENCH_OPTION_GROUPS" :key="group" class="option-group">
+            <div class="option-group-title">{{ group }}</div>
+            <div class="option-grid">
+              <div v-for="field in fieldsByGroup(group)" :key="field.key" class="option-item">
+                <label :title="field.hint ?? ''">{{ field.label }}</label>
+                <el-select v-if="field.type === 'select'" v-model="createForm.options[field.key]" clearable class="full">
+                  <el-option v-for="opt in field.options ?? []" :key="opt.value" :value="opt.value" :label="opt.label" />
+                </el-select>
+                <el-input v-else-if="field.type === 'string'" v-model="createForm.options[field.key]" clearable placeholder="默认" class="full" />
+                <el-switch v-else-if="field.type === 'bool'" v-model="createForm.options[field.key]" />
+                <el-input-number v-else v-model="createForm.options[field.key]" :min="0" :controls="false" class="full" placeholder="默认" />
+              </div>
+            </div>
           </div>
         </div>
       </el-form-item>
@@ -171,10 +178,12 @@ import { DataLine, Delete, Plus, Refresh, VideoPause, VideoPlay } from '@element
 import {
   api,
   BENCH_OPTION_FIELDS,
+  BENCH_OPTION_GROUPS,
   collectTags,
   errMsg,
   matchesTags,
   type BenchItem,
+  type BenchOptionField,
   type Node,
   type Task,
   type TaskLogs,
@@ -265,17 +274,24 @@ const createForm = reactive<{
   options: { op: 'write' },
 })
 
+const fieldsByGroup = (group: string): BenchOptionField[] =>
+  BENCH_OPTION_FIELDS.filter((field) => field.group === group)
+
 async function openCreate() {
   try {
     nodes.value = await api.listNodes()
   } catch (error) {
     ElMessage.error(errMsg(error))
   }
+  const defaults: Record<string, unknown> = { op: 'write' }
+  for (const field of BENCH_OPTION_FIELDS) {
+    if (field.type === 'bool') defaults[field.key] = field.default ?? false
+  }
   Object.assign(createForm, {
     task_id: '',
     workerNames: [],
     benchItems: [{ src: '', dst: '', type: 'forward' }],
-    options: { op: 'write' },
+    options: defaults,
   })
   workerTagFilter.value = []
   createVisible.value = true
@@ -431,11 +447,33 @@ onBeforeUnmount(() => {
   width: 100%;
 }
 
+.option-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #475569;
+  margin: 14px 0 8px;
+  padding-left: 8px;
+  border-left: 3px solid var(--el-color-primary);
+}
+
+.option-group:first-child .option-group-title {
+  margin-top: 0;
+}
+
+.create-task-dialog :deep(.el-dialog__body) {
+  max-height: 70vh;
+  overflow-y: auto;
+  padding-right: 20px;
+}
+
 .option-item label {
   display: block;
   color: #64748b;
   font-size: 12px;
   margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .metric-grid {

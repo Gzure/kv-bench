@@ -53,6 +53,30 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("--peer-ip=10.0.0.2", commands[0])
         self.assertIn("--peer-ip=10.0.0.1", commands[1])
 
+    def test_build_assignments_handles_flag_options(self):
+        manager = DeploymentManager(FakeExecutor({"a": "u", "b": "u"}))
+        task = TaskSpec(
+            task_id="t2",
+            workers={"a": Node("a", "10.0.0.1"), "b": Node("b", "10.0.0.2")},
+            bench_items=[BenchItem("a", "b", "forward")],
+            options={
+                "event_mode": True,   # 开关 True -> --event-mode
+                "cacheable": False,   # 默认关开关 False -> 不传
+                "mbind": False,       # 默认开开关 False -> --no-mbind
+                "drv_ext": True,      # 默认开开关 True -> --drv-ext
+                "seed": 42,           # 标量 -> --seed=42
+            },
+        )
+        commands = manager.build_commands(task)
+        first = commands[0]
+        self.assertIn("--event-mode", first)
+        self.assertNotIn("--cacheable", first)
+        self.assertIn("--no-mbind", first)
+        self.assertIn("--drv-ext", first)
+        self.assertIn("--seed=42", first)
+        self.assertIn("--op=write", first)
+        self.assertIn("--threads=1", first)
+
     def test_version_mismatch_compiles_only_mismatching_node(self):
         executor = FakeExecutor({"a": "liburma-1.0", "b": "liburma-2.0"})
         manager = DeploymentManager(executor)

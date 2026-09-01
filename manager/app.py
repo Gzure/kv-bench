@@ -422,9 +422,26 @@ class DeploymentManager:
                     arguments += [f"--peer-ip={peer.ip}", f"--direction={item.type}"]
                 else:
                     arguments += [f"--direction={item.type}", "--no-interactive"]
-                arguments += [f"--{key.replace('_', '-')}={value}" for key, value in common.items()]
+                for key, value in common.items():
+                    arguments.extend(self._format_option(key, value))
                 assignments[node.name].append(" ".join(shlex.quote(str(value)) for value in arguments))
         return assignments
+
+    @staticmethod
+    def _format_option(key: str, value: Any) -> list[str]:
+        """打流选项 -> CLI 参数。
+
+        标量 -> --key=value；bool True -> --key（开关）；bool False ->
+        默认开启的开关（mbind/drv-ext）转 --no-key，其余不传。
+        """
+        flag = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                return [flag]
+            if key in {"mbind", "drv_ext"}:
+                return [f"--no-{key.replace('_', '-')}"]
+            return []
+        return [f"{flag}={value}"]
 
     @staticmethod
     def _resolve_worker(task: TaskSpec, endpoint: str) -> Node | None:
