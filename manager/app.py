@@ -281,22 +281,38 @@ class SshExecutor:
 
     def run(self, node: Node, command: list[str]) -> str:
         prefix = ["sshpass", "-e"] if node.password else []
-        result = subprocess.run(
-            prefix + ["ssh", "-p", str(node.ssh_port), self._target(node), "--", *command],
-            check=True,
-            text=True,
-            capture_output=True,
-            env={**__import__("os").environ, "SSHPASS": node.password},
-        )
+        try:
+            result = subprocess.run(
+                prefix + ["ssh", "-p", str(node.ssh_port), self._target(node), "--", *command],
+                check=True,
+                text=True,
+                capture_output=True,
+                env={**__import__("os").environ, "SSHPASS": node.password},
+            )
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(
+                f"ssh {node.name} ({node.ip}) failed: {error.stderr.strip() or error}"
+            ) from error
         return result.stdout
 
     def copy(self, node: Node, source: str, destination: str) -> None:
+        if not os.path.exists(source):
+            raise RuntimeError(f"local artifact not found: {source}")
+        # scp 不会自动创建远端目录；先 mkdir -p（幂等），避免 exit 1
+        self.run(node, ["mkdir", "-p", os.path.dirname(destination) or "."])
         prefix = ["sshpass", "-e"] if node.password else []
-        subprocess.run(
-            prefix + ["scp", "-P", str(node.ssh_port), source, f"{self._target(node)}:{destination}"],
-            check=True,
-            env={**__import__("os").environ, "SSHPASS": node.password},
-        )
+        try:
+            subprocess.run(
+                prefix + ["scp", "-P", str(node.ssh_port), source, f"{self._target(node)}:{destination}"],
+                check=True,
+                text=True,
+                capture_output=True,
+                env={**__import__("os").environ, "SSHPASS": node.password},
+            )
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(
+                f"scp to {node.name} ({node.ip}:{destination}) failed: {error.stderr.strip() or error}"
+            ) from error
 
 
 class HttpWorkerClient:

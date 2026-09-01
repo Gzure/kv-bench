@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from manager import BenchItem, DeploymentManager, Node, NodeStore, TaskSpec
-from manager.app import DeployStatusStore, RunArtifacts, TaskStore
+from manager.app import DeployStatusStore, RunArtifacts, SshExecutor, TaskStore
 
 
 class FakeExecutor:
@@ -96,6 +96,12 @@ class ManagerTests(unittest.TestCase):
         manager.compile_node(Node("a", "10.0.0.1"), "/opt/kv-bench", "/opt/umdk")
         configure_with = executor.calls[2][1]
         self.assertIn("-DUMDK_ROOT=/opt/umdk", configure_with)
+
+    def test_ssh_executor_copy_missing_source_raises_clear_error(self):
+        executor = SshExecutor()
+        with self.assertRaisesRegex(RuntimeError, "artifact not found"):
+            executor.copy(Node("a", "10.0.0.1"), "/nonexistent/kv-bench-artifact",
+                          "/opt/kv-bench/build/kv-bench")
 
     def test_manager_controls_workers_through_worker_api(self):
         client = FakeWorkerClient()

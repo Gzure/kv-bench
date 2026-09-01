@@ -93,6 +93,10 @@ API 文档（Swagger UI）在 `http://manager:18080/docs`。
 `umdk_root` 可选：留空（或省略）时，不一致节点的编译命令不加 `-DUMDK_ROOT`，
 由 cmake 走系统/环境默认查找 URMA。
 
+部署前 manager 会自动在远端 `mkdir -p` 目标目录（scp 不自动建目录）；
+SSH/SCP 失败时返回 `{"error": "..."}` 并附 stderr 详情（如认证失败、
+远端目录不可写、本地 artifact 不存在）。
+
 响应 `{versions, consistent, reference}`：各节点 URMA 包版本、是否一致、参考版本。
 
 ### 任务
@@ -149,5 +153,6 @@ python3 -m unittest discover -s manager/tests -v
 
 ## 备注
 
-- 错误响应统一为 `{"error": "..."}`；pydantic 校验失败返回 422。
+- 错误响应统一为 `{"error": "..."}`：pydantic 校验失败 422、逻辑错误 400、
+  SSH/SCP/worker 调用等运行期失败 500（均带具体原因）。
 - worker API 不接受 manager 地址，也没有注册/回连逻辑。

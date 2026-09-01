@@ -40,6 +40,11 @@ class FakeExecutor:
         self.calls.append((node.name, "copy", source, destination))
 
 
+class FailingExecutor(FakeExecutor):
+    def copy(self, node, source, destination):
+        raise RuntimeError(f"scp to {node.name} failed: remote dir missing")
+
+
 class FakeWorkerClient:
     def __init__(self):
         self.started = []
@@ -156,6 +161,21 @@ class ApiTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["consistent"])
+
+    def test_deploy_failure_returns_clear_error(self):
+        manager = DeploymentManager(
+            FailingExecutor({"a": "liburma-1.0"}), FakeWorkerClient(),
+            NodeStore(Path(self.tmpdir.name) / "nodes.json"),
+        )
+        client = TestClient(create_app(manager, dist_dir=Path(self.tmpdir.name) / "dist"))
+        response = client.post("/v1/deploy", json={
+            "nodes": [{"name": "a", "ip": "10.0.0.1"}],
+            "artifact": "build/kv-bench",
+            "destination": "/opt/kv-bench/build/kv-bench",
+            "source_dir": "/opt/kv-bench",
+        })
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("scp to a failed", response.json()["error"])
 
     def test_task_lifecycle_and_result(self):
         create = self.client.post("/v1/tasks", json={

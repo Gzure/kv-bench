@@ -120,6 +120,11 @@ def create_app(manager: DeploymentManager, dist_dir: str | Path | None = None) -
     async def value_error_handler(_request: Request, exc: ValueError) -> JSONResponse:
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
+    @app.exception_handler(RuntimeError)
+    async def runtime_error_handler(_request: Request, exc: RuntimeError) -> JSONResponse:
+        # SSH/SCP/worker 调用等运行期失败：返回 {"error": ...} 供前端展示
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
     # ---- nodes ------------------------------------------------------------
 
     @app.get("/v1/nodes", summary="节点列表")
