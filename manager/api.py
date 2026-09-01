@@ -191,10 +191,15 @@ def create_app(manager: DeploymentManager, dist_dir: str | Path | None = None) -
         })
         return {"task_id": task.task_id, "state": task.state}
 
-    @app.post("/v1/tasks/{task_id}/start", summary="启动任务")
+    @app.post("/v1/tasks/{task_id}/start", summary="启动任务（拉起任务 worker）")
     def start_task(task_id: str) -> dict[str, Any]:
         commands = manager.start_task(task_id)
-        return {"task_id": task_id, "state": "running", "commands": commands}
+        return {
+            "task_id": task_id,
+            "state": "running",
+            "commands": commands,
+            "worker_ports": dict(manager.tasks[task_id].worker_ports),
+        }
 
     @app.post("/v1/tasks/{task_id}/stop", summary="停止任务")
     def stop_task(task_id: str) -> dict[str, str]:

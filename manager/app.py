@@ -23,9 +23,6 @@ try:
 except ImportError:  # domain layer stays usable without third-party deps
     httpx = None
 
-#: worker 端 nohup 日志路径（deploy 时写入，日志拉取从这里 tail）
-WORKER_LOG_PATH = "/var/log/kv-bench-worker.log"
-
 
 def atomic_write_json(path: str | os.PathLike[str], data: Any) -> None:
     """原子写 JSON：临时文件 + os.replace，避免写一半损坏。"""
@@ -115,6 +112,7 @@ class TaskStore:
                     options=entry.get("options", {}),
                     state=entry.get("state", "queued"),
                     result=entry.get("result", {}),
+                    worker_ports=entry.get("worker_ports", {}),
                 )
                 self._tasks[task.task_id] = task
 
@@ -163,6 +161,41 @@ class DeployStatusStore:
             return dict(self._status)
 
 
+class PortAllocator:
+    """任务级 worker 端口分配：默认 18082 起顺延、空闲复用，多任务端口错开。"""
+
+    def __init__(self, base: int = 18082, max_ports: int = 200):
+        self.base = base
+        self.max_ports = max_ports
+        self._lock = threading.Lock()
+        self._used: dict[int, str] = {}  # port -> task_id
+
+    def allocate(self, task_id: str) -> int:
+        with self._lock:
+            for offset in range(self.max_ports):
+                port = self.base + offset
+                if port not in self._used:
+                    self._used[port] = task_id
+                    return port
+            raise RuntimeError(
+                f"no free worker port in [{self.base}, {self.base + self.max_ports})")
+
+    def release(self, port: int) -> None:
+        with self._lock:
+            self._used.pop(port, None)
+
+    def reserve(self, task_id: str, port: int) -> None:
+        """重启恢复：把持久化的端口重新登记到本任务名下。"""
+        with self._lock:
+            self._used[port] = task_id
+
+    def used_ports(self, task_id: str | None = None) -> list[int]:
+        with self._lock:
+            if task_id is None:
+                return sorted(self._used)
+            return sorted(port for port, owner in self._used.items() if owner == task_id)
+
+
 class RunArtifacts:
     """任务运行产物目录 runs/{task_id}/：结果、任务快照、worker 日志、事件日志。"""
 
@@ -192,14 +225,18 @@ class RunArtifacts:
             stream.write(f"{datetime.now().isoformat(timespec='seconds')}  {event}\n")
 
     def fetch_logs(self, executor: Executor, task: TaskSpec) -> dict[str, str]:
-        """SSH tail 各 worker 的 kv-bench 日志到 logs/{worker}.log（失败写 .error）。"""
+        """SSH tail 各 worker 的 kv-bench 日志到 logs/{worker}.log（失败写 .error）。
+
+        任务专属 worker 的日志文件为 /var/log/kv-bench-worker-{task_id}.log。
+        """
         directory = self._ensure(task.task_id)
         logs_dir = os.path.join(directory, "logs")
         os.makedirs(logs_dir, exist_ok=True)
+        log_path = f"/var/log/kv-bench-worker-{task.task_id}.log"
         collected: dict[str, str] = {}
         for name, node in task.workers.items():
             try:
-                content = executor.run(node, ["tail", "-n", "500", WORKER_LOG_PATH])
+                content = executor.run(node, ["tail", "-n", "500", log_path])
                 suffix = "log"
             except Exception as error:
                 content = f"[log fetch failed: {error}]"
@@ -251,6 +288,9 @@ class TaskSpec:
     options: dict[str, Any] = field(default_factory=dict)
     state: str = "queued"
     result: dict[str, Any] = field(default_factory=dict)
+    # 任务专属 worker 端口（node -> port）；任务启动时分配、停止时回收，
+    # 持久化到 tasks.json，重启后可继续停止/收集结果
+    worker_ports: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -267,13 +307,13 @@ class Executor(Protocol):
 
 
 class WorkerClient(Protocol):
-    def health(self, node: Node) -> dict[str, Any]: ...
+    def health(self, node: Node, port: int | None = None) -> dict[str, Any]: ...
 
-    def start(self, node: Node, task_id: str, command: list[str]) -> None: ...
+    def start(self, node: Node, task_id: str, command: list[str], port: int | None = None) -> None: ...
 
-    def stop(self, node: Node, task_id: str) -> None: ...
+    def stop(self, node: Node, task_id: str, port: int | None = None) -> None: ...
 
-    def result(self, node: Node, task_id: str) -> dict[str, Any]: ...
+    def result(self, node: Node, task_id: str, port: int | None = None) -> dict[str, Any]: ...
 
 
 class SshExecutor:
@@ -342,28 +382,41 @@ class HttpWorkerClient:
         if response.status_code >= 300:
             raise RuntimeError(f"worker {node.name} returned HTTP {response.status_code}")
 
-    def start(self, node: Node, task_id: str, command: list[str]) -> None:
-        self._post(node, "/v1/tasks/start", {"task_id": task_id, "command": command})
+    def _url(self, node: Node, path: str, port: int | None) -> str:
+        return f"http://{node.ip}:{port or node.api_port}{path}"
 
-    def stop(self, node: Node, task_id: str) -> None:
-        self._post(node, f"/v1/tasks/{task_id}/stop", {})
+    def _post(self, node: Node, path: str, payload: dict[str, Any], port: int | None = None) -> None:
+        self._require_httpx()
+        try:
+            with httpx.Client(timeout=10.0, trust_env=False) as client:
+                response = client.post(self._url(node, path, port), json=payload)
+        except httpx.HTTPError as error:
+            raise RuntimeError(f"worker {node.name} unreachable: {error}") from error
+        if response.status_code >= 300:
+            raise RuntimeError(f"worker {node.name} returned HTTP {response.status_code}")
 
-    def health(self, node: Node) -> dict[str, Any]:
+    def start(self, node: Node, task_id: str, command: list[str], port: int | None = None) -> None:
+        self._post(node, "/v1/tasks/start", {"task_id": task_id, "command": command}, port=port)
+
+    def stop(self, node: Node, task_id: str, port: int | None = None) -> None:
+        self._post(node, f"/v1/tasks/{task_id}/stop", {}, port=port)
+
+    def health(self, node: Node, port: int | None = None) -> dict[str, Any]:
         self._require_httpx()
         try:
             with httpx.Client(timeout=5.0, trust_env=False) as client:
-                response = client.get(f"http://{node.ip}:{node.api_port}/v1/health")
+                response = client.get(self._url(node, "/v1/health", port))
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as error:
             raise RuntimeError(f"worker {node.name} unreachable: {error}") from error
 
-    def result(self, node: Node, task_id: str) -> dict[str, Any]:
+    def result(self, node: Node, task_id: str, port: int | None = None) -> dict[str, Any]:
         self._require_httpx()
         try:
             with httpx.Client(timeout=10.0, trust_env=False) as client:
                 response = client.get(
-                    f"http://{node.ip}:{node.api_port}/v1/tasks/{task_id}/result")
+                    self._url(node, f"/v1/tasks/{task_id}/result", port))
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as error:
@@ -379,6 +432,7 @@ class DeploymentManager:
         task_store: TaskStore | None = None,
         deploy_status: DeployStatusStore | None = None,
         artifacts: RunArtifacts | None = None,
+        ports: PortAllocator | None = None,
     ):
         self.executor = executor
         self.worker_client = worker_client
@@ -386,13 +440,17 @@ class DeploymentManager:
         self.task_store = task_store
         self.deploy_status = deploy_status
         self.artifacts = artifacts
+        self.ports = ports if ports is not None else PortAllocator()
         self.tasks: dict[str, TaskSpec] = {}
         self._lock = threading.Lock()
-        self.probe_attempts = 10
-        self.probe_interval = 0.5
-        if task_store is not None:  # 恢复已持久化的任务
+        self.port_attempts = 3          # 单节点启动 worker 尝试的端口数
+        self.worker_start_attempts = 10  # 健康探测轮数
+        self.worker_start_interval = 0.5
+        if task_store is not None:  # 恢复已持久化的任务与其端口占用
             for task in task_store.values():
                 self.tasks[task.task_id] = task
+                for port in task.worker_ports.values():
+                    self.ports.reserve(task.task_id, port)
 
     def _event(self, task_id: str, message: str) -> None:
         if self.artifacts is not None:
@@ -424,22 +482,13 @@ class DeploymentManager:
         self.executor.run(node, ["cmake", "--build", f"{node.workdir}/build", "-j"])
 
     def deploy(self, nodes: list[Node], artifact: str, destination: str, source_dir: str, umdk_root: str | None) -> VersionCheck:
+        """部署 = 仅版本一致性编译 + 拷贝二进制；worker 在任务启动时按任务拉起。"""
         if self.node_store is not None:
             for node in nodes:
                 self.node_store.upsert(node)
         check = self.ensure_urma_consistency(nodes, source_dir, umdk_root)
         for node in nodes:
             self.executor.copy(node, artifact, destination)
-            # 整条启动命令作为单个参数传给 ssh：ssh 会用空格拼接参数、远端 shell
-            # 重新分词，若拆成 ["sh","-lc",...] 会被分词成 sh -l -c "nohup" 而报
-            # "nohup: missing operand"；单参数让远端 shell 原样执行整行。
-            # </dev/null 防止 ssh 因后台进程持有通道而挂住。
-            start_cmd = (
-                f"nohup {shlex.quote(destination)} --worker --worker-port={node.api_port} "
-                f">{WORKER_LOG_PATH} 2>&1 </dev/null &"
-            )
-            self.executor.run(node, [start_cmd])
-            worker_state = self._probe_worker(node)
             if self.deploy_status is not None:
                 self.deploy_status.update(
                     node.name,
@@ -448,24 +497,9 @@ class DeploymentManager:
                     destination=destination,
                     versions=list(check.versions.get(node.name, ())),
                     consistent=check.consistent or check.versions.get(node.name) == check.reference,
-                    worker_state=worker_state,
+                    worker_state="deployed",
                 )
         return check
-
-    def _probe_worker(self, node: Node) -> str:
-        """启动后探测 worker /v1/health，返回 ready / failed（无 worker_client 时 assumed started）。"""
-        if self.worker_client is None:
-            return "started"
-        for attempt in range(self.probe_attempts):
-            try:
-                state = self.worker_client.health(node).get("state")
-                if state in {"ready", "running"}:
-                    return "ready"
-            except Exception:
-                pass
-            if attempt + 1 < self.probe_attempts:
-                time.sleep(self.probe_interval)
-        return "failed"
 
     def build_commands(self, task: TaskSpec) -> list[str]:
         return [command for commands in self.build_assignments(task).values() for command in commands]
@@ -524,28 +558,96 @@ class DeploymentManager:
         return task
 
     def start_task(self, task_id: str) -> list[str]:
+        """启动任务：为每个参与节点拉起任务专属 worker（独立端口），健康后就绪后下发 bench。"""
         with self._lock:
             task = self.tasks[task_id]
             if task.state != "queued":
                 raise ValueError("task is not queued")
             assignments = self.build_assignments(task)
-            if self.worker_client is not None:
+            started: list[tuple[str, int]] = []
+            try:
                 for node_name, commands in assignments.items():
-                    for command in commands:
-                        self.worker_client.start(task.workers[node_name], task.task_id, shlex.split(command))
-            commands = [command for values in assignments.values() for command in values]
-            task.state = "running"
+                    node = task.workers[node_name]
+                    port = self._spawn_worker(task, node)
+                    task.worker_ports[node_name] = port
+                    started.append((node_name, port))
+                    if self.worker_client is not None:
+                        for command in commands:
+                            self.worker_client.start(node, task.task_id, shlex.split(command), port=port)
+                commands = [command for values in assignments.values() for command in values]
+                task.state = "running"
+            except Exception:
+                # 任一节点失败：回滚已拉起的 worker，释放端口，任务保持 queued
+                self._teardown_workers(task, started)
+                raise
         self._persist_task(task, "started")
         return commands
 
     def stop_task(self, task_id: str) -> None:
         with self._lock:
             task = self.tasks[task_id]
+            ports = dict(task.worker_ports)
             if self.worker_client is not None:
                 for node in task.workers.values():
-                    self.worker_client.stop(node, task_id)
+                    try:
+                        self.worker_client.stop(node, task.task_id, port=ports.get(node.name))
+                    except Exception:
+                        pass  # worker 可能已不在
+            self._teardown_workers(task, list(ports.items()))
             task.state = "stopped"
         self._persist_task(task, "stopped")
+
+    def _spawn_worker(self, task: TaskSpec, node: Node) -> int:
+        """分配端口 -> ssh 拉起该任务的 worker -> 轮询 /v1/health；失败换下一个端口。"""
+        for _ in range(self.port_attempts):
+            port = self.ports.allocate(task.task_id)
+            log_path = f"/var/log/kv-bench-worker-{task.task_id}.log"
+            # 整行命令作为单个参数传给 ssh（远端 shell 原样执行），</dev/null 防挂住
+            start_cmd = (
+                f"nohup {shlex.quote(node.binary)} --worker --worker-port={port} "
+                f">{log_path} 2>&1 </dev/null &"
+            )
+            try:
+                self.executor.run(node, [start_cmd])
+            except Exception:
+                self.ports.release(port)
+                raise
+            if self._wait_worker_ready(node, port):
+                return port
+            # 进程可能已起（如端口被占后崩溃/不健康）：清理后换端口
+            try:
+                self.executor.run(node, ["pkill", "-f", f"worker-port={port}"])
+            except Exception:
+                pass
+            self.ports.release(port)
+        raise RuntimeError(f"worker {node.name} did not become healthy on any free port")
+
+    def _wait_worker_ready(self, node: Node, port: int) -> bool:
+        if self.worker_client is None:
+            return True
+        for attempt in range(self.worker_start_attempts):
+            try:
+                state = self.worker_client.health(node, port=port).get("state")
+                if state in {"ready", "running"}:
+                    return True
+            except Exception:
+                pass
+            if attempt + 1 < self.worker_start_attempts:
+                time.sleep(self.worker_start_interval)
+        return False
+
+    def _teardown_workers(self, task: TaskSpec, entries: list[tuple[str, int]]) -> None:
+        """杀掉任务 worker 进程并释放端口（尽力而为，不抛异常）。"""
+        for node_name, port in entries:
+            node = task.workers.get(node_name)
+            if node is not None:
+                try:
+                    self.executor.run(node, ["pkill", "-f", f"worker-port={port}"])
+                except Exception:
+                    pass
+            self.ports.release(port)
+        for node_name, _ in entries:
+            task.worker_ports.pop(node_name, None)
 
     def collect_result(self, task_id: str) -> dict[str, Any]:
         with self._lock:
@@ -554,7 +656,8 @@ class DeploymentManager:
             for name, node in task.workers.items():
                 if self.worker_client is not None:
                     try:
-                        workers[name] = self.worker_client.result(node, task_id)
+                        workers[name] = self.worker_client.result(
+                            node, task_id, port=task.worker_ports.get(name))
                     except Exception as error:  # worker may still be starting
                         workers[name] = {"state": "unreachable", "error": str(error)}
             total = {"ops": 0, "bytes": 0, "errors": 0}

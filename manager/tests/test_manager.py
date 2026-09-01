@@ -29,16 +29,16 @@ class FakeWorkerClient:
         self.started = []
         self.stopped = []
 
-    def health(self, node):
+    def health(self, node, port=None):
         return {"state": "ready"}
 
-    def start(self, node, task_id, command):
-        self.started.append((node.name, task_id, command))
+    def start(self, node, task_id, command, port=None):
+        self.started.append((node.name, task_id, command, port))
 
-    def stop(self, node, task_id):
-        self.stopped.append((node.name, task_id))
+    def stop(self, node, task_id, port=None):
+        self.stopped.append((node.name, task_id, port))
 
-    def result(self, node, task_id):
+    def result(self, node, task_id, port=None):
         return {"state": "ready", "ops": 10 if node.name == "a" else 20, "bytes": 100, "errors": 1}
 
 
@@ -123,6 +123,81 @@ class ManagerTests(unittest.TestCase):
         result = manager.collect_result(task.task_id)
         self.assertEqual(result["aggregate"]["ops"], 30)
         self.assertEqual(result["aggregate"]["errors"], 2)
+
+    def test_task_worker_ports_staggered_and_released(self):
+        executor = FakeExecutor({"a": "u", "b": "u"})
+        client = FakeWorkerClient()
+        manager = DeploymentManager(executor, client)
+        task1 = manager.create_task({
+            "task_id": "p1",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        manager.start_task("p1")
+        self.assertEqual(task1.worker_ports, {"a": 18082, "b": 18083})
+        # 第二个任务端口继续错开
+        task2 = manager.create_task({
+            "task_id": "p2",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        manager.start_task("p2")
+        self.assertEqual(task2.worker_ports, {"a": 18084, "b": 18085})
+        # 停止 p1 后端口回收，p3 复用 18082/18083
+        manager.stop_task("p1")
+        task3 = manager.create_task({
+            "task_id": "p3",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        manager.start_task("p3")
+        self.assertEqual(task3.worker_ports, {"a": 18082, "b": 18083})
+        # 停止时对每个节点执行 pkill 杀 worker
+        pkills = [call for call in executor.calls if call[1] and call[1][0] == "pkill"]
+        self.assertEqual(len(pkills), 2)  # p1 的两个节点
+
+    def test_task_start_failure_rolls_back_workers(self):
+        class DownWorker(FakeWorkerClient):
+            def health(self, node, port=None):
+                raise RuntimeError("worker down")
+
+        class FailDispatchOnB(FakeWorkerClient):
+            def start(self, node, task_id, command, port=None):
+                if node.name == "b":
+                    raise RuntimeError("dispatch failed")
+                super().start(node, task_id, command, port=port)
+
+        def make_task(manager):
+            return manager.create_task({
+                "task_id": "t",
+                "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+                "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+            })
+
+        # 1) 健康探测失败 -> 报错、端口释放、任务保持 queued
+        executor = FakeExecutor({"a": "u", "b": "u"})
+        manager = DeploymentManager(executor, DownWorker())
+        manager.worker_start_attempts = 1
+        manager.worker_start_interval = 0
+        manager.port_attempts = 1
+        make_task(manager)
+        with self.assertRaises(RuntimeError):
+            manager.start_task("t")
+        self.assertEqual(manager.tasks["t"].state, "queued")
+        self.assertEqual(manager.tasks["t"].worker_ports, {})
+        self.assertEqual(manager.ports.used_ports(), [])
+
+        # 2) 已拉起的节点在下发 bench 时失败 -> 回滚杀掉已拉起的 worker、释放端口
+        executor2 = FakeExecutor({"a": "u", "b": "u"})
+        manager2 = DeploymentManager(executor2, FailDispatchOnB())
+        make_task(manager2)
+        with self.assertRaises(RuntimeError):
+            manager2.start_task("t")
+        self.assertEqual(manager2.tasks["t"].state, "queued")
+        self.assertEqual(manager2.tasks["t"].worker_ports, {})
+        self.assertEqual(manager2.ports.used_ports(), [])
+        pkills = [call for call in executor2.calls if call[1] and call[1][0] == "pkill"]
+        self.assertEqual(len(pkills), 2)  # a、b 都已拉起，全部回滚杀掉
 
     def test_node_store_persists_registered_nodes(self):
         with tempfile.TemporaryDirectory() as directory:

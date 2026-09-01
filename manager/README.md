@@ -77,8 +77,8 @@ API 文档（Swagger UI）在 `http://manager:18080/docs`。
 ### 部署
 
 `POST /v1/deploy`：manager 对每个节点执行 `rpm -qa` 并筛选 `urma`；
-版本集合不一致时，仅对不一致节点执行独立的 CMake 编译，然后复制 artifact
-并以 nohup 启动 worker。
+版本集合不一致时，仅对不一致节点执行独立的 CMake 编译，然后复制 artifact。
+**部署不做 worker 常驻启动** —— worker 在任务启动时按任务拉起（见下）。
 
 ```json
 {
@@ -97,11 +97,8 @@ API 文档（Swagger UI）在 `http://manager:18080/docs`。
 SSH/SCP 失败时返回 `{"error": "..."}` 并附 stderr 详情（如认证失败、
 远端目录不可写、本地 artifact 不存在）。
 
-worker 启动命令以整行作为单个参数通过 ssh 执行（避免远端 shell 分词把
-`nohup` 拆成无参数），并在启动后探测 `/v1/health`：探测结果写入部署状态
-（`worker_state` = ready / failed / started），节点管理页可查看。
-
 响应 `{versions, consistent, reference}`：各节点 URMA 包版本、是否一致、参考版本。
+部署状态（`worker_state = deployed`）写入 `deploy_status.json`，节点管理页可查看。
 
 ### 任务
 
@@ -119,18 +116,23 @@ worker 启动命令以整行作为单个参数通过 ssh 执行（避免远端 s
 }
 ```
 
-manager 调用 worker API：
+**任务启动时按任务拉起 worker，端口错开（默认 18082 起顺延、空闲复用）**：
 
-- `POST /v1/tasks/{id}/start`：manager 为拓扑生成每个 worker 的 kv-bench 参数，
-  并调用 worker 的 `POST /v1/tasks/start`；worker 在同一 kv-bench 进程内启动测试线程。
-- `POST /v1/tasks/{id}/stop`：调用相关 worker 的 `POST /v1/tasks/{id}/stop`。
+- `POST /v1/tasks/{id}/start`：manager 为任务中每个节点分配独立端口，ssh
+  `nohup kv-bench --worker --worker-port=<端口> >/var/log/kv-bench-worker-{task_id}.log 2>&1 </dev/null &`
+  拉起该任务的 worker，轮询 `/v1/health` 就绪后把 bench 命令下发到该任务的端口；
+  启动失败自动换端口，全部失败则回滚（杀掉已拉起 worker、释放端口）并返回 `{"error": ...}`。
+  多任务端口互不冲突，同一节点可并发多个任务；manager 与 worker 同机也适用。
+  响应含 `worker_ports`（node -> 端口）。
+- `POST /v1/tasks/{id}/stop`：经该任务端口停止 bench，ssh `pkill -f worker-port=<端口>`
+  杀掉 worker 并释放端口。
+- 任务自然结束后 worker 保活（结果/日志仍可查），端口占用到该任务被停止。
 - `GET /v1/tasks/{id}/result`：聚合各 worker 结果（`ops/bytes/errors` → `iops/带宽`），
   并落盘到 `runs/{task_id}/result.json`。
-- `GET /v1/tasks/{id}/logs`：SSH `tail` 各 worker 的 `/var/log/kv-bench-worker.log`
+- `GET /v1/tasks/{id}/logs`：SSH `tail` 各 worker 的 `/var/log/kv-bench-worker-{task_id}.log`
   并保存到 `runs/{task_id}/logs/{worker}.log`（拉取失败写 `.error`），返回日志内容。
   kv-bench 的 `main()` 已对 stdout 设置行缓冲（`setvbuf(_IOLBF)`），
   printf 的区间统计/summary 实时落盘，任务期间即可 tail 到。
-- worker `GET /v1/health`：查看 worker 本地运行中的 kv-bench 任务。
 
 `options` 覆盖 kv-bench 全部打流参数（`_` 转 `-` 后透传为 CLI 参数）：
 标量 `{"threads": 4}` → `--threads=4`；开关 `{"event_mode": true}` → `--event-mode`；
@@ -143,7 +145,7 @@ manager 运行目录（默认当前目录）下的文件：
 | 文件 | 内容 |
 | --- | --- |
 | `nodes.json` | 节点配置（含 SSH 密码，注意文件权限） |
-| `tasks.json` | 任务与状态（创建/启动/停止/结果实时持久化，manager 重启不丢） |
+| `tasks.json` | 任务与状态（创建/启动/停止/结果 + worker 端口映射实时持久化，manager 重启不丢） |
 | `deploy_status.json` | 各节点部署状态（部署时间/artifact/URMA 版本一致性/worker 状态） |
 | `runs/{task_id}/` | 每任务产物：`result.json`、`task.json`（任务快照）、`logs/{worker}.log`（SSH 拉取的 worker 日志）、`manager.log`（生命周期事件） |
 

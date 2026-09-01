@@ -53,21 +53,21 @@ class FakeWorkerClient:
         self.started = []
         self.stopped = []
 
-    def health(self, node):
+    def health(self, node, port=None):
         return {"state": "ready"}
 
-    def start(self, node, task_id, command):
-        self.started.append((node.name, task_id, command))
+    def start(self, node, task_id, command, port=None):
+        self.started.append((node.name, task_id, command, port))
 
-    def stop(self, node, task_id):
-        self.stopped.append((node.name, task_id))
+    def stop(self, node, task_id, port=None):
+        self.stopped.append((node.name, task_id, port))
 
-    def result(self, node, task_id):
+    def result(self, node, task_id, port=None):
         return {"state": "ready", "ops": 10 if node.name == "a" else 20, "bytes": 100, "errors": 1}
 
 
 class DownWorkerClient(FakeWorkerClient):
-    def health(self, node):
+    def health(self, node, port=None):
         raise RuntimeError("worker down")
 
 
@@ -210,6 +210,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(start.status_code, 200)
         self.assertEqual(start.json()["state"], "running")
         self.assertEqual(len(start.json()["commands"]), 2)
+        self.assertEqual(start.json()["worker_ports"], {"a": 18082, "b": 18083})
 
         result = self.client.get("/v1/tasks/t1/result")
         self.assertEqual(result.status_code, 200)
@@ -293,31 +294,33 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(deploy.status_code, 200)
         nodes = self.client.get("/v1/nodes").json()
         self.assertIsNotNone(nodes[0]["deploy"])
-        self.assertEqual(nodes[0]["deploy"]["worker_state"], "ready")  # 健康探测通过
+        self.assertEqual(nodes[0]["deploy"]["worker_state"], "deployed")  # 仅编译+拷贝
         self.assertEqual(nodes[0]["deploy"]["versions"], ["liburma-1.0"])
         self.assertTrue(nodes[0]["deploy"]["consistent"])
         # 部署状态持久化到磁盘
         restored = DeployStatusStore(Path(self.tmpdir.name) / "deploy_status.json")
-        self.assertEqual(restored.get("a")["worker_state"], "ready")
+        self.assertEqual(restored.get("a")["worker_state"], "deployed")
 
-    def test_deploy_marks_failed_when_worker_unreachable(self):
+    def test_task_start_failure_returns_error_and_keeps_queued(self):
         manager = DeploymentManager(
             FakeExecutor({"a": "liburma-1.0"}), DownWorkerClient(),
             NodeStore(Path(self.tmpdir.name) / "nodes.json"),
-            deploy_status=self.deploy_status,
         )
-        manager.probe_attempts = 2
-        manager.probe_interval = 0
+        manager.worker_start_attempts = 1
+        manager.worker_start_interval = 0
+        manager.port_attempts = 1
         client = TestClient(create_app(manager, dist_dir=Path(self.tmpdir.name) / "dist"))
-        response = client.post("/v1/deploy", json={
-            "nodes": [{"name": "a", "ip": "10.0.0.1"}],
-            "artifact": "build/kv-bench",
-            "destination": "/opt/kv-bench/build/kv-bench",
-            "source_dir": "/opt/kv-bench",
+        client.post("/v1/tasks", json={
+            "task_id": "t-fail",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
         })
-        self.assertEqual(response.status_code, 200)
-        nodes = client.get("/v1/nodes").json()
-        self.assertEqual(nodes[0]["deploy"]["worker_state"], "failed")
+        response = client.post("/v1/tasks/t-fail/start")
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("did not become healthy", response.json()["error"])
+        tasks = client.get("/v1/tasks").json()
+        self.assertEqual(tasks[0]["state"], "queued")
+        self.assertEqual(manager.ports.used_ports(), [])
 
 
 @unittest.skipUnless(HAVE_FASTAPI, "fastapi/httpx not installed")

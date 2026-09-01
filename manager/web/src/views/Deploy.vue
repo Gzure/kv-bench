@@ -2,7 +2,7 @@
   <el-card class="page-card" shadow="never">
     <template #header>
       <div class="card-header">
-        <span>部署与启动 worker</span>
+        <span>部署（编译 + 拷贝二进制）</span>
         <el-button :icon="Refresh" circle title="刷新节点" @click="loadNodes" />
       </div>
     </template>
@@ -49,7 +49,7 @@
           :disabled="!selected.length"
           @click="deploy"
         >
-          部署并启动 worker
+          部署（编译并拷贝）
         </el-button>
       </el-form-item>
     </el-form>
@@ -158,7 +158,7 @@ async function deploy() {
       source_dir: form.source_dir,
       umdk_root: form.umdk_root,
     })
-    ElMessage.success('部署完成，worker 已启动')
+    ElMessage.success('部署完成（worker 将在任务启动时按任务拉起）')
   } catch (error) {
     ElMessage.error(errMsg(error))
   } finally {
