@@ -132,9 +132,9 @@ client                                  server
 对齐参考 `ServerEventHandleThreadMain → PollJfcWait → CheckAndNotify`，但**去掉了 map+CV**，改为**每打流线程固定事件槽数组**：
 
 ```
-常量：kEventSlotsPerWorker = 256，kRidShift = 40，kRidMask = 2^40-1
-事件 token：token = generation<<8 | slotIndex
-事件槽编码：user_ctx = (workerId << 40) | token
+常量：kEventSlotsPerWorker = 1024，kRidShift = 42，kRidMask = 2^42-1
+事件 token：token = generation<<10 | slotIndex
+事件槽编码：user_ctx = (workerId << 42) | token
 槽状态：token<<2        （已登记，等待完成）
         token<<2 | 1    （成功完成）
         token<<2 | 2    （失败完成）

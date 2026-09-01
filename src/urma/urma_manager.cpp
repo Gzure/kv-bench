@@ -67,7 +67,8 @@ struct WireInfo {
                         * 旧版本 memset 为 0 → 校验时跳过（向后兼容） */
   uint32_t sends_per_req; /* 复用原 reserved[1]：每请求 send 数，两端须一致；
                             * 旧版本 memset 为 0 → 校验时跳过（向后兼容） */
-  uint32_t reserved[1];
+  uint32_t concurrency; /* 复用原 reserved[2]：在飞请求数，两端须一致；
+                         * 旧版本 memset 为 0 → 校验时跳过（向后兼容） */
 } __attribute__((packed));
 
 int SockSyncData(int sockfd, int size, char *localData, char *remoteData) {
@@ -525,6 +526,7 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   localWire.read_size = params.readSize;
   localWire.write_size = params.writeSize;
   localWire.sends_per_req = params.sendsPerReq;
+  localWire.concurrency = params.concurrency;
   localWire.dst_chip = params.dstChip;
 
   WireInfo remoteWire;
@@ -535,10 +537,11 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   }
 
   printf("exchange: remote seg va=0x%lx len=%lu jetty=%u dst_chip=%u "
-         "threads=%u op=%u write_size=%u sends_per_req=%u\n",
+         "threads=%u op=%u write_size=%u sends_per_req=%u concurrency=%u\n",
          (uint64_t)remoteWire.seg_va, (uint64_t)remoteWire.seg_len,
          remoteWire.jetty_id.id, remoteWire.dst_chip, remoteWire.threads,
-         remoteWire.op_code, remoteWire.write_size, remoteWire.sends_per_req);
+         remoteWire.op_code, remoteWire.write_size, remoteWire.sends_per_req,
+         remoteWire.concurrency);
 
   /* 校验两端 write_size 一致（write 数据面 offset/缓冲布局依赖同尺寸）；
    * 0 = 对端未设置（旧版本/非 write），跳过校验 */
@@ -562,6 +565,17 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
     return false;
   }
 
+  /* 校验两端 concurrency 一致（服务器缓冲布局依赖同值）；
+   * 0 = 对端未设置（旧版本），跳过校验 */
+  if (params.concurrency != 0 && remoteWire.concurrency != 0 &&
+      remoteWire.concurrency != params.concurrency) {
+    fprintf(stderr,
+            "exchange: concurrency mismatch local=%u remote=%u; both ends "
+            "must pass the same --concurrency\n",
+            params.concurrency, remoteWire.concurrency);
+    return false;
+  }
+
   auto newConn = std::make_shared<UrmaConnection>();
   newConn->peer.eid = remoteWire.eid;
   newConn->peer.uasid = remoteWire.uasid;
@@ -572,6 +586,7 @@ bool UrmaManager::Exchange(int sockfd, const HandshakeParams &params,
   newConn->peer.readSize = remoteWire.read_size;
   newConn->peer.writeSize = remoteWire.write_size;
   newConn->peer.sendsPerReq = remoteWire.sends_per_req;
+  newConn->peer.concurrency = remoteWire.concurrency;
   newConn->peer.seg.ubva.eid = remoteWire.eid;
   newConn->peer.seg.ubva.uasid = remoteWire.uasid;
   newConn->peer.seg.ubva.va = remoteWire.seg_va;

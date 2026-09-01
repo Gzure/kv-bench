@@ -26,7 +26,7 @@ namespace kv_bench {
 
 constexpr uint32_t kEventSlotsPerWorker = EventSlotPool::kSlotCount;
 constexpr uint32_t kMaxRegisteredWorkers = 1024;
-constexpr uint32_t kRidShift = 40;
+constexpr uint32_t kRidShift = 42; /* kSlotBits(10) + 32 ≤ 42，worker-id 在高位 */
 constexpr uint64_t kRidMask = (1ULL << kRidShift) - 1;
 static_assert(EventSlotPool::kSlotBits + 32 <= kRidShift,
               "event token must fit below the worker-id bits");
@@ -38,6 +38,7 @@ struct HandshakeParams {
   uint32_t readSize = 0;
   uint32_t writeSize = 0; /* write 每 send 字节数（拆 2 条 WR）；握手校验两端一致 */
   uint32_t sendsPerReq = 0; /* 每请求 send 数（1..10）；握手校验两端一致 */
+  uint32_t concurrency = 0; /* 在飞请求数（1..50）；握手校验两端一致 */
   uint32_t dstChip = kInvalidChip; /* 本进程数据落地目的 chip */
   uint32_t transMode = 0; /* 0=RM 1=RC 2=UM 3=RS（RC 时绑定本地 jetty） */
 };
@@ -53,6 +54,7 @@ struct UrmaPeerInfo {
   uint32_t readSize = 0;
   uint32_t writeSize = 0; /* 对端 write 每 send 字节数 */
   uint32_t sendsPerReq = 0; /* 对端每请求 send 数 */
+  uint32_t concurrency = 0; /* 对端在飞请求数 */
   urma_seg_t seg{};
 };
 

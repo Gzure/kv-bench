@@ -113,8 +113,8 @@ WR/请求）。**20 条 WR 连续全部 post（不等 CQE）；请求之间不�
   Bresenham 加权轮询打散分配（如 `7:3` → chip2 打散在 idx 1/5/8，非连续 7 个 chip1）。
   `10:0`/`0:10` 等价 `--single-chip`；仅 affinity 模式生效，anti/none 传则 warning 忽略。
 - 时延 = **第 1 条 WR post → 最后一条 CQE**（`request latency`）。
-- 带宽 = **`write-size`×10 传输字节/请求**（同一 `write-size` 数据发 10 次）。
-- **`--concurrency`**：在飞请求数（1..10，重叠度）。
+- 带宽 = **`write-size`×`sends_per_req` 传输字节/请求**（同一 `write-size` 数据发 `sends_per_req` 次）。
+- **`--concurrency`**：在飞请求数（1..50，重叠度）。
 - **`--single-chip 1|2`**：单 chip 场景——所有发送固定走该 chip（src==dst），
   `--mbind` 时缓冲绑到该 chip 对应的 NUMA 节点（测单 chip 极限 + 内存亲和）。与
   `--chip-weight` 互斥。

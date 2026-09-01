@@ -43,7 +43,7 @@
 #define PAGE_SHIFT 12
 #define PAGE_SIZE (0x1 << PAGE_SHIFT) /* 4KB */
 #define DEFAULT_READ_SIZE (4UL * 1024 * 1024)
-#define MAX_JETTY_COUNT 200
+#define MAX_JETTY_COUNT 1024
 #define MAX_CLIENT_CNT 10
 #define POLL_SLEEP_NS 1000L /* 1us */
 #define DEFAULT_PORT 13857
@@ -58,7 +58,7 @@
 #define KV_WR_PER_SEND 2  /* 每次 send 拆 2 条 WR（固定） */
 #define KV_MAX_SENDS_PER_REQ 10 /* 每请求最大 send 数（编译期上限，用于数组定长） */
 #define KV_MAX_WR_PER_REQ (KV_MAX_SENDS_PER_REQ * KV_WR_PER_SEND) /* 20 条 WR/请求 */
-#define KV_MAX_CONCURRENCY 10 /* --concurrency 上限：在飞请求数 */
+#define KV_MAX_CONCURRENCY 50 /* --concurrency 上限：在飞请求数 */
 #define KV_MAX_WR_SLOTS KV_MAX_CONCURRENCY /* 槽 = 一个请求（20 条 WR） */
 #define KV_MAX_INFLIGHT_REQS KV_MAX_CONCURRENCY
 #define DEFAULT_WRITE_SIZE (8UL * 1024 * 1024) /* 默认每 send 8MB */
@@ -97,7 +97,7 @@ typedef struct argument {
   const char *destination_cpus;
   bool cacheable;
   uint32_t threads;
-  int concurrency; /* write/get 在飞请求数 1..10，默认 1 */
+  int concurrency; /* write/get 在飞请求数 1..50，默认 1 */
   int single_chip; /* 单 chip 场景：0=双 chip 交替；1/2=只用该 chip（src==dst）
                     */
   uint32_t chip_weight[2]; /* affinity 模式两 die 权重 [chip1, chip2]，
@@ -460,14 +460,17 @@ static int layout_client_buffer(context_t *ctx) {
 static int layout_server_buffer(context_t *ctx) {
   const argument_t *args = &ctx->args;
   uint64_t size = args->read_size;
-  /* 服务器数据区：write/get 都按 10 并发 × 10 send × (write_size|read_size)
-   * 覆盖客户端分片流水线最大窗口；mixed 用旧同步模型窗口 */
+  /* 服务器数据区：write/get 都按 concurrency × sends_per_req × (write_size|read_size)
+   * 覆盖客户端分片流水线窗口；mixed 用旧同步模型窗口 */
   ctx->data_len = (args->op == OP_WRITE)
-                      ? (uint64_t)args->sends_per_req * KV_MAX_CONCURRENCY *
+                      ? (uint64_t)args->sends_per_req *
+                            (args->concurrency >= 1 ? args->concurrency : 1) *
                             args->write_size
                       : (args->op == OP_GET)
                             ? (uint64_t)args->sends_per_req *
-                                  KV_MAX_CONCURRENCY * size
+                                  (args->concurrency >= 1 ? args->concurrency
+                                                          : 1) *
+                                  size
                             : (uint64_t)SERVER_DATA_WINDOW * size;
   ctx->buf_len = ROUND_UP(ctx->data_len, PAGE_SIZE);
   return 0;
@@ -1852,6 +1855,7 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args) {
   params.readSize = (uint32_t)args->read_size;
   params.writeSize = (uint32_t)args->write_size;
   params.sendsPerReq = args->sends_per_req;
+  params.concurrency = args->concurrency;
   params.transMode = args->trans_mode;
   params.dstChip = INVALID_CHIP;
   int dst_chip = first_dst_chip(args);
@@ -2416,6 +2420,7 @@ static void *server_conn_main(void *arg) {
   params.readSize = (uint32_t)ctx->args.read_size;
   params.writeSize = (uint32_t)ctx->args.write_size;
   params.sendsPerReq = ctx->args.sends_per_req;
+  params.concurrency = ctx->args.concurrency;
   params.transMode = ctx->args.trans_mode;
   params.dstChip = INVALID_CHIP;
   int dst_chip = first_dst_chip(&ctx->args);
@@ -2675,7 +2680,7 @@ static void usage(void) {
          "auto per chip)\n");
   printf("      --cacheable            register/import cacheable memory\n");
   printf("      --threads <n>          client load threads (default 1)\n");
-  printf("      --concurrency <n>      write/get inflight requests 1..10 "
+  printf("      --concurrency <n>      write/get inflight requests 1..50 "
          "(default 1)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all "
          "sends use one chip (src==dst), mbind to that chip's NUMA\n");

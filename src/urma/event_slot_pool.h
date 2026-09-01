@@ -11,8 +11,8 @@ namespace kv_bench {
  * token = generation + slot index，迟到 CQE 无法命中新一代事件。 */
 class EventSlotPool {
 public:
-  static constexpr uint32_t kSlotCount = 256;
-  static constexpr uint32_t kSlotBits = 8;
+  static constexpr uint32_t kSlotCount = 1024;
+  static constexpr uint32_t kSlotBits = 10;
   static constexpr uint64_t kSlotMask = kSlotCount - 1;
 
   EventSlotPool() {
