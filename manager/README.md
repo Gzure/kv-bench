@@ -113,8 +113,22 @@ manager 调用 worker API：
 - `POST /v1/tasks/{id}/start`：manager 为拓扑生成每个 worker 的 kv-bench 参数，
   并调用 worker 的 `POST /v1/tasks/start`；worker 在同一 kv-bench 进程内启动测试线程。
 - `POST /v1/tasks/{id}/stop`：调用相关 worker 的 `POST /v1/tasks/{id}/stop`。
-- `GET /v1/tasks/{id}/result`：聚合各 worker 结果（`ops/bytes/errors` → `iops/带宽`）。
+- `GET /v1/tasks/{id}/result`：聚合各 worker 结果（`ops/bytes/errors` → `iops/带宽`），
+  并落盘到 `runs/{task_id}/result.json`。
+- `GET /v1/tasks/{id}/logs`：SSH `tail` 各 worker 的 `/var/log/kv-bench-worker.log`
+  并保存到 `runs/{task_id}/logs/{worker}.log`（拉取失败写 `.error`），返回日志内容。
 - worker `GET /v1/health`：查看 worker 本地运行中的 kv-bench 任务。
+
+## 持久化与运行产物
+
+manager 运行目录（默认当前目录）下的文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `nodes.json` | 节点配置（含 SSH 密码，注意文件权限） |
+| `tasks.json` | 任务与状态（创建/启动/停止/结果实时持久化，manager 重启不丢） |
+| `deploy_status.json` | 各节点部署状态（部署时间/artifact/URMA 版本一致性/worker 状态） |
+| `runs/{task_id}/` | 每任务产物：`result.json`、`task.json`（任务快照）、`logs/{worker}.log`（SSH 拉取的 worker 日志）、`manager.log`（生命周期事件） |
 
 ## 测试
 

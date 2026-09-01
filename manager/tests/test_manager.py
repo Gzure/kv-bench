@@ -1,8 +1,10 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from manager import BenchItem, DeploymentManager, Node, NodeStore, TaskSpec
+from manager.app import DeployStatusStore, RunArtifacts, TaskStore
 
 
 class FakeExecutor:
@@ -103,6 +105,55 @@ class ManagerTests(unittest.TestCase):
             # 无 tags 字段的旧文件兼容
             old = Node("b", "10.0.0.2")
             self.assertEqual(old.tags, ())
+
+    def test_task_store_persists_state_across_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            manager = DeploymentManager(FakeExecutor({"a": "u", "b": "u"}), task_store=TaskStore(path))
+            manager.create_task({
+                "task_id": "t1",
+                "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+                "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+            })
+            manager.start_task("t1")
+            manager.stop_task("t1")
+            # 用持久化的 store 重建 manager -> 状态不丢
+            manager2 = DeploymentManager(FakeExecutor({"a": "u", "b": "u"}), task_store=TaskStore(path))
+            task = manager2.tasks["t1"]
+            self.assertEqual(task.state, "stopped")
+            self.assertEqual(task.workers["a"].ip, "10.0.0.1")
+            self.assertEqual(task.bench_items[0].type, "forward")
+
+    def test_deploy_status_store_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deploy_status.json"
+            store = DeployStatusStore(path)
+            store.update("a", deployed_at="2026-01-01T00:00:00", consistent=True, versions=["liburma-1.0"])
+            restored = DeployStatusStore(path)
+            self.assertEqual(restored.get("a")["consistent"], True)
+            self.assertEqual(restored.get("a")["versions"], ["liburma-1.0"])
+            self.assertIsNone(restored.get("nope"))
+
+    def test_run_artifacts_save_result_and_fetch_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = RunArtifacts(directory)
+            executor = FakeExecutor({"a": "u", "b": "u"})
+            task = TaskSpec(
+                "t1",
+                {"a": Node("a", "10.0.0.1"), "b": Node("b", "10.0.0.2")},
+                [BenchItem("a", "b", "forward")],
+            )
+            artifacts.save_result(task, {"aggregate": {"ops": 42}})
+            artifacts.append_event("t1", "created")
+            logs = artifacts.fetch_logs(executor, task)
+            self.assertEqual(set(logs), {"a", "b"})
+            base = Path(directory) / "t1"
+            self.assertEqual(json.loads((base / "result.json").read_text())["aggregate"]["ops"], 42)
+            for name in ("a", "b"):
+                self.assertEqual((base / "logs" / f"{name}.log").read_text(), "ok")
+            data = artifacts.read_logs("t1")
+            self.assertEqual(data["workers"]["a"]["content"], "ok")
+            self.assertIn("created", data["manager_log"])
 
 
 if __name__ == "__main__":

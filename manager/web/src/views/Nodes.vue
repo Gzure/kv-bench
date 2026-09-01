@@ -27,6 +27,14 @@
           </div>
         </template>
       </el-table-column>
+      <el-table-column label="部署" width="100">
+        <template #default="{ row }">
+          <el-tooltip v-if="row.deploy" :content="deployTip(row.deploy)" placement="top">
+            <el-tag size="small" :type="row.deploy.consistent ? 'success' : 'warning'">已部署</el-tag>
+          </el-tooltip>
+          <el-tag v-else size="small" type="info" effect="plain">未部署</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column prop="ip" label="地址" min-width="130" />
       <el-table-column prop="user" label="用户" width="90" />
       <el-table-column prop="ssh_port" label="SSH 端口" width="100" />
@@ -95,7 +103,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
 
-import { api, collectTags, errMsg, type Node, type NodeInput } from '@/api'
+import { api, collectTags, errMsg, type Node, type NodeDeployStatus, type NodeInput } from '@/api'
 
 const nodes = ref<Node[]>([])
 const loading = ref(false)
@@ -103,6 +111,9 @@ const saving = ref(false)
 const dialogVisible = ref(false)
 
 const existingTags = computed(() => collectTags(nodes.value))
+
+const deployTip = (deploy: NodeDeployStatus): string =>
+  `部署于 ${deploy.deployed_at}\n${deploy.destination}\nURMA: ${deploy.versions.join(', ') || '—'}\n一致性: ${deploy.consistent ? '一致' : '不一致'}`
 
 const form = reactive<NodeInput>({
   name: '',

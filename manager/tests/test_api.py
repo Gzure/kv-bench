@@ -12,7 +12,13 @@ try:
     from fastapi.testclient import TestClient
 
     from manager.api import create_app
-    from manager.app import DeploymentManager, NodeStore
+    from manager.app import (
+        DeploymentManager,
+        DeployStatusStore,
+        NodeStore,
+        RunArtifacts,
+        TaskStore,
+    )
 
     HAVE_FASTAPI = True
 except Exception:  # pragma: no cover - exercised only without third-party deps
@@ -54,9 +60,13 @@ class ApiTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         store = NodeStore(Path(self.tmpdir.name) / "nodes.json")
+        self.task_store = TaskStore(Path(self.tmpdir.name) / "tasks.json")
+        self.deploy_status = DeployStatusStore(Path(self.tmpdir.name) / "deploy_status.json")
+        self.artifacts = RunArtifacts(Path(self.tmpdir.name) / "runs")
         self.manager = DeploymentManager(
             FakeExecutor({"a": "liburma-1.0", "b": "liburma-1.0"}),
             FakeWorkerClient(), store,
+            self.task_store, self.deploy_status, self.artifacts,
         )
         self.client = TestClient(create_app(self.manager, dist_dir=Path(self.tmpdir.name) / "dist"))
 
@@ -193,6 +203,60 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("kv-bench Manager", response.text)
         self.assertIn("npm run build", response.text)
+
+    def test_tasks_persist_across_manager_restart(self):
+        create = self.client.post("/v1/tasks", json={
+            "task_id": "persist-1",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        self.assertEqual(create.status_code, 201)
+        manager2 = DeploymentManager(
+            FakeExecutor({"a": "u", "b": "u"}), FakeWorkerClient(),
+            self.manager.node_store, self.task_store, self.deploy_status, self.artifacts,
+        )
+        client2 = TestClient(create_app(manager2, dist_dir=Path(self.tmpdir.name) / "dist"))
+        tasks = client2.get("/v1/tasks").json()
+        self.assertEqual([task["task_id"] for task in tasks], ["persist-1"])
+        self.assertEqual(tasks[0]["state"], "queued")
+        self.assertNotIn("password", str(tasks))
+
+    def test_task_logs_endpoint_saves_artifacts(self):
+        self.client.post("/v1/tasks", json={
+            "task_id": "lt1",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        response = self.client.get("/v1/tasks/lt1/logs")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["task_id"], "lt1")
+        self.assertIn("a", body["workers"])
+        self.assertEqual(body["workers"]["a"]["content"], "ok")  # FakeExecutor tail 输出
+        self.assertIn("logs collected", body["manager_log"])
+        result_dir = Path(self.tmpdir.name) / "runs" / "lt1"
+        self.assertTrue((result_dir / "logs" / "a.log").exists())
+        self.assertTrue((result_dir / "task.json").exists())
+        self.assertEqual(self.client.get("/v1/tasks/nope/logs").status_code, 404)
+
+    def test_nodes_include_deploy_status(self):
+        self.client.post("/v1/nodes", json={"name": "a", "ip": "10.0.0.1"})
+        deploy = self.client.post("/v1/deploy", json={
+            "nodes": [{"name": "a", "ip": "10.0.0.1"}],
+            "artifact": "build/kv-bench",
+            "destination": "/opt/kv-bench/build/kv-bench",
+            "source_dir": "/opt/kv-bench",
+            "umdk_root": "/opt/umdk",
+        })
+        self.assertEqual(deploy.status_code, 200)
+        nodes = self.client.get("/v1/nodes").json()
+        self.assertIsNotNone(nodes[0]["deploy"])
+        self.assertEqual(nodes[0]["deploy"]["worker_state"], "started")
+        self.assertEqual(nodes[0]["deploy"]["versions"], ["liburma-1.0"])
+        self.assertTrue(nodes[0]["deploy"]["consistent"])
+        # 部署状态持久化到磁盘
+        restored = DeployStatusStore(Path(self.tmpdir.name) / "deploy_status.json")
+        self.assertEqual(restored.get("a")["worker_state"], "started")
 
 
 if __name__ == "__main__":

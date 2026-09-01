@@ -136,13 +136,37 @@
     <el-divider v-if="result" content-position="left">原始 JSON</el-divider>
     <pre v-if="result" class="json-view">{{ JSON.stringify(result, null, 2) }}</pre>
     <el-empty v-else description="暂无结果（任务可能尚未完成或 worker 不可达）" :image-size="72" />
+
+    <el-divider content-position="left">日志（保存于 runs/{{ currentTask?.task_id }}）</el-divider>
+    <div class="log-toolbar">
+      <el-button size="small" :icon="Refresh" :loading="logsLoading" @click="loadLogs">刷新日志</el-button>
+      <span v-if="logs?.directory" class="muted">{{ logs.directory }}</span>
+    </div>
+    <template v-if="logs && (logWorkerNames.length || logs.manager_log)">
+      <el-tabs v-model="activeLogTab">
+        <el-tab-pane v-for="name in logWorkerNames" :key="name" :label="name" :name="name">
+          <el-alert
+            v-if="logs.workers[name]?.error"
+            title="日志拉取失败（SSH tail 出错）"
+            type="error"
+            :closable="false"
+            class="log-alert"
+          />
+          <pre class="json-view log-view">{{ logs.workers[name]?.content || '（无内容）' }}</pre>
+        </el-tab-pane>
+        <el-tab-pane v-if="logs.manager_log" label="manager 事件" name="__manager__">
+          <pre class="json-view log-view">{{ logs.manager_log }}</pre>
+        </el-tab-pane>
+      </el-tabs>
+    </template>
+    <el-empty v-else-if="logs" description="暂无日志（任务可能尚未启动）" :image-size="60" />
   </el-drawer>
 </template>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { DataLine, Delete, Plus, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import { DataLine, Delete, Plus, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 
 import {
   api,
@@ -153,6 +177,7 @@ import {
   type BenchItem,
   type Node,
   type Task,
+  type TaskLogs,
   type TaskResult,
 } from '@/api'
 
@@ -297,6 +322,11 @@ async function create() {
 const resultVisible = ref(false)
 const currentTask = ref<Task | null>(null)
 const result = ref<TaskResult | null>(null)
+const logs = ref<TaskLogs | null>(null)
+const logsLoading = ref(false)
+const activeLogTab = ref('')
+
+const logWorkerNames = computed(() => (logs.value ? Object.keys(logs.value.workers) : []))
 
 const workerRows = computed(() => {
   if (!result.value) return []
@@ -316,11 +346,29 @@ const workerStateType = (state: string): 'success' | 'warning' | 'danger' | 'inf
 async function showResult(task: Task) {
   currentTask.value = task
   result.value = null
+  logs.value = null
+  activeLogTab.value = ''
   resultVisible.value = true
   try {
     result.value = await api.taskResult(task.task_id)
   } catch (error) {
     ElMessage.error(errMsg(error))
+  }
+  await loadLogs()
+}
+
+async function loadLogs() {
+  if (!currentTask.value) return
+  logsLoading.value = true
+  try {
+    logs.value = await api.taskLogs(currentTask.value.task_id)
+    if (!activeLogTab.value && logWorkerNames.value.length) {
+      activeLogTab.value = logWorkerNames.value[0]
+    }
+  } catch (error) {
+    ElMessage.error(errMsg(error))
+  } finally {
+    logsLoading.value = false
   }
 }
 
@@ -398,5 +446,20 @@ onBeforeUnmount(() => {
 
 .metric-err {
   color: #dc2626;
+}
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.log-alert {
+  margin-bottom: 8px;
+}
+
+.log-view {
+  max-height: 420px;
 }
 </style>

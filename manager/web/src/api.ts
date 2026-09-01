@@ -12,6 +12,16 @@ export interface Node {
   binary: string
   api_port: number
   tags: string[]
+  deploy?: NodeDeployStatus | null
+}
+
+export interface NodeDeployStatus {
+  deployed_at: string
+  artifact: string
+  destination: string
+  versions: string[]
+  consistent: boolean
+  worker_state: string
 }
 
 export interface NodeInput extends Node {
@@ -58,6 +68,13 @@ export interface TaskResult {
   }
 }
 
+export interface TaskLogs {
+  task_id: string
+  directory: string
+  workers: Record<string, { content: string; error: boolean }>
+  manager_log: string
+}
+
 export interface DeployPayload {
   nodes: NodeInput[]
   artifact: string
@@ -94,6 +111,8 @@ export const api = {
   stopTask: async (id: string) => (await http.post(`/v1/tasks/${encodeURIComponent(id)}/stop`)).data,
   taskResult: async (id: string): Promise<TaskResult> =>
     (await http.get(`/v1/tasks/${encodeURIComponent(id)}/result`)).data,
+  taskLogs: async (id: string): Promise<TaskLogs> =>
+    (await http.get(`/v1/tasks/${encodeURIComponent(id)}/logs`)).data,
 }
 
 /** 归一化 axios / 后端错误消息（后端统一返回 {"error": ...}）。 */

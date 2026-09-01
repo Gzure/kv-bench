@@ -126,7 +126,12 @@ def create_app(manager: DeploymentManager, dist_dir: str | Path | None = None) -
     @app.get("/v1/workers", summary="节点列表（别名）")
     def list_nodes() -> list[dict[str, Any]]:
         nodes = manager.node_store.list() if manager.node_store else []
-        return [node_dict(node) for node in nodes]
+        result = []
+        for node in nodes:
+            item = node_dict(node)
+            item["deploy"] = manager.deploy_status.get(node.name) if manager.deploy_status else None
+            result.append(item)
+        return result
 
     @app.post("/v1/nodes", status_code=201, summary="保存节点")
     def save_node(payload: NodeIn) -> dict[str, str]:
@@ -194,6 +199,10 @@ def create_app(manager: DeploymentManager, dist_dir: str | Path | None = None) -
     @app.get("/v1/tasks/{task_id}/result", summary="任务聚合结果")
     def task_result(task_id: str) -> dict[str, Any]:
         return manager.collect_result(task_id)
+
+    @app.get("/v1/tasks/{task_id}/logs", summary="任务日志（拉取并落盘到 runs/{task_id}/）")
+    def task_logs(task_id: str) -> dict[str, Any]:
+        return manager.collect_logs(task_id)
 
     # ---- frontend ---------------------------------------------------------
 

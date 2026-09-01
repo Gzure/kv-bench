@@ -14,12 +14,27 @@ import subprocess
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
 
 try:
     import httpx
 except ImportError:  # domain layer stays usable without third-party deps
     httpx = None
+
+#: worker 端 nohup 日志路径（deploy 时写入，日志拉取从这里 tail）
+WORKER_LOG_PATH = "/var/log/kv-bench-worker.log"
+
+
+def atomic_write_json(path: str | os.PathLike[str], data: Any) -> None:
+    """原子写 JSON：临时文件 + os.replace，避免写一半损坏。"""
+    path = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    temporary = os.path.join(directory, f".{os.path.basename(path)}.tmp")
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+    os.replace(temporary, path)
 
 
 @dataclass(frozen=True)
@@ -57,12 +72,7 @@ class NodeStore:
                 self._nodes = {entry["name"]: Node(**entry) for entry in json.load(stream)}
 
     def _save(self) -> None:
-        directory = os.path.dirname(os.path.abspath(self.path)) or "."
-        temporary = os.path.join(directory, f".{os.path.basename(self.path)}.tmp")
-        with open(temporary, "w", encoding="utf-8") as stream:
-            json.dump([asdict(node) for node in self.list()], stream, indent=2)
-            stream.write("\n")
-        os.replace(temporary, self.path)
+        atomic_write_json(self.path, [asdict(node) for node in self.list()])
 
     def upsert(self, node: Node) -> None:
         with self._lock:
@@ -81,6 +91,142 @@ class NodeStore:
 
     def list(self) -> list[Node]:
         return sorted(self._nodes.values(), key=lambda node: node.name)
+
+
+class TaskStore:
+    """任务状态持久化（tasks.json）：manager 重启后任务与状态不丢。"""
+
+    def __init__(self, path: str | os.PathLike[str] = "tasks.json"):
+        self.path = os.fspath(path)
+        self._lock = threading.Lock()
+        self._tasks: dict[str, TaskSpec] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        with open(self.path, encoding="utf-8") as stream:
+            for entry in json.load(stream):
+                task = TaskSpec(
+                    task_id=entry["task_id"],
+                    workers={name: Node(**worker) for name, worker in entry["workers"].items()},
+                    bench_items=[BenchItem(**item) for item in entry["bench_items"]],
+                    options=entry.get("options", {}),
+                    state=entry.get("state", "queued"),
+                    result=entry.get("result", {}),
+                )
+                self._tasks[task.task_id] = task
+
+    def _save(self) -> None:
+        # 调用方已持有 self._lock（upsert 内），直接遍历，避免重入死锁
+        atomic_write_json(self.path, [asdict(task) for task in self._tasks.values()])
+
+    def upsert(self, task: TaskSpec) -> None:
+        with self._lock:
+            self._tasks[task.task_id] = task
+            self._save()
+
+    def values(self) -> list[TaskSpec]:
+        with self._lock:
+            return list(self._tasks.values())
+
+
+class DeployStatusStore:
+    """节点部署状态持久化（deploy_status.json）。"""
+
+    def __init__(self, path: str | os.PathLike[str] = "deploy_status.json"):
+        self.path = os.fspath(path)
+        self._lock = threading.Lock()
+        self._status: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if os.path.exists(self.path):
+            with open(self.path, encoding="utf-8") as stream:
+                self._status = json.load(stream)
+
+    def _save(self) -> None:
+        atomic_write_json(self.path, self._status)
+
+    def update(self, name: str, **fields: Any) -> None:
+        with self._lock:
+            self._status[name] = {**self._status.get(name, {}), **fields}
+            self._save()
+
+    def get(self, name: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._status.get(name)
+
+    def all(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return dict(self._status)
+
+
+class RunArtifacts:
+    """任务运行产物目录 runs/{task_id}/：结果、任务快照、worker 日志、事件日志。"""
+
+    def __init__(self, base_dir: str | os.PathLike[str] = "runs"):
+        self.base = os.fspath(base_dir)
+
+    def directory(self, task_id: str) -> str:
+        return os.path.join(self.base, task_id)
+
+    def _ensure(self, task_id: str) -> str:
+        directory = self.directory(task_id)
+        os.makedirs(directory, exist_ok=True)
+        return directory
+
+    def save_task(self, task: TaskSpec) -> None:
+        directory = self._ensure(task.task_id)
+        atomic_write_json(os.path.join(directory, "task.json"), asdict(task))
+
+    def save_result(self, task: TaskSpec, result: dict[str, Any]) -> None:
+        directory = self._ensure(task.task_id)
+        atomic_write_json(os.path.join(directory, "result.json"), result)
+        atomic_write_json(os.path.join(directory, "task.json"), asdict(task))
+
+    def append_event(self, task_id: str, event: str) -> None:
+        directory = self._ensure(task_id)
+        with open(os.path.join(directory, "manager.log"), "a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now().isoformat(timespec='seconds')}  {event}\n")
+
+    def fetch_logs(self, executor: Executor, task: TaskSpec) -> dict[str, str]:
+        """SSH tail 各 worker 的 kv-bench 日志到 logs/{worker}.log（失败写 .error）。"""
+        directory = self._ensure(task.task_id)
+        logs_dir = os.path.join(directory, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        collected: dict[str, str] = {}
+        for name, node in task.workers.items():
+            try:
+                content = executor.run(node, ["tail", "-n", "500", WORKER_LOG_PATH])
+                suffix = "log"
+            except Exception as error:
+                content = f"[log fetch failed: {error}]"
+                suffix = "error"
+            path = os.path.join(logs_dir, f"{name}.{suffix}")
+            with open(path, "w", encoding="utf-8", errors="replace") as stream:
+                stream.write(content)
+            collected[name] = content
+        return collected
+
+    def read_logs(self, task_id: str) -> dict[str, Any]:
+        """读取已保存的日志：{workers: {name: {content, error}}, manager_log}。"""
+        directory = self.directory(task_id)
+        workers: dict[str, Any] = {}
+        logs_dir = os.path.join(directory, "logs")
+        if os.path.isdir(logs_dir):
+            for entry in sorted(os.listdir(logs_dir)):
+                name, _, suffix = entry.rpartition(".")
+                if suffix not in {"log", "error"}:
+                    continue
+                with open(os.path.join(logs_dir, entry), encoding="utf-8", errors="replace") as stream:
+                    workers[name] = {"content": stream.read(), "error": suffix == "error"}
+        manager_log = ""
+        log_path = os.path.join(directory, "manager.log")
+        if os.path.isfile(log_path):
+            with open(log_path, encoding="utf-8", errors="replace") as stream:
+                manager_log = stream.read()
+        return {"workers": workers, "manager_log": manager_log}
 
 
 @dataclass(frozen=True)
@@ -191,12 +337,30 @@ class HttpWorkerClient:
 
 
 class DeploymentManager:
-    def __init__(self, executor: Executor, worker_client: WorkerClient | None = None, node_store: NodeStore | None = None):
+    def __init__(
+        self,
+        executor: Executor,
+        worker_client: WorkerClient | None = None,
+        node_store: NodeStore | None = None,
+        task_store: TaskStore | None = None,
+        deploy_status: DeployStatusStore | None = None,
+        artifacts: RunArtifacts | None = None,
+    ):
         self.executor = executor
         self.worker_client = worker_client
         self.node_store = node_store
+        self.task_store = task_store
+        self.deploy_status = deploy_status
+        self.artifacts = artifacts
         self.tasks: dict[str, TaskSpec] = {}
         self._lock = threading.Lock()
+        if task_store is not None:  # 恢复已持久化的任务
+            for task in task_store.values():
+                self.tasks[task.task_id] = task
+
+    def _event(self, task_id: str, message: str) -> None:
+        if self.artifacts is not None:
+            self.artifacts.append_event(task_id, message)
 
     def urma_packages(self, node: Node) -> tuple[str, ...]:
         # Equivalent to: rpm -qa | grep urma. Filtering locally avoids shell
@@ -227,7 +391,17 @@ class DeploymentManager:
         check = self.ensure_urma_consistency(nodes, source_dir, umdk_root)
         for node in nodes:
             self.executor.copy(node, artifact, destination)
-            self.executor.run(node, ["sh", "-lc", f"nohup {shlex.quote(destination)} --worker --worker-port={node.api_port} >/var/log/kv-bench-worker.log 2>&1 &"])
+            self.executor.run(node, ["sh", "-lc", f"nohup {shlex.quote(destination)} --worker --worker-port={node.api_port} >{WORKER_LOG_PATH} 2>&1 &"])
+            if self.deploy_status is not None:
+                self.deploy_status.update(
+                    node.name,
+                    deployed_at=datetime.now().isoformat(timespec="seconds"),
+                    artifact=artifact,
+                    destination=destination,
+                    versions=list(check.versions.get(node.name, ())),
+                    consistent=check.consistent or check.versions.get(node.name) == check.reference,
+                    worker_state="started",
+                )
         return check
 
     def build_commands(self, task: TaskSpec) -> list[str]:
@@ -266,6 +440,7 @@ class DeploymentManager:
             if task.task_id in self.tasks:
                 raise ValueError("task already exists")
             self.tasks[task.task_id] = task
+        self._persist_task(task, "created")
         return task
 
     def start_task(self, task_id: str) -> list[str]:
@@ -280,7 +455,8 @@ class DeploymentManager:
                         self.worker_client.start(task.workers[node_name], task.task_id, shlex.split(command))
             commands = [command for values in assignments.values() for command in values]
             task.state = "running"
-            return commands
+        self._persist_task(task, "started")
+        return commands
 
     def stop_task(self, task_id: str) -> None:
         with self._lock:
@@ -289,6 +465,7 @@ class DeploymentManager:
                 for node in task.workers.values():
                     self.worker_client.stop(node, task_id)
             task.state = "stopped"
+        self._persist_task(task, "stopped")
 
     def collect_result(self, task_id: str) -> dict[str, Any]:
         with self._lock:
@@ -308,7 +485,29 @@ class DeploymentManager:
             total["iops"] = total["ops"] / duration
             total["bandwidth_mb_s"] = total["bytes"] / duration / 1_000_000
             task.result = {"workers": workers, "aggregate": total}
-            return task.result
+        self._persist_task(task, "result collected")
+        if self.artifacts is not None:
+            self.artifacts.save_result(task, task.result)
+        return task.result
+
+    def collect_logs(self, task_id: str) -> dict[str, Any]:
+        """SSH 拉取各 worker 日志并落盘，返回已保存的日志内容。"""
+        with self._lock:
+            task = self.tasks[task_id]
+        if self.artifacts is None:
+            return {"task_id": task_id, "directory": "", "workers": {}, "manager_log": ""}
+        collected = self.artifacts.fetch_logs(self.executor, task)
+        self._event(task_id, f"logs collected: {', '.join(collected)}")
+        data = self.artifacts.read_logs(task_id)
+        data.update(task_id=task_id, directory=self.artifacts.directory(task_id))
+        return data
+
+    def _persist_task(self, task: TaskSpec, event: str) -> None:
+        if self.task_store is not None:
+            self.task_store.upsert(task)
+        if self.artifacts is not None:
+            self._event(task.task_id, event)
+            self.artifacts.save_task(task)
 
 
 def serve(host: str, port: int) -> None:
@@ -316,7 +515,10 @@ def serve(host: str, port: int) -> None:
     from .api import create_app
     import uvicorn
 
-    manager = DeploymentManager(SshExecutor(), HttpWorkerClient(), NodeStore())
+    manager = DeploymentManager(
+        SshExecutor(), HttpWorkerClient(), NodeStore(),
+        TaskStore(), DeployStatusStore(), RunArtifacts(),
+    )
     uvicorn.run(create_app(manager), host=host, port=port)
 
 
