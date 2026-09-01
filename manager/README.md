@@ -117,6 +117,8 @@ manager 调用 worker API：
   并落盘到 `runs/{task_id}/result.json`。
 - `GET /v1/tasks/{id}/logs`：SSH `tail` 各 worker 的 `/var/log/kv-bench-worker.log`
   并保存到 `runs/{task_id}/logs/{worker}.log`（拉取失败写 `.error`），返回日志内容。
+  kv-bench 的 `main()` 已对 stdout 设置行缓冲（`setvbuf(_IOLBF)`），
+  printf 的区间统计/summary 实时落盘，任务期间即可 tail 到。
 - worker `GET /v1/health`：查看 worker 本地运行中的 kv-bench 任务。
 
 `options` 覆盖 kv-bench 全部打流参数（`_` 转 `-` 后透传为 CLI 参数）：

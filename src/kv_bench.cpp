@@ -2875,6 +2875,11 @@ static int run_chip_query(const argument_t *args) {
 }
 
 int main(int argc, char *argv[]) {
+  /* 重定向到文件（nohup worker 日志 /var/log/kv-bench-worker.log）时，
+   * glibc 默认对 stdout 块缓冲（4KB），printf 的区间统计/summary 要等
+   * 缓冲满或进程退出才落盘，manager SSH tail 收集不到实时日志；
+   * 改为行缓冲：每条 printf 立即写入日志文件。 */
+  setvbuf(stdout, NULL, _IOLBF, 0);
   kv_clock_init(); /* 周期计数器校准：必须在任何计时/建线程之前 */
   argument_t args{};
   int ret;

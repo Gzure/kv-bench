@@ -84,7 +84,12 @@
             <div class="option-group-title">{{ group }}</div>
             <div class="option-grid">
               <div v-for="field in fieldsByGroup(group)" :key="field.key" class="option-item">
-                <label :title="field.hint ?? ''">{{ field.label }}</label>
+                <div class="option-label">
+                  <label>{{ field.label }}</label>
+                  <el-tooltip v-if="field.hint" :content="field.hint" placement="top" :show-after="120" :enterable="false">
+                    <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                  </el-tooltip>
+                </div>
                 <el-select v-if="field.type === 'select'" v-model="createForm.options[field.key]" clearable class="full">
                   <el-option v-for="opt in field.options ?? []" :key="opt.value" :value="opt.value" :label="opt.label" />
                 </el-select>
@@ -173,7 +178,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { DataLine, Delete, Plus, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import { DataLine, Delete, Plus, QuestionFilled, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 
 import {
   api,
@@ -474,6 +479,24 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.option-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.help-icon {
+  color: #94a3b8;
+  cursor: help;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.help-icon:hover {
+  color: var(--el-color-primary);
 }
 
 .metric-grid {
