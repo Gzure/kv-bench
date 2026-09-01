@@ -217,6 +217,7 @@ done
 | 参数 | 说明 |
 | --- | --- |
 | `--write-size <bytes>` | write 每次 send 的字节数，拆 2 条 WR（默认 8M；如 16M→2×8M、4M→2×2M、64K→2×32K）。须为 8K 倍数，两端须一致 |
+| `--sends-per-req <n>` | 每请求 send 数（默认 10，1..10）。每个 send 拆 2 条 WR 共用 jetty，仅 write/get pipeline 生效，mixed 不受影响。两端须一致 |
 | `--chip-weight W1:W2` | affinity 模式 chip1:chip2 权重（默认 1:1=5+5 交替；如 7:3、2:8）。加权轮询打散，仅 affinity 生效，与 `--single-chip` 互斥 |
 | `--read-size <bytes>` | get/旧 mirror 模型每 WR 载荷（默认 4M） |
 | `--trans-mode` | 0=RM(默认) 1=RC 2=UM 3=RS |

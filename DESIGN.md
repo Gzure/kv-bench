@@ -123,7 +123,7 @@ client                                  server
 3. `import_seg` 对端 segment（`peer.seg`）。
 4. 握手读/写均**阻塞无超时**（`connect` 阻塞等待内核握手；`SockSyncData` read 循环无限等待，对端关闭连接时报 `peer closed`）。
 
-**握手参数**（`HandshakeParams`）：threads / opCode / dualMode / readSize / writeSize / dstChip / transMode，随 TCP 发送。
+**握手参数**（`HandshakeParams`）：threads / opCode / dualMode / readSize / writeSize / sendsPerReq / dstChip / transMode，随 TCP 发送。
 
 ---
 
