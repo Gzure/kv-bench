@@ -369,7 +369,7 @@ class DeploymentManager:
         return tuple(sorted(line.strip() for line in output.splitlines() if "urma" in line.lower()))
 
     def ensure_urma_consistency(
-        self, nodes: list[Node], source_dir: str, umdk_root: str
+        self, nodes: list[Node], source_dir: str, umdk_root: str | None
     ) -> VersionCheck:
         versions = {node.name: self.urma_packages(node) for node in nodes}
         reference = next(iter(versions.values()), ())
@@ -380,11 +380,14 @@ class DeploymentManager:
                     self.compile_node(node, source_dir, umdk_root)
         return result
 
-    def compile_node(self, node: Node, source_dir: str, umdk_root: str) -> None:
-        self.executor.run(node, ["cmake", "-S", source_dir, "-B", f"{node.workdir}/build", f"-DUMDK_ROOT={umdk_root}"])
+    def compile_node(self, node: Node, source_dir: str, umdk_root: str | None) -> None:
+        configure = ["cmake", "-S", source_dir, "-B", f"{node.workdir}/build"]
+        if umdk_root:  # 未配置 UMDK_ROOT 时不加 -D，走系统/环境默认查找
+            configure.append(f"-DUMDK_ROOT={umdk_root}")
+        self.executor.run(node, configure)
         self.executor.run(node, ["cmake", "--build", f"{node.workdir}/build", "-j"])
 
-    def deploy(self, nodes: list[Node], artifact: str, destination: str, source_dir: str, umdk_root: str) -> VersionCheck:
+    def deploy(self, nodes: list[Node], artifact: str, destination: str, source_dir: str, umdk_root: str | None) -> VersionCheck:
         if self.node_store is not None:
             for node in nodes:
                 self.node_store.upsert(node)

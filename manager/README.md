@@ -90,6 +90,9 @@ API 文档（Swagger UI）在 `http://manager:18080/docs`。
 }
 ```
 
+`umdk_root` 可选：留空（或省略）时，不一致节点的编译命令不加 `-DUMDK_ROOT`，
+由 cmake 走系统/环境默认查找 URMA。
+
 响应 `{versions, consistent, reference}`：各节点 URMA 包版本、是否一致、参考版本。
 
 ### 任务

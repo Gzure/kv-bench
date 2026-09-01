@@ -81,7 +81,7 @@ class DeployIn(BaseModel):
     artifact: str
     destination: str
     source_dir: str
-    umdk_root: str
+    umdk_root: str = Field(default="", description="UMDK 根目录；留空则编译时不加 -DUMDK_ROOT")
 
 
 # ---------------------------------------------------------------------------

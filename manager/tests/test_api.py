@@ -146,6 +146,17 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["consistent"])
         self.assertEqual(body["versions"]["a"], ["liburma-1.0"])
 
+    def test_deploy_without_umdk_root_is_optional(self):
+        response = self.client.post("/v1/deploy", json={
+            "nodes": [{"name": "a", "ip": "10.0.0.1"}],
+            "artifact": "build/kv-bench",
+            "destination": "/opt/kv-bench/build/kv-bench",
+            "source_dir": "/opt/kv-bench",
+            # 省略 umdk_root -> 编译时（若有）不加 -DUMDK_ROOT
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["consistent"])
+
     def test_task_lifecycle_and_result(self):
         create = self.client.post("/v1/tasks", json={
             "task_id": "t1",

@@ -86,6 +86,17 @@ class ManagerTests(unittest.TestCase):
         compile_calls = [call for call in executor.calls if "cmake" in call[-1]]
         self.assertEqual([call[0] for call in compile_calls], ["b", "b"])
 
+    def test_compile_node_without_umdk_root_omits_flag(self):
+        executor = FakeExecutor({"a": "u"})
+        manager = DeploymentManager(executor)
+        manager.compile_node(Node("a", "10.0.0.1"), "/opt/kv-bench", "")
+        configure = executor.calls[0][1]
+        self.assertEqual(configure[0], "cmake")
+        self.assertNotIn("-DUMDK_ROOT", configure)
+        manager.compile_node(Node("a", "10.0.0.1"), "/opt/kv-bench", "/opt/umdk")
+        configure_with = executor.calls[2][1]
+        self.assertIn("-DUMDK_ROOT=/opt/umdk", configure_with)
+
     def test_manager_controls_workers_through_worker_api(self):
         client = FakeWorkerClient()
         manager = DeploymentManager(FakeExecutor({"a": "u", "b": "u"}), client)

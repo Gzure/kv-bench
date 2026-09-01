@@ -17,8 +17,8 @@
       <el-form-item label="源码目录" required>
         <el-input v-model="form.source_dir" placeholder="/opt/kv-bench" />
       </el-form-item>
-      <el-form-item label="UMDK 根目录" required>
-        <el-input v-model="form.umdk_root" placeholder="/opt/umdk" />
+      <el-form-item label="UMDK 根目录">
+        <el-input v-model="form.umdk_root" placeholder="留空则编译时不加 -DUMDK_ROOT（走系统/环境默认）" />
       </el-form-item>
       <el-form-item label="按标签筛选">
         <el-select v-model="tagFilter" multiple clearable placeholder="选择标签后仅显示匹配节点（任一匹配）" class="full">
@@ -103,7 +103,7 @@ const form = reactive({
   artifact: 'build/kv-bench',
   destination: '/opt/kv-bench/build/kv-bench',
   source_dir: '/opt/kv-bench',
-  umdk_root: '/opt/umdk',
+  umdk_root: '',
 })
 
 const allTags = computed(() => collectTags(nodes.value))
