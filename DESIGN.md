@@ -100,7 +100,7 @@ struct WireInfo {                 // __attribute__((packed))
   uint32_t        threads;        // 打流线程数
   uint32_t        op_code;        // write/get/mixed
   uint32_t        dual_mode;      // mirror/split
-  uint32_t        value_size;
+  uint32_t        read_size;
   uint32_t        dst_chip;       // 本进程数据落地目的 chip
   uint32_t        reserved[2];
 };
@@ -123,7 +123,7 @@ client                                  server
 3. `import_seg` 对端 segment（`peer.seg`）。
 4. 握手读/写均**阻塞无超时**（`connect` 阻塞等待内核握手；`SockSyncData` read 循环无限等待，对端关闭连接时报 `peer closed`）。
 
-**握手参数**（`HandshakeParams`）：threads / opCode / dualMode / valueSize / dstChip / transMode，随 TCP 发送。
+**握手参数**（`HandshakeParams`）：threads / opCode / dualMode / readSize / writeSize / dstChip / transMode，随 TCP 发送。
 
 ---
 
@@ -185,7 +185,7 @@ client                                  server
 
 ### 6.3 get（Get）—— 客户端直接 READ
 
-客户端发起 `URMA_OPC_READ` WR（`PostRead`，src/dst sge 对调：src=服务器段、dst=本地读缓冲），从服务器数据区读 `value-size` 字节到本地，CQE 完成记一次时延。服务器仅为数据源（预置数据），无回写线程：
+客户端发起 `URMA_OPC_READ` WR（`PostRead`，src/dst sge 对调：src=服务器段、dst=本地读缓冲），从服务器数据区读 `read-size` 字节到本地，CQE 完成记一次时延。服务器仅为数据源（预置数据），无回写线程：
 
 ```
 客户端打流线程:
@@ -264,7 +264,7 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
          [-i/--server-ip <ip>]          # 有 = client；无 = server
          [-p/--server-port <port>]      # 默认 13857
          [-e/--event-mode]              # wait_jfc/ack/rearm 事件模式
-         [--value-size <bytes>]         # 默认 4M
+         [--read-size <bytes>]         # 默认 4M
          [--qps <n>]                    # 请求/秒；0 = 全速
          [--duration <sec>]             # 默认 10
          [--jetty-count <n>]            # 1..200，默认 1；池 = max(count, threads)

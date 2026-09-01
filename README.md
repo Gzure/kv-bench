@@ -73,26 +73,26 @@ kv_bench 打流线程
 
 ```bash
 ./build/kv-bench --dev-name bonding0 --server-port 13857 \
-  --send-size 8M --jetty-count 16 --affinity-mode affinity --destination-cpus 8,9
+  --write-size 8M --jetty-count 16 --affinity-mode affinity --destination-cpus 8,9
 ```
 
 客户端（write 带宽/时延）：
 
 ```bash
 ./build/kv-bench --dev-name bonding0 --server-ip 10.0.0.20 --server-port 13857 \
-  --send-size 8M --threads 16 --qps 0 --duration 30 \
+  --write-size 8M --threads 16 --qps 0 --duration 30 \
   --jetty-count 16 --affinity-mode affinity --source-cpus 4,5 --destination-cpus 8,9
 ```
 
-两 die 不均场景（`--chip-weight 7:3`，仅 affinity 模式；两端 send-size 须一致）：
+两 die 不均场景（`--chip-weight 7:3`，仅 affinity 模式；两端 write-size 须一致）：
 
 ```bash
 # 服务端
-./build/kv-bench --dev-name bonding0 --server-port 13857 --send-size 16M \
+./build/kv-bench --dev-name bonding0 --server-port 13857 --write-size 16M \
   --affinity-mode affinity --chip-weight 7:3 --destination-cpus 8,9
 # 客户端
 ./build/kv-bench --dev-name bonding0 --server-ip 10.0.0.20 --server-port 13857 \
-  --send-size 16M --threads 16 --qps 0 --duration 30 \
+  --write-size 16M --threads 16 --qps 0 --duration 30 \
   --affinity-mode affinity --chip-weight 7:3 --source-cpus 4,5 --destination-cpus 8,9
 ```
 
@@ -101,19 +101,19 @@ kv_bench 打流线程
 
 ## 打流模型（write：请求级流水线重叠）
 
-**一个 KV 请求 = 同一 local `send-size` buffer 写入 remote `send-size`×10**（10 个
-连续且不重叠的 `send-size` 区间；chip 分配按 `--chip-weight` 加权打散，默认 1:1 = 5+5
-交替），**每次发送拆 2 条 `send-size/2` WR，两条 WR 共用一个 jetty**（10 个 jetty、20 条
+**一个 KV 请求 = 同一 local `write-size` buffer 写入 remote `write-size`×10**（10 个
+连续且不重叠的 `write-size` 区间；chip 分配按 `--chip-weight` 加权打散，默认 1:1 = 5+5
+交替），**每次发送拆 2 条 `write-size/2` WR，两条 WR 共用一个 jetty**（10 个 jetty、20 条
 WR/请求）。**20 条 WR 连续全部 post（不等 CQE）；请求之间不等前一个完成（重叠）**，在飞请求 ≤
-`--concurrency`（各占 local `send-size` + remote `send-size`×10），完成一个补发一个：
+`--concurrency`（各占 local `write-size` + remote `write-size`×10），完成一个补发一个：
 
-- `--send-size <bytes>`：每次 send 的字节数（默认 8M），拆 2 条 `send-size/2` WR。
+- `--write-size <bytes>`：每次 send 的字节数（默认 8M），拆 2 条 `write-size/2` WR。
   例如 `16M`→2×8M、`4M`→2×2M、`64K`→2×32K。须为 `2*PAGE_SIZE`（8K）倍数。
 - `--chip-weight W1:W2`：affinity 模式两 die 权重（默认 `1:1`=5+5 交替），按
   Bresenham 加权轮询打散分配（如 `7:3` → chip2 打散在 idx 1/5/8，非连续 7 个 chip1）。
   `10:0`/`0:10` 等价 `--single-chip`；仅 affinity 模式生效，anti/none 传则 warning 忽略。
 - 时延 = **第 1 条 WR post → 最后一条 CQE**（`request latency`）。
-- 带宽 = **`send-size`×10 传输字节/请求**（同一 `send-size` 数据发 10 次）。
+- 带宽 = **`write-size`×10 传输字节/请求**（同一 `write-size` 数据发 10 次）。
 - **`--concurrency`**：在飞请求数（1..10，重叠度）。
 - **`--single-chip 1|2`**：单 chip 场景——所有发送固定走该 chip（src==dst），
   `--mbind` 时缓冲绑到该 chip 对应的 NUMA 节点（测单 chip 极限 + 内存亲和）。与
@@ -125,14 +125,14 @@ WR/请求）。**20 条 WR 连续全部 post（不等 CQE）；请求之间不�
    ┌─────────────────────────── 主循环 ───────────────────────────┐
    │                                                              │
    │  ① 收完成：ProbeEvent 扫描在飞槽，20 条 WR 全完成 → 请求完成    │
-   │     (bytes += send-size×10, 记 request latency, 释放 10 jetty)│
+   │     (bytes += write-size×10, 记 request latency, 释放 10 jetty)│
    │                    │                                         │
    │                    ▼                                         │
    │  ② 发送：在飞请求 < N 且池有 jetty → post 新请求                │
-   │     ┌─ post_one_req：local send-size 写 remote send-size×10 ┐│
+   │     ┌─ post_one_req：local write-size 写 remote write-size×10 ┐│
    │     │  for wr in 0..19:                                      │
    │     │    每个 send 取 1 个 jetty（共 10 个）                 │
-   │     │    PostEvent + PostWrite(send-size/2, chip=加权打散)   │
+   │     │    PostEvent + PostWrite(write-size/2, chip=加权打散)   │
    │     │    （20 条 WR 连续 post，不等 CQE）                     │
    │     └───────────────────────────────────────────────────────┘│
    └───────────────┬───────────────────────────────▲──────────────┘
@@ -145,14 +145,14 @@ WR/请求）。**20 条 WR 连续全部 post（不等 CQE）；请求之间不�
       r1:   |======= 20 WR =======|
       r2:     |======= 20 WR =======|
       r3:       |======= 20 WR =======|
-  在飞: 4 个请求 × 20 WR = 80 条 WR（local 4×send-size，remote 4×send-size×10）
+  在飞: 4 个请求 × 20 WR = 80 条 WR（local 4×write-size，remote 4×write-size×10）
   完成: r0 完成 → 释放 → 补发 r4（窗口恒 4 请求）
 ```
 
 ## 操作类型
 
 - `--op write`（Put，默认）：客户端分片流水线直写服务器内存（上述模型）。
-- `--op get`（Get）：客户端**直接 READ 服务器数据区**（`URMA_OPC_READ`，一次读 `value-size`
+- `--op get`（Get）：客户端**直接 READ 服务器数据区**（`URMA_OPC_READ`，一次读 `read-size`
   字节到本地读缓冲），CQE 完成记一次时延。服务器仅为数据源（预置数据），无回写线程。
 - `--op mixed`：按 `--mixed-ratio`（write 占比%）混合（write 部分沿用旧的 mirror 双 WR 模型）。
 
@@ -182,7 +182,7 @@ EINVAL 警告后继续）。
   打流线程争抢）。
 - `--report-interval <s>` 周期打印瞬时 IOPS/带宽，以及该周期内完成请求的
   request 和 WR 的 `avg/min/p50/p90/p99/p999/p9999/pmax` 时延。WR 时延为
-  每条 WR（`send-size/2`）从自身 post 到 CQE 被确认的时间。
+  每条 WR（`write-size/2`）从自身 post 到 CQE 被确认的时间。
 - 汇总行含 requests/IOPS/WR 速率（write = 20×IOPS，get = 1×IOPS）/带宽（MB/s）/errors。
 
 ```text
@@ -204,21 +204,21 @@ wr latency(us): samples=18000000 avg=2180.12 min=901.12 p50=2105.34 p90=2511.87 
 ```bash
 for n in 1 2 4 8 16 32 64 128 200; do
   ./build/kv-bench --dev-name bonding0 --server-ip 10.0.0.20 \
-    --server-port 13857 --send-size 8M --jetty-count "$n" \
+    --server-port 13857 --write-size 8M --jetty-count "$n" \
     --qps 0 --duration 30 --affinity-mode affinity \
     --source-cpus 4,5 | tee result-$n.txt
 done
 ```
 
-池大小自动取 `max(jetty_count, threads, 10×并发度)`；每个 send 的两条 WR（`send-size/2`）共用一个 jetty，因此每个请求占用 10 个 jetty。
+池大小自动取 `max(jetty_count, threads, 10×并发度)`；每个 send 的两条 WR（`write-size/2`）共用一个 jetty，因此每个请求占用 10 个 jetty。
 
 ## 其它参数
 
 | 参数 | 说明 |
 | --- | --- |
-| `--send-size <bytes>` | write 每次 send 的字节数，拆 2 条 WR（默认 8M；如 16M→2×8M、4M→2×2M、64K→2×32K）。须为 8K 倍数，两端须一致 |
+| `--write-size <bytes>` | write 每次 send 的字节数，拆 2 条 WR（默认 8M；如 16M→2×8M、4M→2×2M、64K→2×32K）。须为 8K 倍数，两端须一致 |
 | `--chip-weight W1:W2` | affinity 模式 chip1:chip2 权重（默认 1:1=5+5 交替；如 7:3、2:8）。加权轮询打散，仅 affinity 生效，与 `--single-chip` 互斥 |
-| `--value-size <bytes>` | get/旧 mirror 模型每 WR 载荷（默认 4M） |
+| `--read-size <bytes>` | get/旧 mirror 模型每 WR 载荷（默认 4M） |
 | `--trans-mode` | 0=RM(默认) 1=RC 2=UM 3=RS |
 | `--import-rtp` | import 对端 jetty 走普通 RTP 路径（默认 bondp/CTP；版本不匹配导致 bondp 崩溃时的绕行） |
 | `--event-mode` | 使用 wait_jfc/ack/rearm 事件模式而非忙轮询 |
