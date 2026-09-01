@@ -113,7 +113,7 @@ const dialogVisible = ref(false)
 const existingTags = computed(() => collectTags(nodes.value))
 
 const deployTip = (deploy: NodeDeployStatus): string =>
-  `部署于 ${deploy.deployed_at}\n${deploy.destination}\nURMA: ${deploy.versions.join(', ') || '—'}\n一致性: ${deploy.consistent ? '一致' : '不一致'}`
+  `部署于 ${deploy.deployed_at}\n${deploy.destination}\nURMA: ${deploy.versions.join(', ') || '—'}\n一致性: ${deploy.consistent ? '一致' : '不一致'}\nworker: ${deploy.worker_state}`
 
 const form = reactive<NodeInput>({
   name: '',

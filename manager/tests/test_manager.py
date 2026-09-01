@@ -29,6 +29,9 @@ class FakeWorkerClient:
         self.started = []
         self.stopped = []
 
+    def health(self, node):
+        return {"state": "ready"}
+
     def start(self, node, task_id, command):
         self.started.append((node.name, task_id, command))
 

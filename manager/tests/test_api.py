@@ -53,6 +53,9 @@ class FakeWorkerClient:
         self.started = []
         self.stopped = []
 
+    def health(self, node):
+        return {"state": "ready"}
+
     def start(self, node, task_id, command):
         self.started.append((node.name, task_id, command))
 
@@ -61,6 +64,11 @@ class FakeWorkerClient:
 
     def result(self, node, task_id):
         return {"state": "ready", "ops": 10 if node.name == "a" else 20, "bytes": 100, "errors": 1}
+
+
+class DownWorkerClient(FakeWorkerClient):
+    def health(self, node):
+        raise RuntimeError("worker down")
 
 
 @unittest.skipUnless(HAVE_FASTAPI, "fastapi/httpx not installed")
@@ -285,12 +293,31 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(deploy.status_code, 200)
         nodes = self.client.get("/v1/nodes").json()
         self.assertIsNotNone(nodes[0]["deploy"])
-        self.assertEqual(nodes[0]["deploy"]["worker_state"], "started")
+        self.assertEqual(nodes[0]["deploy"]["worker_state"], "ready")  # 健康探测通过
         self.assertEqual(nodes[0]["deploy"]["versions"], ["liburma-1.0"])
         self.assertTrue(nodes[0]["deploy"]["consistent"])
         # 部署状态持久化到磁盘
         restored = DeployStatusStore(Path(self.tmpdir.name) / "deploy_status.json")
-        self.assertEqual(restored.get("a")["worker_state"], "started")
+        self.assertEqual(restored.get("a")["worker_state"], "ready")
+
+    def test_deploy_marks_failed_when_worker_unreachable(self):
+        manager = DeploymentManager(
+            FakeExecutor({"a": "liburma-1.0"}), DownWorkerClient(),
+            NodeStore(Path(self.tmpdir.name) / "nodes.json"),
+            deploy_status=self.deploy_status,
+        )
+        manager.probe_attempts = 2
+        manager.probe_interval = 0
+        client = TestClient(create_app(manager, dist_dir=Path(self.tmpdir.name) / "dist"))
+        response = client.post("/v1/deploy", json={
+            "nodes": [{"name": "a", "ip": "10.0.0.1"}],
+            "artifact": "build/kv-bench",
+            "destination": "/opt/kv-bench/build/kv-bench",
+            "source_dir": "/opt/kv-bench",
+        })
+        self.assertEqual(response.status_code, 200)
+        nodes = client.get("/v1/nodes").json()
+        self.assertEqual(nodes[0]["deploy"]["worker_state"], "failed")
 
 
 @unittest.skipUnless(HAVE_FASTAPI, "fastapi/httpx not installed")

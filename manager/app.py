@@ -12,6 +12,7 @@ import os
 import shlex
 import subprocess
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -266,6 +267,8 @@ class Executor(Protocol):
 
 
 class WorkerClient(Protocol):
+    def health(self, node: Node) -> dict[str, Any]: ...
+
     def start(self, node: Node, task_id: str, command: list[str]) -> None: ...
 
     def stop(self, node: Node, task_id: str) -> None: ...
@@ -345,6 +348,16 @@ class HttpWorkerClient:
     def stop(self, node: Node, task_id: str) -> None:
         self._post(node, f"/v1/tasks/{task_id}/stop", {})
 
+    def health(self, node: Node) -> dict[str, Any]:
+        self._require_httpx()
+        try:
+            with httpx.Client(timeout=5.0, trust_env=False) as client:
+                response = client.get(f"http://{node.ip}:{node.api_port}/v1/health")
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as error:
+            raise RuntimeError(f"worker {node.name} unreachable: {error}") from error
+
     def result(self, node: Node, task_id: str) -> dict[str, Any]:
         self._require_httpx()
         try:
@@ -375,6 +388,8 @@ class DeploymentManager:
         self.artifacts = artifacts
         self.tasks: dict[str, TaskSpec] = {}
         self._lock = threading.Lock()
+        self.probe_attempts = 10
+        self.probe_interval = 0.5
         if task_store is not None:  # 恢复已持久化的任务
             for task in task_store.values():
                 self.tasks[task.task_id] = task
@@ -415,7 +430,16 @@ class DeploymentManager:
         check = self.ensure_urma_consistency(nodes, source_dir, umdk_root)
         for node in nodes:
             self.executor.copy(node, artifact, destination)
-            self.executor.run(node, ["sh", "-lc", f"nohup {shlex.quote(destination)} --worker --worker-port={node.api_port} >{WORKER_LOG_PATH} 2>&1 &"])
+            # 整条启动命令作为单个参数传给 ssh：ssh 会用空格拼接参数、远端 shell
+            # 重新分词，若拆成 ["sh","-lc",...] 会被分词成 sh -l -c "nohup" 而报
+            # "nohup: missing operand"；单参数让远端 shell 原样执行整行。
+            # </dev/null 防止 ssh 因后台进程持有通道而挂住。
+            start_cmd = (
+                f"nohup {shlex.quote(destination)} --worker --worker-port={node.api_port} "
+                f">{WORKER_LOG_PATH} 2>&1 </dev/null &"
+            )
+            self.executor.run(node, [start_cmd])
+            worker_state = self._probe_worker(node)
             if self.deploy_status is not None:
                 self.deploy_status.update(
                     node.name,
@@ -424,9 +448,24 @@ class DeploymentManager:
                     destination=destination,
                     versions=list(check.versions.get(node.name, ())),
                     consistent=check.consistent or check.versions.get(node.name) == check.reference,
-                    worker_state="started",
+                    worker_state=worker_state,
                 )
         return check
+
+    def _probe_worker(self, node: Node) -> str:
+        """启动后探测 worker /v1/health，返回 ready / failed（无 worker_client 时 assumed started）。"""
+        if self.worker_client is None:
+            return "started"
+        for attempt in range(self.probe_attempts):
+            try:
+                state = self.worker_client.health(node).get("state")
+                if state in {"ready", "running"}:
+                    return "ready"
+            except Exception:
+                pass
+            if attempt + 1 < self.probe_attempts:
+                time.sleep(self.probe_interval)
+        return "failed"
 
     def build_commands(self, task: TaskSpec) -> list[str]:
         return [command for commands in self.build_assignments(task).values() for command in commands]

@@ -97,6 +97,10 @@ API 文档（Swagger UI）在 `http://manager:18080/docs`。
 SSH/SCP 失败时返回 `{"error": "..."}` 并附 stderr 详情（如认证失败、
 远端目录不可写、本地 artifact 不存在）。
 
+worker 启动命令以整行作为单个参数通过 ssh 执行（避免远端 shell 分词把
+`nohup` 拆成无参数），并在启动后探测 `/v1/health`：探测结果写入部署状态
+（`worker_state` = ready / failed / started），节点管理页可查看。
+
 响应 `{versions, consistent, reference}`：各节点 URMA 包版本、是否一致、参考版本。
 
 ### 任务
