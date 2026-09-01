@@ -4,6 +4,7 @@ Skipped automatically when fastapi/httpx are not installed (e.g. offline
 environments that still run the domain-level test_manager.py).
 """
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,8 @@ try:
     from manager.app import (
         DeploymentManager,
         DeployStatusStore,
+        HttpWorkerClient,
+        Node,
         NodeStore,
         RunArtifacts,
         TaskStore,
@@ -288,6 +291,46 @@ class ApiTests(unittest.TestCase):
         # 部署状态持久化到磁盘
         restored = DeployStatusStore(Path(self.tmpdir.name) / "deploy_status.json")
         self.assertEqual(restored.get("a")["worker_state"], "started")
+
+
+@unittest.skipUnless(HAVE_FASTAPI, "fastapi/httpx not installed")
+class WorkerClientTests(unittest.TestCase):
+    """worker 客户端必须绕过环境代理（内网控制面直连），否则 504。"""
+
+    def test_worker_client_bypasses_env_proxy(self):
+        import http.server
+        import socketserver
+        import threading
+
+        seen: dict[str, str] = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                seen["path"] = self.path
+                body = b'{"state":"running"}'
+                self.send_response(202)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            # 塞入必定失败的代理环境变量；若客户端跟随环境代理将无法直连
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+                os.environ[key] = "http://127.0.0.1:1"
+            try:
+                node = Node("w", "127.0.0.1", api_port=server.server_address[1])
+                HttpWorkerClient().start(node, "t1", ["kv-bench", "--op=write"])
+                self.assertEqual(seen.get("path"), "/v1/tasks/start")
+            finally:
+                for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+                    os.environ.pop(key, None)
+                server.shutdown()
 
 
 if __name__ == "__main__":

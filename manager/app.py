@@ -316,7 +316,12 @@ class SshExecutor:
 
 
 class HttpWorkerClient:
-    """Worker API client over httpx (mature HTTP stack, explicit timeouts)."""
+    """Worker API client over httpx (mature HTTP stack, explicit timeouts).
+
+    ``trust_env=False``：worker 是内网控制面，必须直连。manager 机器上通常
+    配置了 HTTP_PROXY/HTTPS_PROXY 环境代理（用于外网），若 httpx 默认跟随
+    环境代理，内网 worker 调用会被塞进代理，代理连不上内网地址返回 504。
+    """
 
     def _require_httpx(self) -> None:
         if httpx is None:
@@ -326,7 +331,7 @@ class HttpWorkerClient:
     def _post(self, node: Node, path: str, payload: dict[str, Any]) -> None:
         self._require_httpx()
         try:
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=10.0, trust_env=False) as client:
                 response = client.post(
                     f"http://{node.ip}:{node.api_port}{path}", json=payload)
         except httpx.HTTPError as error:
@@ -343,7 +348,7 @@ class HttpWorkerClient:
     def result(self, node: Node, task_id: str) -> dict[str, Any]:
         self._require_httpx()
         try:
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=10.0, trust_env=False) as client:
                 response = client.get(
                     f"http://{node.ip}:{node.api_port}/v1/tasks/{task_id}/result")
             response.raise_for_status()

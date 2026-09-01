@@ -155,4 +155,6 @@ python3 -m unittest discover -s manager/tests -v
 
 - 错误响应统一为 `{"error": "..."}`：pydantic 校验失败 422、逻辑错误 400、
   SSH/SCP/worker 调用等运行期失败 500（均带具体原因）。
+- worker API 调用**绕过环境代理**（`httpx trust_env=False`，内网控制面直连）；
+  manager 机器上配置的 HTTP_PROXY/HTTPS_PROXY 仅用于外网，不会劫持 worker 流量。
 - worker API 不接受 manager 地址，也没有注册/回连逻辑。
