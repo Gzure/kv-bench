@@ -9,10 +9,22 @@
 
     <el-table :data="nodes" v-loading="loading" stripe>
       <el-table-column prop="name" label="名称" min-width="110" />
-      <el-table-column label="标签" min-width="170">
+      <el-table-column label="标签" min-width="200">
         <template #default="{ row }">
-          <el-tag v-for="tag in row.tags" :key="tag" size="small" effect="plain" class="tag-chip">{{ tag }}</el-tag>
-          <span v-if="!row.tags?.length" class="muted">—</span>
+          <div class="tag-cell">
+            <el-tag
+              v-for="tag in row.tags"
+              :key="tag"
+              size="small"
+              effect="plain"
+              closable
+              class="tag-chip"
+              @close="removeTag(row, tag)"
+            >
+              <span class="tag-text" :title="`点击修改标签 ${tag}`" @click="renameTag(row, tag)">{{ tag }}</span>
+            </el-tag>
+            <el-tag size="small" effect="plain" class="tag-add" title="添加标签" @click="addTag(row)">+ 标签</el-tag>
+          </div>
         </template>
       </el-table-column>
       <el-table-column prop="ip" label="地址" min-width="130" />
@@ -167,16 +179,85 @@ async function remove(node: Node) {
   }
 }
 
+// ---- 标签行内编辑（添加 / 修改 / 删除，均走 PATCH，保留密码等其余字段）----
+
+async function addTag(node: Node) {
+  const { value } = await ElMessageBox.prompt(`为节点 ${node.name} 添加标签`, '添加标签', {
+    confirmButtonText: '添加',
+    cancelButtonText: '取消',
+    inputPlaceholder: '输入标签名',
+  }).catch(() => ({ value: '' }))
+  const tag = (value ?? '').trim()
+  if (!tag) return
+  if (node.tags.includes(tag)) {
+    ElMessage.warning(`标签「${tag}」已存在`)
+    return
+  }
+  await updateTags(node, [...node.tags, tag])
+}
+
+async function renameTag(node: Node, oldTag: string) {
+  const { value } = await ElMessageBox.prompt(`将节点 ${node.name} 的标签「${oldTag}」改为：`, '修改标签', {
+    confirmButtonText: '保存',
+    cancelButtonText: '取消',
+    inputValue: oldTag,
+  }).catch(() => ({ value: '' }))
+  const tag = (value ?? '').trim()
+  if (!tag || tag === oldTag) return
+  await updateTags(
+    node,
+    node.tags.map((item) => (item === oldTag ? tag : item)),
+  )
+}
+
+async function removeTag(node: Node, tag: string) {
+  await updateTags(
+    node,
+    node.tags.filter((item) => item !== tag),
+  )
+}
+
+async function updateTags(node: Node, tags: string[]) {
+  try {
+    await api.patchNodeTags(node.name, tags)
+    ElMessage.success(`已更新 ${node.name} 的标签`)
+    await load()
+  } catch (error) {
+    ElMessage.error(errMsg(error))
+  }
+}
+
 onMounted(load)
 </script>
 
 <style scoped>
-.tag-chip {
-  margin: 2px 4px 2px 0;
+.tag-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
 }
 
-.muted {
-  color: #94a3b8;
+.tag-chip {
+  margin: 1px 0;
+}
+
+.tag-text {
+  cursor: pointer;
+  display: inline-block;
+  line-height: 1.6;
+}
+
+.tag-add {
+  cursor: pointer;
+  border-style: dashed;
+  margin: 1px 0;
+  color: #64748b;
+}
+
+.tag-add:hover {
+  color: var(--el-color-primary);
+  border-color: var(--el-color-primary);
 }
 
 .full {

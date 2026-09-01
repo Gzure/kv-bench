@@ -10,7 +10,7 @@ never included in HTTP responses.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -55,6 +55,12 @@ class NodeIn(BaseModel):
     api_port: int = 18082
     password: str = ""
     tags: list[str] = Field(default_factory=list, description="节点标签（可多个）")
+
+
+class NodePatchIn(BaseModel):
+    """局部更新节点（当前仅支持 tags，保留密码等其余字段）。"""
+
+    tags: list[str] | None = Field(default=None, description="替换后的标签列表")
 
 
 class BenchItemIn(BaseModel):
@@ -136,6 +142,17 @@ def create_app(manager: DeploymentManager, dist_dir: str | Path | None = None) -
             raise KeyError(name)
         manager.node_store.remove(name)
         return {"state": "deleted"}
+
+    @app.patch("/v1/nodes/{name}", summary="更新节点标签")
+    def patch_node(name: str, payload: NodePatchIn) -> dict[str, Any]:
+        if manager.node_store is None:
+            raise KeyError(name)
+        node = manager.node_store.get(name)
+        if payload.tags is not None:
+            # replace 重建 Node（frozen）并触发 __post_init__ 标签归一化，
+            # 密码等其余字段保持不变。
+            manager.node_store.upsert(replace(node, tags=payload.tags))
+        return node_dict(manager.node_store.get(name))
 
     # ---- deploy -----------------------------------------------------------
 

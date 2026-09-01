@@ -54,11 +54,11 @@ class ApiTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         store = NodeStore(Path(self.tmpdir.name) / "nodes.json")
-        manager = DeploymentManager(
+        self.manager = DeploymentManager(
             FakeExecutor({"a": "liburma-1.0", "b": "liburma-1.0"}),
             FakeWorkerClient(), store,
         )
-        self.client = TestClient(create_app(manager, dist_dir=Path(self.tmpdir.name) / "dist"))
+        self.client = TestClient(create_app(self.manager, dist_dir=Path(self.tmpdir.name) / "dist"))
 
     def tearDown(self):
         self.tmpdir.cleanup()
@@ -83,6 +83,27 @@ class ApiTests(unittest.TestCase):
         nodes = self.client.get("/v1/nodes").json()
         self.assertEqual(nodes[0]["tags"], ["gpu", "fast"])
         self.assertNotIn("password", nodes[0])
+
+    def test_patch_node_tags_preserves_other_fields(self):
+        self.client.post("/v1/nodes", json={
+            "name": "a", "ip": "10.0.0.1", "password": "keep", "tags": ["gpu"],
+        })
+        response = self.client.patch("/v1/nodes/a", json={"tags": ["gpu", "idle", "idle", " fast "]})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["tags"], ["gpu", "idle", "fast"])  # 归一化去重
+        self.assertEqual(body["ip"], "10.0.0.1")
+        self.assertNotIn("password", body)
+        # 密码与其余字段保持不变
+        self.assertEqual(self.manager.node_store.get("a").password, "keep")
+        self.assertEqual(self.manager.node_store.get("a").ip, "10.0.0.1")
+        # 清空标签
+        cleared = self.client.patch("/v1/nodes/a", json={"tags": []})
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(cleared.json()["tags"], [])
+        # 节点不存在 -> 404
+        missing = self.client.patch("/v1/nodes/nope", json={"tags": ["x"]})
+        self.assertEqual(missing.status_code, 404)
 
     def test_task_workers_include_tags_without_password(self):
         create = self.client.post("/v1/tasks", json={

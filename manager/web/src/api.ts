@@ -80,6 +80,8 @@ export const api = {
   listNodes: async (): Promise<Node[]> => (await http.get('/v1/nodes')).data,
   saveNode: async (node: NodeInput) => (await http.post('/v1/nodes', node)).data,
   deleteNode: async (name: string) => (await http.delete(`/v1/nodes/${encodeURIComponent(name)}`)).data,
+  patchNodeTags: async (name: string, tags: string[]): Promise<Node> =>
+    (await http.patch(`/v1/nodes/${encodeURIComponent(name)}`, { tags })).data,
 
   // 部署
   deploy: async (payload: DeployPayload): Promise<VersionCheck> =>

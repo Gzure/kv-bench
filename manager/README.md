@@ -62,6 +62,7 @@ API 文档（Swagger UI）在 `http://manager:18080/docs`。
   部署与创建任务时按标签筛选节点。节点信息保存在 manager 当前目录的 `nodes.json`；
   密码写入该文件但不会出现在 HTTP 响应中，生产环境应限制文件权限。
 - `DELETE /v1/nodes/{name}`：删除节点。
+- `PATCH /v1/nodes/{name}`：更新节点标签（`{"tags": [...]}`），保留密码等其余字段。
 
 示例（带标签）：
 
