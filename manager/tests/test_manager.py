@@ -253,7 +253,43 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(manager.tasks["g2"].state, "queued")
         self.assertEqual(manager.ports.used_ports(), [])
 
-    def test_task_start_failure_rolls_back_workers(self):
+    def test_start_does_not_block_other_operations(self):
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingExecutor(FakeExecutor):
+            def run(self, node, command):
+                if command and command[0].startswith("nohup"):
+                    entered.set()
+                    release.wait(5)
+                return super().run(node, command)
+
+        manager = DeploymentManager(BlockingExecutor({"a": "u", "b": "u"}), FakeWorkerClient())
+        manager.create_task({
+            "task_id": "s1",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        outcome: dict[str, object] = {}
+        thread = threading.Thread(
+            target=lambda: outcome.update(started=manager.start_task("s1")), daemon=True)
+        thread.start()
+        entered.wait(5)  # spawn 的 ssh（nohup）被卡住中
+        # 慢操作不再持有全局锁：此时仍能创建任务
+        created = manager.create_task({
+            "task_id": "s2",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        self.assertEqual(created.state, "queued")
+        release.set()
+        thread.join(15)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(manager.tasks["s1"].state, "running")
+
+    def test_start_failure_rolls_back_workers(self):
         class DownWorker(FakeWorkerClient):
             def health(self, node, port=None):
                 raise RuntimeError("worker down")

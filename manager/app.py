@@ -329,41 +329,56 @@ class WorkerClient(Protocol):
 
 
 class SshExecutor:
-    """Remote executor using the system ssh/scp clients."""
+    """Remote executor using the system ssh/scp clients.
+
+    无密码节点走 key 认证（BatchMode=yes 禁止交互提示，失败快速返回而非挂起）；
+    所有命令 stdin=DEVNULL 并带超时，避免 ssh 等待输入/连接卡死 manager。
+    """
 
     def _target(self, node: Node) -> str:
         return f"{node.user}@{node.ip}"
 
-    def run(self, node: Node, command: list[str]) -> str:
-        prefix = ["sshpass", "-e"] if node.password else []
+    def run(self, node: Node, command: list[str], timeout: float = 600.0) -> str:
+        if node.password:
+            cmd = ["sshpass", "-e", "ssh", "-p", str(node.ssh_port), self._target(node), "--", *command]
+        else:
+            cmd = ["ssh", "-p", str(node.ssh_port), "-o", "BatchMode=yes",
+                   self._target(node), "--", *command]
         try:
             result = subprocess.run(
-                prefix + ["ssh", "-p", str(node.ssh_port), self._target(node), "--", *command],
-                check=True,
-                text=True,
-                capture_output=True,
-                env={**__import__("os").environ, "SSHPASS": node.password},
+                cmd, check=True, text=True, capture_output=True,
+                stdin=subprocess.DEVNULL, timeout=timeout,
+                env={**os.environ, "SSHPASS": node.password},
             )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"ssh {node.name} ({node.ip}) timed out after {timeout:g}s") from error
         except subprocess.CalledProcessError as error:
             raise RuntimeError(
                 f"ssh {node.name} ({node.ip}) failed: {error.stderr.strip() or error}"
             ) from error
         return result.stdout
 
-    def copy(self, node: Node, source: str, destination: str) -> None:
+    def copy(self, node: Node, source: str, destination: str, timeout: float = 600.0) -> None:
         if not os.path.exists(source):
             raise RuntimeError(f"local artifact not found: {source}")
         # scp 不会自动创建远端目录；先 mkdir -p（幂等），避免 exit 1
         self.run(node, ["mkdir", "-p", os.path.dirname(destination) or "."])
-        prefix = ["sshpass", "-e"] if node.password else []
+        if node.password:
+            cmd = ["sshpass", "-e", "scp", "-P", str(node.ssh_port), source,
+                   f"{self._target(node)}:{destination}"]
+        else:
+            cmd = ["scp", "-o", "BatchMode=yes", "-P", str(node.ssh_port), source,
+                   f"{self._target(node)}:{destination}"]
         try:
             subprocess.run(
-                prefix + ["scp", "-P", str(node.ssh_port), source, f"{self._target(node)}:{destination}"],
-                check=True,
-                text=True,
-                capture_output=True,
-                env={**__import__("os").environ, "SSHPASS": node.password},
+                cmd, check=True, text=True, capture_output=True,
+                stdin=subprocess.DEVNULL, timeout=timeout,
+                env={**os.environ, "SSHPASS": node.password},
             )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"scp to {node.name} ({node.ip}) timed out after {timeout:g}s") from error
         except subprocess.CalledProcessError as error:
             raise RuntimeError(
                 f"scp to {node.name} ({node.ip}:{destination}) failed: {error.stderr.strip() or error}"
@@ -459,6 +474,7 @@ class DeploymentManager:
         self.ports = ports if ports is not None else PortAllocator()
         self.tasks: dict[str, TaskSpec] = {}
         self._lock = threading.Lock()
+        self._starting: set[str] = set()  # 正在启动的任务（防止重复启动/并发修改）
         self.server_probe = DeploymentManager.default_server_probe
         self.port_attempts = 3          # 单节点启动 worker 尝试的端口数
         self.worker_start_attempts = 10  # 健康探测轮数
@@ -580,45 +596,56 @@ class DeploymentManager:
         """启动任务：queued 或 stopped（停止后可再次执行）-> running。
 
         顺序保证：先拉起所有节点任务 worker -> 先下发被动端（server）-> 轮询
-        确认其数据面端口已监听 -> 再下发主动端（client）。避免 client 在 server
-        就绪前 connect 被拒。
+        确认其数据面端口已监听 -> 再下发主动端（client）。
+
+        SSH/探测等慢操作在全局锁外执行：锁内仅做状态校验与登记，避免一个任务
+        启动卡住阻塞其它请求（创建/停止/查询等）。
         """
         with self._lock:
             task = self.tasks[task_id]
             if task.state not in {"queued", "stopped"}:
                 raise ValueError(f"task is not startable (state={task.state})")
+            if task_id in self._starting:
+                raise ValueError("task is already starting")
+            previous_state = task.state
             task.result = {}  # 重新执行时清掉旧结果
-            assignments = self.build_assignments(task)
-            started: list[tuple[str, int]] = []
-            try:
-                # 1) 所有节点拉起任务专属 worker
-                for node_name in assignments:
-                    node = task.workers[node_name]
-                    port = self._spawn_worker(task, node)
-                    task.worker_ports[node_name] = port
-                    started.append((node_name, port))
-                # 2) 分类：含 --peer-ip 的是主动端(client)，否则是被动端(server)
-                passive = [n for n, cmds in assignments.items() if any("--peer-ip" not in c for c in cmds)]
-                active = [n for n, cmds in assignments.items() if any("--peer-ip" in c for c in cmds)]
-                # 3) 先下发被动端，等其 server 监听后再下发主动端
-                for node_name in passive:
-                    self._dispatch_commands(task, node_name, assignments[node_name])
-                server_port = self._task_server_port(task)
-                for node_name in passive:
-                    node = task.workers[node_name]
-                    if not self._wait_server_ready(node, server_port):
-                        raise RuntimeError(
-                            f"server {node.name} did not listen on :{server_port}")
-                for node_name in active:
-                    self._dispatch_commands(task, node_name, assignments[node_name])
-                commands = [command for values in assignments.values() for command in values]
-                task.state = "running"
-            except Exception:
-                # 任一节点失败：回滚已拉起的 worker，释放端口，状态不变（queued/stopped）
-                self._teardown_workers(task, started)
-                raise
+            self._starting.add(task_id)
+        assignments = self.build_assignments(task)
+        started: list[tuple[str, int]] = []
+        try:
+            # 1) 所有节点拉起任务专属 worker
+            for node_name in assignments:
+                node = task.workers[node_name]
+                port = self._spawn_worker(task, node)
+                task.worker_ports[node_name] = port
+                started.append((node_name, port))
+            # 2) 分类：含 --peer-ip 的是主动端(client)，否则是被动端(server)
+            passive = [n for n, cmds in assignments.items() if any("--peer-ip" not in c for c in cmds)]
+            active = [n for n, cmds in assignments.items() if any("--peer-ip" in c for c in cmds)]
+            # 3) 先下发被动端，等其 server 监听后再下发主动端
+            for node_name in passive:
+                self._dispatch_commands(task, node_name, assignments[node_name])
+            server_port = self._task_server_port(task)
+            for node_name in passive:
+                node = task.workers[node_name]
+                if not self._wait_server_ready(node, server_port):
+                    raise RuntimeError(
+                        f"server {node.name} did not listen on :{server_port}")
+            for node_name in active:
+                self._dispatch_commands(task, node_name, assignments[node_name])
+        except Exception:
+            # 任一节点失败：回滚已拉起的 worker，释放端口，恢复原状态
+            self._teardown_workers(task, started)
+            with self._lock:
+                task.state = previous_state
+            raise
+        finally:
+            with self._lock:
+                self._starting.discard(task_id)
+        with self._lock:
+            task.state = "running"
         self._persist_task(task, "started")
-        return commands
+        return [command for values in assignments.values() for command in values]
 
     def _dispatch_commands(self, task: TaskSpec, node_name: str, commands: list[str]) -> None:
         if self.worker_client is None:
@@ -658,6 +685,8 @@ class DeploymentManager:
             task = self.tasks[task_id]
             if task.state == "running":
                 raise ValueError("cannot edit a running task")
+            if task_id in self._starting:
+                raise ValueError("cannot edit a task that is starting")
             task.workers = {entry["name"]: Node(**entry) for entry in payload["workers"]}
             task.bench_items = [BenchItem(**entry) for entry in payload["bench_items"]]
             task.options = payload.get("options", {})
@@ -669,6 +698,8 @@ class DeploymentManager:
     def delete_task(self, task_id: str) -> None:
         """删除任务：回收 worker/端口、移除持久化任务与其运行产物。"""
         with self._lock:
+            if task_id in self._starting:
+                raise ValueError("task is still starting")
             task = self.tasks.pop(task_id, None)
             if task is None:
                 raise KeyError(task_id)
@@ -679,16 +710,20 @@ class DeploymentManager:
             self.artifacts.remove(task_id)
 
     def stop_task(self, task_id: str) -> None:
+        """停止任务：停 bench -> 杀 worker -> 释放端口（慢操作在锁外）。"""
         with self._lock:
             task = self.tasks[task_id]
+            if task_id in self._starting:
+                raise ValueError("task is still starting")
             ports = dict(task.worker_ports)
-            if self.worker_client is not None:
-                for node in task.workers.values():
-                    try:
-                        self.worker_client.stop(node, task.task_id, port=ports.get(node.name))
-                    except Exception:
-                        pass  # worker 可能已不在
-            self._teardown_workers(task, list(ports.items()))
+        if self.worker_client is not None:
+            for node in task.workers.values():
+                try:
+                    self.worker_client.stop(node, task.task_id, port=ports.get(node.name))
+                except Exception:
+                    pass  # worker 可能已不在
+        self._teardown_workers(task, list(ports.items()))
+        with self._lock:
             task.state = "stopped"
         self._persist_task(task, "stopped")
 
@@ -741,24 +776,26 @@ class DeploymentManager:
                 except Exception:
                     pass
             self.ports.release(port)
-        for node_name, _ in entries:
-            task.worker_ports.pop(node_name, None)
+        with self._lock:
+            for node_name, _ in entries:
+                task.worker_ports.pop(node_name, None)
 
     def collect_result(self, task_id: str) -> dict[str, Any]:
         with self._lock:
             task = self.tasks[task_id]
-            workers: dict[str, Any] = {}
-            for name, node in task.workers.items():
-                if self.worker_client is not None:
-                    try:
-                        workers[name] = self.worker_client.result(
-                            node, task_id, port=task.worker_ports.get(name))
-                    except Exception as error:  # worker may still be starting
-                        workers[name] = {"state": "unreachable", "error": str(error)}
+            ports = dict(task.worker_ports)
+        workers: dict[str, Any] = {}
+        for name, node in task.workers.items():
+            if self.worker_client is not None:
+                try:
+                    workers[name] = self.worker_client.result(
+                        node, task_id, port=ports.get(name))
+                except Exception as error:  # worker may still be starting
+                    workers[name] = {"state": "unreachable", "error": str(error)}
+        with self._lock:
             # 任务停止后 worker 已被回收：返回上次收集的结果，避免显示全零
-            if task.result and all(
-                worker.get("state") == "unreachable" for worker in workers.values()
-            ):
+            any_reachable = any(w.get("state") != "unreachable" for w in workers.values())
+            if task.result and not any_reachable:
                 return task.result
             total = {"ops": 0, "bytes": 0, "errors": 0}
             for result in workers.values():
