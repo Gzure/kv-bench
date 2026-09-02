@@ -155,7 +155,7 @@ bool UrmaJetty::Create(UrmaResource &res, bool isSend,
   }
 
   /* send: 共享 context 级 JFR；recv: 独立 JFR（对齐 yuanrong UrmaJetty::Create
-   * L344） */:
+   * L344） */
   std::shared_ptr<UrmaJfr> jfr;
   if (isSend) {
     if (res.sharedJettyJfr_ == nullptr) {
