@@ -6,6 +6,9 @@ from pathlib import Path
 from manager import BenchItem, DeploymentManager, Node, NodeStore, TaskSpec
 from manager.app import DeployStatusStore, RunArtifacts, SshExecutor, TaskStore
 
+# 测试用：server 就绪探测默认通过（生产实现为 TCP 连接探测）
+DeploymentManager.default_server_probe = lambda node, port: True
+
 
 class FakeExecutor:
     def __init__(self, versions):
@@ -115,9 +118,10 @@ class ManagerTests(unittest.TestCase):
             "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
         })
         manager.start_task(task.task_id)
-        self.assertEqual([call[0] for call in client.started], ["a", "b"])
-        self.assertIn("--peer-ip=10.0.0.2", client.started[0][2])
-        self.assertNotIn("--peer-ip=10.0.0.1", client.started[1][2])
+        # 被动端（server）先下发，主动端（client）等 server 就绪后下发
+        self.assertEqual([call[0] for call in client.started], ["b", "a"])
+        self.assertNotIn("--peer-ip=10.0.0.1", client.started[0][2])  # b 被动端
+        self.assertIn("--peer-ip=10.0.0.2", client.started[1][2])     # a 主动端
         manager.stop_task(task.task_id)
         self.assertEqual([call[0] for call in client.stopped], ["a", "b"])
         result = manager.collect_result(task.task_id)
@@ -210,6 +214,44 @@ class ManagerTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "runs" / "u1").exists())
             with self.assertRaises(KeyError):
                 manager.delete_task("u1")
+
+    def test_start_waits_for_server_listening_before_client(self):
+        calls: list[tuple[str, str]] = []
+        probe_calls: list[tuple[str, int]] = []
+
+        class TrackingClient(FakeWorkerClient):
+            def start(self, node, task_id, command, port=None):
+                calls.append((node.name, " ".join(command)))
+                super().start(node, task_id, command, port=port)
+
+        manager = DeploymentManager(FakeExecutor({"a": "u", "b": "u"}), TrackingClient())
+        manager.server_probe = lambda node, port: probe_calls.append((node.name, port)) or True
+        manager.create_task({
+            "task_id": "g1",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        manager.start_task("g1")
+        # 顺序：被动端 b 先下发 -> 探测 b 的 server 端口就绪 -> 主动端 a 下发
+        self.assertEqual([name for name, _ in calls], ["b", "a"])
+        self.assertEqual(probe_calls, [("b", 13857)])
+        self.assertIn("--no-interactive", calls[0][1])
+        self.assertIn("--peer-ip=10.0.0.2", calls[1][1])
+
+    def test_start_fails_if_server_never_listens(self):
+        manager = DeploymentManager(FakeExecutor({"a": "u", "b": "u"}), FakeWorkerClient())
+        manager.server_probe = lambda node, port: False
+        manager.server_ready_timeout = 0.2
+        manager.server_ready_interval = 0.05
+        manager.create_task({
+            "task_id": "g2",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        with self.assertRaisesRegex(RuntimeError, "did not listen"):
+            manager.start_task("g2")
+        self.assertEqual(manager.tasks["g2"].state, "queued")
+        self.assertEqual(manager.ports.used_ports(), [])
 
     def test_task_start_failure_rolls_back_workers(self):
         class DownWorker(FakeWorkerClient):

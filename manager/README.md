@@ -125,10 +125,11 @@ SSH/SCP 失败时返回 `{"error": "..."}` 并附 stderr 详情（如认证失�
 
 - `POST /v1/tasks/{id}/start`：manager 为任务中每个节点分配独立端口，ssh
   `nohup kv-bench --worker --worker-port=<端口> >/var/log/kv-bench-worker-{task_id}.log 2>&1 </dev/null &`
-  拉起该任务的 worker，轮询 `/v1/health` 就绪后把 bench 命令下发到该任务的端口；
-  启动失败自动换端口，全部失败则回滚（杀掉已拉起 worker、释放端口）并返回 `{"error": ...}`。
-  多任务端口互不冲突，同一节点可并发多个任务；manager 与 worker 同机也适用。
-  响应含 `worker_ports`（node -> 端口）。
+  拉起该任务的 worker，轮询 `/v1/health` 就绪后下发 bench。**顺序保证**：
+  先下发被动端（server），轮询确认其数据面端口（`--server-port`，默认 13857）
+  已监听，再下发主动端（client）—— client 启动时 server 必然已就绪；
+  超时未监听则回滚并返回 `{"error": ...}`。多任务端口互不冲突，
+  同一节点可并发多个任务；manager 与 worker 同机也适用。响应含 `worker_ports`。
 - `POST /v1/tasks/{id}/stop`：经该任务端口停止 bench，ssh `pkill -f worker-port=<端口>`
   杀掉 worker 并释放端口。
 - 任务自然结束后 worker 保活（结果/日志仍可查），端口占用到该任务被停止。

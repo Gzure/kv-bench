@@ -24,6 +24,8 @@ try:
     )
 
     HAVE_FASTAPI = True
+    # 测试用：server 就绪探测默认通过（生产实现为 TCP 连接探测）
+    DeploymentManager.default_server_probe = lambda node, port: True
 except Exception:  # pragma: no cover - exercised only without third-party deps
     HAVE_FASTAPI = False
 

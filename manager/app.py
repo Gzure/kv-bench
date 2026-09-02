@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -435,6 +436,10 @@ class HttpWorkerClient:
 
 
 class DeploymentManager:
+    # 可注入的默认 server 就绪探测（测试/扩展用，None 时走 TCP 连接探测）；
+    # 经 __init__ 复制为实例属性，避免类属性函数被绑定为方法
+    default_server_probe = None
+
     def __init__(
         self,
         executor: Executor,
@@ -454,9 +459,12 @@ class DeploymentManager:
         self.ports = ports if ports is not None else PortAllocator()
         self.tasks: dict[str, TaskSpec] = {}
         self._lock = threading.Lock()
+        self.server_probe = DeploymentManager.default_server_probe
         self.port_attempts = 3          # 单节点启动 worker 尝试的端口数
         self.worker_start_attempts = 10  # 健康探测轮数
         self.worker_start_interval = 0.5
+        self.server_ready_timeout = 30.0  # 被动端数据面端口监听等待（秒）
+        self.server_ready_interval = 0.5
         if task_store is not None:  # 恢复已持久化的任务与其端口占用
             for task in task_store.values():
                 self.tasks[task.task_id] = task
@@ -571,7 +579,9 @@ class DeploymentManager:
     def start_task(self, task_id: str) -> list[str]:
         """启动任务：queued 或 stopped（停止后可再次执行）-> running。
 
-        为每个参与节点拉起任务专属 worker（独立端口），健康后就绪后下发 bench。
+        顺序保证：先拉起所有节点任务 worker -> 先下发被动端（server）-> 轮询
+        确认其数据面端口已监听 -> 再下发主动端（client）。避免 client 在 server
+        就绪前 connect 被拒。
         """
         with self._lock:
             task = self.tasks[task_id]
@@ -581,14 +591,26 @@ class DeploymentManager:
             assignments = self.build_assignments(task)
             started: list[tuple[str, int]] = []
             try:
-                for node_name, commands in assignments.items():
+                # 1) 所有节点拉起任务专属 worker
+                for node_name in assignments:
                     node = task.workers[node_name]
                     port = self._spawn_worker(task, node)
                     task.worker_ports[node_name] = port
                     started.append((node_name, port))
-                    if self.worker_client is not None:
-                        for command in commands:
-                            self.worker_client.start(node, task.task_id, shlex.split(command), port=port)
+                # 2) 分类：含 --peer-ip 的是主动端(client)，否则是被动端(server)
+                passive = [n for n, cmds in assignments.items() if any("--peer-ip" not in c for c in cmds)]
+                active = [n for n, cmds in assignments.items() if any("--peer-ip" in c for c in cmds)]
+                # 3) 先下发被动端，等其 server 监听后再下发主动端
+                for node_name in passive:
+                    self._dispatch_commands(task, node_name, assignments[node_name])
+                server_port = self._task_server_port(task)
+                for node_name in passive:
+                    node = task.workers[node_name]
+                    if not self._wait_server_ready(node, server_port):
+                        raise RuntimeError(
+                            f"server {node.name} did not listen on :{server_port}")
+                for node_name in active:
+                    self._dispatch_commands(task, node_name, assignments[node_name])
                 commands = [command for values in assignments.values() for command in values]
                 task.state = "running"
             except Exception:
@@ -597,6 +619,38 @@ class DeploymentManager:
                 raise
         self._persist_task(task, "started")
         return commands
+
+    def _dispatch_commands(self, task: TaskSpec, node_name: str, commands: list[str]) -> None:
+        if self.worker_client is None:
+            return
+        node = task.workers[node_name]
+        for command in commands:
+            self.worker_client.start(node, task.task_id, shlex.split(command),
+                                     port=task.worker_ports[node_name])
+
+    @staticmethod
+    def _task_server_port(task: TaskSpec) -> int:
+        try:
+            return int(task.options.get("server_port") or 13857)
+        except (TypeError, ValueError):
+            return 13857
+
+    def _wait_server_ready(self, node: Node, port: int) -> bool:
+        deadline = time.time() + self.server_ready_timeout
+        while time.time() < deadline:
+            if self._server_listening(node, port):
+                return True
+            time.sleep(self.server_ready_interval)
+        return False
+
+    def _server_listening(self, node: Node, port: int) -> bool:
+        if self.server_probe is not None:
+            return bool(self.server_probe(node, port))
+        try:
+            with socket.create_connection((node.ip, port), timeout=1.0):
+                return True
+        except OSError:
+            return False
 
     def update_task(self, task_id: str, payload: dict[str, Any]) -> TaskSpec:
         """修改任务（queued/stopped 时可用；修改后回到 queued 待执行）。"""
