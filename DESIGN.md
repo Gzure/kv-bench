@@ -340,7 +340,10 @@ kv-bench [-m/--trans-mode <0RM 1RC 2UM 3RS>] [-d/--dev-name <dev>]
 
 - **首错即中断**：客户端打流 / get READ 遇到第一个失败即置 `fatal` 标志并中止。
 - **超时**：`WaitEvent` 等待超时（`--timeout-ms`）→ 计 error；对应 lane 不再复用，保留到连接销毁。
-- **TCP 无超时**：`connect()` 阻塞等待内核握手（SYN 重试约 2 分钟）；握手 `read()` 无限等待，对端关闭连接时报 `peer closed` 快速失败。
+- **TCP 无超时**：`connect()` 阻塞等待内核握手（SYN 重试约 2 分钟）；对
+  `ECONNREFUSED`/`ECONNRESET` 自动重试（200ms 间隔、最长 30s，规避被动端
+  server 初始化慢导致的时序竞态）；握手 `read()` 无限等待，对端关闭连接时报
+  `peer closed` 快速失败。
 - **清理顺序**（`destroy_context`）：
   1. `conn.reset()`（先 unimport 对端 target jetty/segment）；
   2. `mgr->Stop()`：停轮询线程 → `localSeg_.reset()`（`urma_unregister_seg`）→ `urma_uninit`（必须在 unregister 之后）；

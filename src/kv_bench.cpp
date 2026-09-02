@@ -1484,6 +1484,27 @@ static void *client_sampler_main(void *arg) {
 
 /* ---------------- 客户端流程 ---------------- */
 
+/* 被动端 server 初始化较慢（如 mbind 800MB 大缓冲），主动端 connect 可能先于
+ * listen 触发 ECONNREFUSED/ECONNRESET；对这两类瞬时错误重试一段时间，
+ * 避免多节点任务/直连模式下"连接被拒"的时序竞态。 */
+#define CONNECT_RETRY_INTERVAL_MS 200u
+#define CONNECT_RETRY_TOTAL_MS 30000u
+
+static int connect_with_retry(int sockfd, const struct sockaddr *addr,
+                              socklen_t addrlen) {
+  for (unsigned int waited = 0; waited <= CONNECT_RETRY_TOTAL_MS;
+       waited += CONNECT_RETRY_INTERVAL_MS) {
+    if (connect(sockfd, addr, addrlen) == 0)
+      return 0;
+    if (errno != ECONNREFUSED && errno != ECONNRESET)
+      return -1; /* 非瞬时错误（如 ENETUNREACH）不再重试 */
+    if (waited + CONNECT_RETRY_INTERVAL_MS > CONNECT_RETRY_TOTAL_MS)
+      break;
+    usleep(CONNECT_RETRY_INTERVAL_MS * 1000);
+  }
+  return -1;
+}
+
 static int client_connect_and_exchange(context_t *ctx, const argument_t *args) {
   struct sockaddr_in addr;
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1494,10 +1515,12 @@ static int client_connect_and_exchange(context_t *ctx, const argument_t *args) {
   addr.sin_family = AF_INET;
   addr.sin_port = htons(args->server_port);
   addr.sin_addr.s_addr = inet_addr(args->server_ip);
-  /* 阻塞式连接（无超时，等待内核完成握手） */
-  if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-    fprintf(stderr, "Failed to connect %s:%u, errno=%d (%s)\n", args->server_ip,
-            args->server_port, errno, strerror(errno));
+  /* 阻塞式连接（无超时，等待内核完成握手）；对 refused/reset 重试规避竞态 */
+  if (connect_with_retry(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    fprintf(stderr, "Failed to connect %s:%u after %ums (retried on refused), "
+            "errno=%d (%s)\n",
+            args->server_ip, args->server_port, CONNECT_RETRY_TOTAL_MS, errno,
+            strerror(errno));
     close(sockfd);
     return -1;
   }
@@ -1774,7 +1797,7 @@ static int run_dual_client(const argument_t *args) {
   addr.sin_family = AF_INET;
   addr.sin_port = htons(args->server_port);
   addr.sin_addr.s_addr = inet_addr(args->server_ip);
-  if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+  if (connect_with_retry(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
     fprintf(stderr, "Failed to connect %s:%u\n", args->server_ip,
             args->server_port);
     close(sockfd);

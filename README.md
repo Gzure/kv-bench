@@ -102,6 +102,10 @@ int 字段（或任何改布局的提交）就崩，改回去又可能不崩，�
 修复：在目标机器上编译（或 `-DUMDK_ROOT` 指向与运行库同版本的头），或统一
 各节点 UMDK 版本。
 
+**多节点竞态**：主动端 connect 可能在被动端 server 初始化完成（含大缓冲
+mbind）之前触发 `ECONNREFUSED`；客户端对 refused/reset 自动重试（200ms 间隔、
+最长 30s），规避"node 已部署但握手即失败"的时序问题。
+
 **import 默认 CTP 模式**（对齐 datasystem：bondp rjetty + `tp_type=CTP` +
 `has_drv_ext=1`，失败自动回退 RTP）。以下场景可双端加 `--import-rtp` 显式走
 普通 RTP import 绕行（RTP 路径用普通 `urma_rjetty_t`，跨版本稳定，不经过
