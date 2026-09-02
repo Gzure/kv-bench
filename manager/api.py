@@ -76,6 +76,14 @@ class TaskIn(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskUpdateIn(BaseModel):
+    """修改任务（task_id 由 URL 指定，不可改）。"""
+
+    workers: list[NodeIn]
+    bench_items: list[BenchItemIn]
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
 class DeployIn(BaseModel):
     nodes: list[NodeIn]
     artifact: str
@@ -190,6 +198,20 @@ def create_app(manager: DeploymentManager, dist_dir: str | Path | None = None) -
             "options": payload.options,
         })
         return {"task_id": task.task_id, "state": task.state}
+
+    @app.put("/v1/tasks/{task_id}", summary="修改任务（queued/stopped 时可用）")
+    def update_task(task_id: str, payload: TaskUpdateIn) -> dict[str, str]:
+        task = manager.update_task(task_id, {
+            "workers": [entry.model_dump() for entry in payload.workers],
+            "bench_items": [entry.model_dump() for entry in payload.bench_items],
+            "options": payload.options,
+        })
+        return {"task_id": task.task_id, "state": task.state}
+
+    @app.delete("/v1/tasks/{task_id}", summary="删除任务")
+    def delete_task(task_id: str) -> dict[str, str]:
+        manager.delete_task(task_id)
+        return {"task_id": task_id, "state": "deleted"}
 
     @app.post("/v1/tasks/{task_id}/start", summary="启动任务（拉起任务 worker）")
     def start_task(task_id: str) -> dict[str, Any]:

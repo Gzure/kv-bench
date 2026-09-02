@@ -219,6 +219,49 @@ class ApiTests(unittest.TestCase):
         stop = self.client.post("/v1/tasks/t1/stop")
         self.assertEqual(stop.status_code, 200)
         self.assertEqual(stop.json()["state"], "stopped")
+        # 停止后 worker 已回收，再次收集返回上次缓存结果而非全零
+        after_stop = self.client.get("/v1/tasks/t1/result").json()
+        self.assertEqual(after_stop["aggregate"]["ops"], 30)
+
+    def test_task_restart_after_stop(self):
+        self.client.post("/v1/tasks", json={
+            "task_id": "t1",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        self.assertEqual(self.client.post("/v1/tasks/t1/start").status_code, 200)
+        self.assertEqual(self.client.post("/v1/tasks/t1/stop").status_code, 200)
+        restart = self.client.post("/v1/tasks/t1/start")
+        self.assertEqual(restart.status_code, 200)
+        self.assertEqual(restart.json()["state"], "running")
+        self.assertEqual(restart.json()["worker_ports"], {"a": 18082, "b": 18083})
+
+    def test_task_update_and_delete_endpoints(self):
+        self.client.post("/v1/tasks", json={
+            "task_id": "t1",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        update = self.client.put("/v1/tasks/t1", json={
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "c", "ip": "10.0.0.3"}],
+            "bench_items": [{"src": "a", "dst": "c", "type": "bidirectional"}],
+            "options": {"threads": 8},
+        })
+        self.assertEqual(update.status_code, 200)
+        self.assertEqual(update.json()["state"], "queued")
+        tasks = self.client.get("/v1/tasks").json()
+        self.assertEqual(tasks[0]["bench_items"][0]["dst"], "c")
+        self.assertEqual(tasks[0]["bench_items"][0]["type"], "bidirectional")
+        # 删除
+        deleted = self.client.delete("/v1/tasks/t1")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.json()["state"], "deleted")
+        self.assertEqual(self.client.get("/v1/tasks").json(), [])
+        self.assertEqual(self.client.delete("/v1/tasks/t1").status_code, 404)
+        self.assertEqual(self.client.put("/v1/tasks/nope", json={
+            "workers": [{"name": "a", "ip": "10.0.0.1"}],
+            "bench_items": [{"src": "a", "dst": "b"}],
+        }).status_code, 404)
 
     def test_errors_map_to_http_status(self):
         missing = self.client.post("/v1/tasks/nope/start")

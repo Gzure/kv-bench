@@ -116,6 +116,11 @@ SSH/SCP 失败时返回 `{"error": "..."}` 并附 stderr 详情（如认证失�
 }
 ```
 
+**任务生命周期**：创建（`queued`）→ 启动（`running`）→ 停止（`stopped`，
+**可再次启动重跑**）→ 删除。`PUT /v1/tasks/{id}` 修改任务（`queued`/`stopped`
+时可用，改后回到 `queued` 待执行，task_id 不可改）；`DELETE /v1/tasks/{id}`
+删除任务（回收 worker/端口并删除 `runs/{task_id}/` 产物）。
+
 **任务启动时按任务拉起 worker，端口错开（默认 18082 起顺延、空闲复用）**：
 
 - `POST /v1/tasks/{id}/start`：manager 为任务中每个节点分配独立端口，ssh

@@ -156,6 +156,61 @@ class ManagerTests(unittest.TestCase):
         pkills = [call for call in executor.calls if call[1] and call[1][0] == "pkill"]
         self.assertEqual(len(pkills), 2)  # p1 的两个节点
 
+    def test_task_restart_after_stop(self):
+        manager = DeploymentManager(FakeExecutor({"a": "u", "b": "u"}), FakeWorkerClient())
+        manager.create_task({
+            "task_id": "r1",
+            "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+            "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+        })
+        manager.start_task("r1")
+        manager.stop_task("r1")
+        self.assertEqual(manager.tasks["r1"].state, "stopped")
+        self.assertEqual(manager.tasks["r1"].worker_ports, {})
+        # 停止后可再次执行，端口重新分配
+        manager.start_task("r1")
+        self.assertEqual(manager.tasks["r1"].state, "running")
+        self.assertEqual(manager.tasks["r1"].worker_ports, {"a": 18082, "b": 18083})
+
+    def test_task_update_and_delete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TaskStore(Path(directory) / "tasks.json")
+            artifacts = RunArtifacts(Path(directory) / "runs")
+            manager = DeploymentManager(FakeExecutor({"a": "u", "b": "u"}), FakeWorkerClient(),
+                                        task_store=store, artifacts=artifacts)
+            manager.create_task({
+                "task_id": "u1",
+                "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "b", "ip": "10.0.0.2"}],
+                "bench_items": [{"src": "a", "dst": "b", "type": "forward"}],
+                "options": {"threads": 2},
+            })
+            manager.start_task("u1")
+            manager.collect_result("u1")
+            manager.stop_task("u1")
+            # 修改 stopped 任务 -> 回到 queued、结果清空、字段替换
+            updated = manager.update_task("u1", {
+                "workers": [{"name": "a", "ip": "10.0.0.1"}, {"name": "c", "ip": "10.0.0.3"}],
+                "bench_items": [{"src": "a", "dst": "c", "type": "reverse"}],
+                "options": {"threads": 8},
+            })
+            self.assertEqual(updated.state, "queued")
+            self.assertEqual(updated.result, {})
+            self.assertEqual(updated.bench_items[0].dst, "c")
+            self.assertEqual(updated.bench_items[0].type, "reverse")
+            self.assertEqual(updated.options["threads"], 8)
+            # 运行中不可修改
+            manager.start_task("u1")
+            with self.assertRaises(ValueError):
+                manager.update_task("u1", {"workers": [], "bench_items": [], "options": {}})
+            manager.stop_task("u1")
+            # 删除：内存/持久化/运行产物全部移除
+            manager.delete_task("u1")
+            self.assertNotIn("u1", manager.tasks)
+            self.assertEqual(store.values(), [])
+            self.assertFalse((Path(directory) / "runs" / "u1").exists())
+            with self.assertRaises(KeyError):
+                manager.delete_task("u1")
+
     def test_task_start_failure_rolls_back_workers(self):
         class DownWorker(FakeWorkerClient):
             def health(self, node, port=None):

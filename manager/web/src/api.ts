@@ -107,6 +107,10 @@ export const api = {
   // 任务
   listTasks: async (): Promise<Task[]> => (await http.get('/v1/tasks')).data,
   createTask: async (payload: TaskPayload) => (await http.post('/v1/tasks', payload)).data,
+  updateTask: async (id: string, payload: TaskPayload) =>
+    (await http.put(`/v1/tasks/${encodeURIComponent(id)}`, payload)).data,
+  deleteTask: async (id: string) =>
+    (await http.delete(`/v1/tasks/${encodeURIComponent(id)}`)).data,
   startTask: async (id: string) => (await http.post(`/v1/tasks/${encodeURIComponent(id)}/start`)).data,
   stopTask: async (id: string) => (await http.post(`/v1/tasks/${encodeURIComponent(id)}/stop`)).data,
   taskResult: async (id: string): Promise<TaskResult> =>

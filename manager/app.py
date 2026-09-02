@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -128,6 +129,12 @@ class TaskStore:
     def values(self) -> list[TaskSpec]:
         with self._lock:
             return list(self._tasks.values())
+
+    def remove(self, task_id: str) -> None:
+        with self._lock:
+            if self._tasks.pop(task_id, None) is None:
+                raise KeyError(task_id)
+            self._save()
 
 
 class DeployStatusStore:
@@ -265,6 +272,10 @@ class RunArtifacts:
             with open(log_path, encoding="utf-8", errors="replace") as stream:
                 manager_log = stream.read()
         return {"workers": workers, "manager_log": manager_log}
+
+    def remove(self, task_id: str) -> None:
+        """删除任务的运行产物目录 runs/{task_id}/。"""
+        shutil.rmtree(self.directory(task_id), ignore_errors=True)
 
 
 @dataclass(frozen=True)
@@ -558,11 +569,15 @@ class DeploymentManager:
         return task
 
     def start_task(self, task_id: str) -> list[str]:
-        """启动任务：为每个参与节点拉起任务专属 worker（独立端口），健康后就绪后下发 bench。"""
+        """启动任务：queued 或 stopped（停止后可再次执行）-> running。
+
+        为每个参与节点拉起任务专属 worker（独立端口），健康后就绪后下发 bench。
+        """
         with self._lock:
             task = self.tasks[task_id]
-            if task.state != "queued":
-                raise ValueError("task is not queued")
+            if task.state not in {"queued", "stopped"}:
+                raise ValueError(f"task is not startable (state={task.state})")
+            task.result = {}  # 重新执行时清掉旧结果
             assignments = self.build_assignments(task)
             started: list[tuple[str, int]] = []
             try:
@@ -577,11 +592,37 @@ class DeploymentManager:
                 commands = [command for values in assignments.values() for command in values]
                 task.state = "running"
             except Exception:
-                # 任一节点失败：回滚已拉起的 worker，释放端口，任务保持 queued
+                # 任一节点失败：回滚已拉起的 worker，释放端口，状态不变（queued/stopped）
                 self._teardown_workers(task, started)
                 raise
         self._persist_task(task, "started")
         return commands
+
+    def update_task(self, task_id: str, payload: dict[str, Any]) -> TaskSpec:
+        """修改任务（queued/stopped 时可用；修改后回到 queued 待执行）。"""
+        with self._lock:
+            task = self.tasks[task_id]
+            if task.state == "running":
+                raise ValueError("cannot edit a running task")
+            task.workers = {entry["name"]: Node(**entry) for entry in payload["workers"]}
+            task.bench_items = [BenchItem(**entry) for entry in payload["bench_items"]]
+            task.options = payload.get("options", {})
+            task.result = {}
+            task.state = "queued"
+        self._persist_task(task, "updated")
+        return task
+
+    def delete_task(self, task_id: str) -> None:
+        """删除任务：回收 worker/端口、移除持久化任务与其运行产物。"""
+        with self._lock:
+            task = self.tasks.pop(task_id, None)
+            if task is None:
+                raise KeyError(task_id)
+        self._teardown_workers(task, list(task.worker_ports.items()))
+        if self.task_store is not None:
+            self.task_store.remove(task_id)
+        if self.artifacts is not None:
+            self.artifacts.remove(task_id)
 
     def stop_task(self, task_id: str) -> None:
         with self._lock:
@@ -660,6 +701,11 @@ class DeploymentManager:
                             node, task_id, port=task.worker_ports.get(name))
                     except Exception as error:  # worker may still be starting
                         workers[name] = {"state": "unreachable", "error": str(error)}
+            # 任务停止后 worker 已被回收：返回上次收集的结果，避免显示全零
+            if task.result and all(
+                worker.get("state") == "unreachable" for worker in workers.values()
+            ):
+                return task.result
             total = {"ops": 0, "bytes": 0, "errors": 0}
             for result in workers.values():
                 for key in total:

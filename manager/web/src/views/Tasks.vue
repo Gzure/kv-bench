@@ -27,11 +27,21 @@
           {{ optionSummary(row) }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="230" fixed="right">
+      <el-table-column label="操作" width="300" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" type="success" plain :icon="VideoPlay" :disabled="row.state !== 'queued'" @click="start(row)">启动</el-button>
+          <el-button
+            size="small"
+            type="success"
+            plain
+            :icon="VideoPlay"
+            :disabled="row.state !== 'queued' && row.state !== 'stopped'"
+            :title="row.state === 'stopped' ? '再次执行' : ''"
+            @click="start(row)"
+          >{{ row.state === 'stopped' ? '重跑' : '启动' }}</el-button>
           <el-button size="small" type="warning" plain :icon="VideoPause" :disabled="row.state !== 'running'" @click="stop(row)">停止</el-button>
+          <el-button size="small" :icon="EditPen" :disabled="row.state === 'running'" @click="openEdit(row)">修改</el-button>
           <el-button size="small" :icon="DataLine" @click="showResult(row)">结果</el-button>
+          <el-button size="small" type="danger" plain :icon="Delete" @click="remove(row)">删除</el-button>
         </template>
       </el-table-column>
       <template #empty>
@@ -40,11 +50,11 @@
     </el-table>
   </el-card>
 
-  <!-- 创建任务 -->
-  <el-dialog v-model="createVisible" title="创建任务" width="780px" destroy-on-close class="create-task-dialog">
+  <!-- 创建 / 修改任务 -->
+  <el-dialog v-model="createVisible" :title="editMode ? '修改任务' : '创建任务'" width="780px" destroy-on-close class="create-task-dialog">
     <el-form :model="createForm" label-width="100px">
       <el-form-item label="任务 ID">
-        <el-input v-model="createForm.task_id" placeholder="留空自动生成" />
+        <el-input v-model="createForm.task_id" :disabled="editMode" placeholder="留空自动生成" />
       </el-form-item>
       <el-form-item label="标签筛选">
         <el-select v-model="workerTagFilter" multiple clearable placeholder="按标签筛选 Worker（任一匹配）" class="full">
@@ -178,7 +188,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { DataLine, Delete, Plus, QuestionFilled, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import { DataLine, Delete, EditPen, Plus, QuestionFilled, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue'
 
 import {
   api,
@@ -205,7 +215,7 @@ const stateType = (state: string): 'info' | 'success' | 'danger' =>
   state === 'running' ? 'success' : state === 'stopped' ? 'danger' : 'info'
 
 const stateText = (state: string): string =>
-  state === 'queued' ? '排队中' : state === 'running' ? '运行中' : '已停止'
+  state === 'queued' ? '排队中' : state === 'running' ? '运行中' : '已停止（可重跑）'
 
 const optionSummary = (task: Task): string =>
   Object.entries(task.options)
@@ -252,9 +262,10 @@ async function stop(task: Task) {
   }
 }
 
-// ---- 创建 ----
+// ---- 创建 / 修改 ----
 const createVisible = ref(false)
 const creating = ref(false)
+const editMode = ref(false)
 const workerTagFilter = ref<string[]>([])
 
 const allTags = computed(() => collectTags(nodes.value))
@@ -282,12 +293,7 @@ const createForm = reactive<{
 const fieldsByGroup = (group: string): BenchOptionField[] =>
   BENCH_OPTION_FIELDS.filter((field) => field.group === group)
 
-async function openCreate() {
-  try {
-    nodes.value = await api.listNodes()
-  } catch (error) {
-    ElMessage.error(errMsg(error))
-  }
+function resetFormDefaults() {
   const defaults: Record<string, unknown> = { op: 'write' }
   for (const field of BENCH_OPTION_FIELDS) {
     if (field.type === 'bool') defaults[field.key] = field.default ?? false
@@ -297,6 +303,48 @@ async function openCreate() {
     workerNames: [],
     benchItems: [{ src: '', dst: '', type: 'forward' }],
     options: defaults,
+  })
+  workerTagFilter.value = []
+}
+
+async function openCreate() {
+  editMode.value = false
+  try {
+    nodes.value = await api.listNodes()
+  } catch (error) {
+    ElMessage.error(errMsg(error))
+  }
+  resetFormDefaults()
+  createVisible.value = true
+}
+
+async function openEdit(task: Task) {
+  editMode.value = true
+  try {
+    nodes.value = await api.listNodes()
+  } catch (error) {
+    ElMessage.error(errMsg(error))
+  }
+  // 拓扑端点可能存的是名称或 IP，统一还原成名称
+  const nameOf = (endpoint: string): string =>
+    task.workers.find((worker) => worker.name === endpoint || worker.ip === endpoint)?.name ?? endpoint
+  const options: Record<string, unknown> = {}
+  for (const field of BENCH_OPTION_FIELDS) {
+    if (field.type === 'bool') {
+      options[field.key] = task.options[field.key] ?? field.default ?? false
+    } else if (task.options[field.key] !== undefined) {
+      options[field.key] = task.options[field.key]
+    }
+  }
+  Object.assign(createForm, {
+    task_id: task.task_id,
+    workerNames: task.workers.map((worker) => worker.name),
+    benchItems: task.bench_items.map((item) => ({
+      src: nameOf(item.src),
+      dst: nameOf(item.dst),
+      type: item.type,
+    })),
+    options,
   })
   workerTagFilter.value = []
   createVisible.value = true
@@ -323,19 +371,43 @@ async function create() {
   }
   creating.value = true
   try {
-    await api.createTask({
-      task_id: createForm.task_id.trim() || undefined,
-      workers,
-      bench_items: benchItems,
-      options,
-    })
-    ElMessage.success('任务已创建')
+    if (editMode.value) {
+      await api.updateTask(createForm.task_id, { workers, bench_items: benchItems, options })
+      ElMessage.success(`任务 ${createForm.task_id} 已修改（回到待执行）`)
+    } else {
+      await api.createTask({
+        task_id: createForm.task_id.trim() || undefined,
+        workers,
+        bench_items: benchItems,
+        options,
+      })
+      ElMessage.success('任务已创建')
+    }
     createVisible.value = false
     await load()
   } catch (error) {
     ElMessage.error(errMsg(error))
   } finally {
     creating.value = false
+  }
+}
+
+async function remove(task: Task) {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除任务 ${task.task_id}？（将回收 worker 并删除其运行产物）`,
+      '删除任务',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.deleteTask(task.task_id)
+    ElMessage.success('任务已删除')
+    await load()
+  } catch (error) {
+    ElMessage.error(errMsg(error))
   }
 }
 
