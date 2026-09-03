@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 /*
  * kv-bench 业务层：选项 / 亲和(chip) / 打流引擎 / 统计。
@@ -481,6 +483,7 @@ static int layout_server_buffer(context_t *ctx) {
 /* 前向声明：定义在下方"亲和"区 */
 static int my_cpu_list(const argument_t *args, bool is_client, int *out,
                        int max_out);
+static const char *op_name(int op);
 
 /* 查询单个虚拟地址所在页实际落在哪个 NUMA 节点（get_mempolicy
  * MPOL_F_NODE|MPOL_F_ADDR）。页必须已分配（已触碰），失败返回 -1。 */
