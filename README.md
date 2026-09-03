@@ -220,6 +220,8 @@ done
 | `--sends-per-req <n>` | 每请求 send 数（默认 10，1..10）。每个 send 拆 2 条 WR 共用 jetty，仅 write/get pipeline 生效，mixed 不受影响。两端须一致 |
 | `--chip-weight W1:W2` | affinity 模式 chip1:chip2 权重（默认 1:1=5+5 交替；如 7:3、2:8）。加权轮询打散，仅 affinity 生效，与 `--single-chip` 互斥 |
 | `--read-size <bytes>` | get/旧 mirror 模型每 WR 载荷（默认 4M） |
+| `--src-numa <node>` | 显式把源端内存绑到 NUMA 节点（客户端 write 源 / 服务器 get 数据源），覆盖 single-chip/destination-cpus 自动推导；不受 `--no-mbind` 影响 |
+| `--dst-numa <node>` | 显式把目的端内存绑到 NUMA 节点（服务器 write 数据区 / 客户端 get 读入缓冲），覆盖自动推导；两端配合可实现源/目的内存分布在不同 NUMA |
 | `--trans-mode` | 0=RM(默认) 1=RC 2=UM 3=RS |
 | `--import-rtp` | import 对端 jetty 走普通 RTP 路径（默认 bondp/CTP；版本不匹配导致 bondp 崩溃时的绕行） |
 | `--event-mode` | 使用 wait_jfc/ack/rearm 事件模式而非忙轮询 |

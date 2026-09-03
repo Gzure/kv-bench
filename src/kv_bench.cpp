@@ -103,6 +103,8 @@ typedef struct argument {
   uint32_t chip_weight[2]; /* affinity 模式两 die 权重 [chip1, chip2]，
                               默认 {1,1}=5+5 均匀；--chip-weight W1:W2 */
   int poll_cpu; /* 轮询线程绑核；-1 = 自动选空闲核 */
+  int src_numa; /* 显式指定源端内存 NUMA 节点（--src-numa；-1 = 按旧逻辑自动） */
+  int dst_numa; /* 显式指定目的端内存 NUMA 节点（--dst-numa；-1 = 按旧逻辑自动） */
   int op;
   uint32_t mixed_ratio;
   uint32_t report_interval;
@@ -480,7 +482,65 @@ static int layout_server_buffer(context_t *ctx) {
 static int my_cpu_list(const argument_t *args, bool is_client, int *out,
                        int max_out);
 
-/* 分配 + 注册缓冲，并按亲和 mbind 数据区 */
+/* 查询单个虚拟地址所在页实际落在哪个 NUMA 节点（get_mempolicy
+ * MPOL_F_NODE|MPOL_F_ADDR）。页必须已分配（已触碰），失败返回 -1。 */
+static int query_page_node(const void *addr) {
+  int node = -1;
+  long rc = syscall(SYS_get_mempolicy, &node, NULL, 0, (void *)addr,
+                    MPOL_F_NODE | MPOL_F_ADDR);
+  return rc == 0 ? node : -1;
+}
+
+/* 采样核对缓冲页的实际落点：等距采样最多 1024 页，打印各节点命中分布。
+ * mbind 顺序错误（在 memset/URMA 注册之后）时页会留在首次触碰的节点，
+ * 用它一眼看出绑定是否真的生效。expect_node >= 0 时校验并告警。 */
+static void verify_buffer_node_placement(const char *tag, void *addr,
+                                         uint64_t len, int expect_node) {
+  const uint64_t page = PAGE_SIZE;
+  uint64_t total = len / page;
+  if (total == 0)
+    return;
+  uint64_t stride = total > 1024 ? total / 1024 : 1;
+  uint64_t hits[64] = {0};
+  uint64_t samples = 0, unknown = 0;
+  for (uint64_t i = 0; i < total; i += stride) {
+    int node = query_page_node((const uint8_t *)addr + i * page);
+    samples++;
+    if (node >= 0 && node < 64)
+      hits[node]++;
+    else
+      unknown++;
+  }
+  printf("[numa] %s placement: sampled %" PRIu64 "/%" PRIu64 " pages:", tag,
+         samples, total);
+  for (int n = 0; n < 64; n++) {
+    if (hits[n] != 0) {
+      printf(" node%d=%" PRIu64 "(%.1f%%)", n, hits[n],
+             100.0 * (double)hits[n] / (double)samples);
+    }
+  }
+  if (unknown != 0) {
+    printf(" unknown=%" PRIu64, unknown);
+  }
+  printf("\n");
+  if (expect_node >= 0) {
+    if (hits[expect_node] == samples) {
+      printf("[numa] %s verified: all sampled pages on node %d as expected\n",
+             tag, expect_node);
+    } else {
+      fprintf(stderr,
+              "[numa] WARNING %s: expected node %d but only %" PRIu64 "/%"
+              " PRIu64 sampled pages there; mbind must run BEFORE memset/"
+              "URMA register to take effect\n",
+              tag, expect_node, hits[expect_node], samples);
+    }
+  }
+}
+
+/* 分配 + 注册缓冲，并按亲和 mbind 数据区。
+ * 顺序关键：决策节点 -> mbind(+touch) -> memset -> URMA 注册。
+ * MPOL_PREFERRED(flags=0) 不迁移已分配页，且 URMA RegisterBuffer 会 pin 页
+ * （pin 后无法迁移），所以 mbind 必须在 memset 与注册之前。 */
 static int setup_buffer(context_t *ctx, bool is_server) {
   const argument_t *args = &ctx->args;
   if (is_server) {
@@ -494,37 +554,100 @@ static int setup_buffer(context_t *ctx, bool is_server) {
             ctx->buf_len);
     return -1;
   }
-  (void)memset(ctx->va, 0, ctx->buf_len);
-  /* va 就绪后再计算区域指针：数据区从缓冲起始 */
-  ctx->client_data = (uint8_t *)ctx->va;
-  if (!ctx->mgr->RegisterBuffer(ctx->va, ctx->buf_len)) {
-    fprintf(stderr, "Failed to register buffer\n");
-    return -1;
+  ctx->client_data = (uint8_t *)ctx->va; /* 数据区从缓冲起始 */
+  printf("[numa] buffer va=%p len=%" PRIu64 "B is_server=%d op=%s\n", ctx->va,
+         ctx->buf_len, (int)is_server, op_name(args->op));
+
+  /* --- ① 决策绑定节点（只决策，不动内存）--- */
+  int bind_node = -1;
+  char how_buf[128]; /* bind 决策来源描述（bind_how 指向它，函数级生命周期） */
+  const char *bind_how = "none"; /* 决策来源，用于日志 */
+  const char *role = is_server ? (args->op == OP_GET ? "get-source"
+                                                     : "write-dest")
+                               : (args->op == OP_GET ? "get-dest"
+                                                     : "write-source");
+  /* 显式 --src-numa/--dst-numa：按本端缓冲在数据路径中的角色选节点，覆盖
+   * single-chip/destination-cpus 自动推导（不受 affinity-mode、--no-mbind 影响）。
+   * 客户端：write 源 -> src-numa；get 读入目的 -> dst-numa。
+   * 服务器：write 写入目的 -> dst-numa；get 数据源 -> src-numa。
+   * mixed 两角色共用一块缓冲，只能落一个节点：优先 dst-numa。 */
+  int explicit_node = -1;
+  const char *explicit_opt = "";
+  if (args->op == OP_MIXED) {
+    explicit_node = (args->dst_numa >= 0) ? args->dst_numa : args->src_numa;
+    explicit_opt = (args->dst_numa >= 0) ? "dst" : "src";
+    if (explicit_node >= 0 && args->dst_numa >= 0 && args->src_numa >= 0) {
+      fprintf(stderr, "Warning: mixed op uses one buffer for both roles; only "
+                      "dst-numa %d applied\n",
+              explicit_node);
+    }
+  } else if (is_server) {
+    /* 服务器：get 数据源用 src-numa，write 写入目的用 dst-numa */
+    explicit_node = (args->op == OP_GET) ? args->src_numa : args->dst_numa;
+    explicit_opt = (args->op == OP_GET) ? "src" : "dst";
+  } else {
+    /* 客户端：write 源用 src-numa，get 读入目的用 dst-numa */
+    explicit_node = (args->op == OP_GET) ? args->dst_numa : args->src_numa;
+    explicit_opt = (args->op == OP_GET) ? "dst" : "src";
   }
-  if (args->mbind && args->affinity_mode == AFF_AFFINITY) {
-    int node = -1;
+  if (explicit_node >= 0) {
+    bind_node = explicit_node;
+    snprintf(how_buf, sizeof(how_buf), "--%s-numa", explicit_opt);
+    bind_how = how_buf;
+  } else if (args->mbind && args->affinity_mode == AFF_AFFINITY) {
     if (args->single_chip >= 1 && args->single_chip <= 2) {
       /* 单 chip 内存亲和：绑到该 chip 对应的 NUMA 节点 */
-      node = chip_to_first_numa(args->single_chip);
+      bind_node = chip_to_first_numa(args->single_chip);
+      snprintf(how_buf, sizeof(how_buf), "auto:single-chip %d",
+               args->single_chip);
+      bind_how = how_buf;
     } else {
       int dst_cpus[MAX_CPUS];
       int n = my_cpu_list(args, false, dst_cpus, MAX_CPUS); /* 含自动选择 */
       if (n > 0) {
-        node = read_cpu_numa(dst_cpus[0]);
-      }
-    }
-    if (node >= 0) {
-      /* 整缓冲绑定（va 由 memalign 页对齐），保证数据区落在目的 NUMA */
-      if (mbind_to_node(ctx->va, ctx->buf_len, node) != 0) {
-        fprintf(stderr,
-                "Warning: mbind to node %d failed, continue without NUMA "
-                "binding\n",
-                node);
+        bind_node = read_cpu_numa(dst_cpus[0]);
+        snprintf(how_buf, sizeof(how_buf),
+                 "auto:destination-cpus first cpu %d (list[0] of %d)",
+                 dst_cpus[0], n);
+        bind_how = how_buf;
       } else {
-        printf("mbind buffer (%" PRIu64 "B) to node %d\n", ctx->buf_len, node);
+        bind_how = "auto:destination-cpus empty";
       }
     }
+  } else {
+    bind_how = args->mbind ? "skipped: affinity-mode != affinity"
+                           : "skipped: mbind disabled (--no-mbind)";
   }
+  printf("[numa] role=%s bind decision: node=%d (%s)\n", role, bind_node,
+         bind_how);
+
+  /* --- ② 先 mbind（含逐页 touch 触发分配），再 memset/注册 --- */
+  if (bind_node >= 0) {
+    if (mbind_to_node(ctx->va, ctx->buf_len, bind_node) != 0) {
+      fprintf(stderr,
+              "Warning: mbind to node %d failed, continue without NUMA "
+              "binding\n",
+              bind_node);
+      bind_node = -1;
+    } else {
+      printf("[numa] mbind ok: buffer (%" PRIu64 "B) -> node %d via %s\n",
+             ctx->buf_len, bind_node, bind_how);
+    }
+  } else {
+    printf("[numa] no binding applied (%s); pages will land on first-touch "
+           "node(s)\n",
+           bind_how);
+  }
+
+  /* --- ③ 触页分配 + 注册 --- */
+  (void)memset(ctx->va, 0, ctx->buf_len);
+  if (!ctx->mgr->RegisterBuffer(ctx->va, ctx->buf_len)) {
+    fprintf(stderr, "Failed to register buffer\n");
+    return -1;
+  }
+
+  /* --- ④ 采样核对实际落点 --- */
+  verify_buffer_node_placement(role, ctx->va, ctx->buf_len, bind_node);
   return 0;
 }
 
@@ -2684,6 +2807,12 @@ static void usage(void) {
          "(default 1)\n");
   printf("      --single-chip <1|2>    single-chip affinity scenario: all "
          "sends use one chip (src==dst), mbind to that chip's NUMA\n");
+  printf("      --src-numa <node>      pin source-side memory to NUMA node "
+         "(client: write source / server: get data source; overrides auto "
+         "mbind)\n");
+  printf("      --dst-numa <node>      pin destination-side memory to NUMA node "
+         "(server: write data region / client: get read buffer; overrides "
+         "auto mbind)\n");
   printf("      --poll-cpu <n>         pin URMA poll thread to cpu (default: "
          "auto pick a non-worker cpu)\n");
   printf("      --dual-dev             dual physical device mode: 2 devices x "
@@ -2977,6 +3106,12 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
       break;
     case 1032:
       args->poll_cpu = (int)strtol(optarg, NULL, 0);
+      break;
+    case 1027: /* --src-numa <node> */
+      args->src_numa = (int)strtol(optarg, NULL, 0);
+      break;
+    case 1028: /* --dst-numa <node> */
+      args->dst_numa = (int)strtol(optarg, NULL, 0);
       break;
     case 1033:
       args->dual_dev = true;
