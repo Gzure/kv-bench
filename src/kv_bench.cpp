@@ -1562,6 +1562,8 @@ static int client_get_pipeline(context_t *ctx, worker_t *w,
     }
     bool all_ok = true;
     for (uint32_t wr = 0; wr < args->sends_per_req * KV_WR_PER_SEND; wr++) {
+      if (s->done[wr])
+        continue; /* 主循环 ProbeEvent 已收的 CQE 已复位，再 WaitEvent 白等超时 */
       if (!mgr->WaitEvent(w->id, s->event_token[wr], remaining_ms)) {
         fprintf(stderr,
                 "[get-pipe] drain timeout: req=%llu WR %u token=%llu; "
@@ -2903,13 +2905,22 @@ static int validate_input_params(argument_t *args) {
             args->single_chip);
     return -1;
   }
-  /* --src-numa/--dst-numa：0..numa_nodes-1；显式指定时覆盖自动 mbind 推导 */
+  /* --src-numa/--dst-numa：0..numa_nodes-1 且节点必须有内存；
+   * 显式指定时覆盖自动 mbind 推导 */
   if (args->src_numa < -1 || args->dst_numa < -1 ||
       args->src_numa >= get_num_numa_nodes() ||
       args->dst_numa >= get_num_numa_nodes()) {
     fprintf(stderr, "Invalid --src-numa %d / --dst-numa %d (valid: -1 or "
                     "0..%d)\n",
             args->src_numa, args->dst_numa, get_num_numa_nodes() - 1);
+    return -1;
+  }
+  if ((args->src_numa >= 0 && !numa_node_has_memory(args->src_numa)) ||
+      (args->dst_numa >= 0 && !numa_node_has_memory(args->dst_numa))) {
+    fprintf(stderr, "Invalid --src-numa %d / --dst-numa %d: node has no "
+                    "memory (memory nodes: see /sys/devices/system/node/"
+                    "has_memory)\n",
+            args->src_numa, args->dst_numa);
     return -1;
   }
   /* --chip-weight：非负、不全 0；与 --single-chip 互斥；非 affinity 仅 warning */
