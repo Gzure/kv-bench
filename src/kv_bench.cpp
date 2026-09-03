@@ -2760,6 +2760,8 @@ static struct option g_long_options[] = {
     {"dual-dev", no_argument, NULL, 1033},
     {"dev-name2", required_argument, NULL, 1034},
     {"single-chip", required_argument, NULL, 1026},
+    {"src-numa", required_argument, NULL, 1027},
+    {"dst-numa", required_argument, NULL, 1028},
     {NULL, 0, NULL, 0}};
 
 static void usage(void) {
@@ -2899,6 +2901,15 @@ static int validate_input_params(argument_t *args) {
   if (args->single_chip < 0 || args->single_chip > 2) {
     fprintf(stderr, "Invalid single-chip %d (0=dual chip, 1|2)\n",
             args->single_chip);
+    return -1;
+  }
+  /* --src-numa/--dst-numa：0..numa_nodes-1；显式指定时覆盖自动 mbind 推导 */
+  if (args->src_numa < -1 || args->dst_numa < -1 ||
+      args->src_numa >= get_num_numa_nodes() ||
+      args->dst_numa >= get_num_numa_nodes()) {
+    fprintf(stderr, "Invalid --src-numa %d / --dst-numa %d (valid: -1 or "
+                    "0..%d)\n",
+            args->src_numa, args->dst_numa, get_num_numa_nodes() - 1);
     return -1;
   }
   /* --chip-weight：非负、不全 0；与 --single-chip 互斥；非 affinity 仅 warning */
