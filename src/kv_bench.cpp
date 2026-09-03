@@ -388,6 +388,30 @@ static int enumerate_all_cpus(int *out, int max_out) {
   return n;
 }
 
+/* 判断 NUMA 节点是否有内存：读 /sys/devices/system/node/has_memory（节点
+ * 列表格式同 cpu list，如 "0" / "0,2" / "0-3"）。部分平台有 cpu 节点但无
+ * 内存插条（size=0MB），mbind 到这类节点会 EINVAL；文件不存在时保守
+ * 返回 true，由 mbind 运行时报错兜底。 */
+static int numa_node_has_memory(int node) {
+  FILE *f = fopen("/sys/devices/system/node/has_memory", "r");
+  if (f == NULL)
+    return 1;
+  char buf[128] = {0};
+  int has = 0;
+  if (fgets(buf, sizeof(buf), f) != NULL) {
+    int nodes[64];
+    int n = parse_cpu_list(buf, nodes, 64);
+    for (int i = 0; i < n; i++) {
+      if (nodes[i] == node) {
+        has = 1;
+        break;
+      }
+    }
+  }
+  fclose(f);
+  return has;
+}
+
 /* mbind: 把 [addr, addr+len) 绑定到 node（用 syscall 避免 libnuma 依赖） */
 /* mbind: 把 [addr, addr+len) 绑定到 node。对齐参考
  * DistributeMemoryAcrossNumaNodeList (yuanrong numa_util.cpp)：
@@ -2987,6 +3011,8 @@ static int parse_arguments(int argc, char *argv[], argument_t *args) {
   args->chip_weight[0] = 1;
   args->chip_weight[1] = 1;
   args->poll_cpu = -1; /* 默认自动选空闲核给轮询线程 */
+  args->src_numa = -1; /* -1 = 不显式指定，按旧逻辑（affinity/single-chip）自动 mbind */
+  args->dst_numa = -1;
   args->op = OP_WRITE;
   args->mixed_ratio = 50;
   args->report_interval = 1;
